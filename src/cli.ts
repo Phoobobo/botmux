@@ -7419,6 +7419,7 @@ import { resolvePricingConfig, type ResolvedModelPricing } from './services/mode
 import { config } from './config.js';
 import { loadCompanionSecret } from './dashboard/companion-api.js';
 import { applyCompanionStartupOptions } from './cli/companion-startup-options.js';
+import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import {
   resolveQuoteTarget,
@@ -13460,12 +13461,13 @@ const ROOT_FLEET_MUTATION_COMMANDS = new Set(['start', 'stop', 'restart', 'upgra
 // there — its meaning on stop/restart is "also tear the plugin service down",
 // and start has no tear-down phase.
 const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
-  start: [],
+  start: ['--companion-secret-file', '--companion-bot'],
   stop: ['--with-plugin'],
-  restart: ['--with-plugin'],
+  restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
   upgrade: [],
   update: [],
 };
+const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   const fleetArgs = process.argv.slice(3);
   if (fleetArgs.some(arg => arg === '--help' || arg === '-h')) {
@@ -13483,9 +13485,12 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   // of these commands takes a positional argument either, so anything outside
   // the table above is unknown, flag-shaped or not.
   const knownFleetFlags = FLEET_KNOWN_FLAGS[command ?? ''] ?? [];
-  const unknownFleetArgs = fleetArgs.filter(arg => !knownFleetFlags.includes(arg));
-  if (unknownFleetArgs.length > 0) {
-    console.error(`未知参数: ${unknownFleetArgs.join(' ')}`);
+  const unknownArgs = unknownFleetArgs(fleetArgs, {
+    boolFlags: knownFleetFlags.filter(flag => !FLEET_VALUE_FLAGS.has(flag)),
+    valueFlags: knownFleetFlags.filter(flag => FLEET_VALUE_FLAGS.has(flag)),
+  });
+  if (unknownArgs.length > 0) {
+    console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
     process.exit(2);
