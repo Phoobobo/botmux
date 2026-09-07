@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,7 +36,7 @@ function fixture() {
     const target = url.search ? `${url.pathname}${url.search}` : url.pathname;
     if (!await api(req, res, target)) { res.statusCode = 404; res.end(); }
   });
-  return { secret, server, calls };
+  return { secret, server, calls, api };
 }
 
 async function request(port: number, secret: string, method: string, pathname: string, bodyRaw = '', nonce = Math.random().toString(36).slice(2), timestamp = String(Date.now())) {
@@ -62,6 +63,24 @@ describe('closed companion API', () => {
     expect(isCompanionLoopback('::ffff:127.0.0.1')).toBe(true);
     expect(isCompanionLoopback('10.0.0.1')).toBe(false);
     expect(isCompanionLoopback(undefined)).toBe(false);
+  });
+
+  it('rejects a non-loopback peer at the handler boundary', async () => {
+    const f = fixture();
+    let status = 0;
+    let body = '';
+    const req = Object.assign(Readable.from([]), {
+      method: 'GET',
+      headers: {},
+      socket: { remoteAddress: '10.0.0.1' },
+    });
+    const res = {
+      writeHead: (nextStatus: number) => { status = nextStatus; },
+      end: (value?: string) => { body = value ?? ''; },
+    };
+    await f.api(req as any, res as any, '/__companion/v1/health');
+    expect(status).toBe(403);
+    expect(body).toBe(JSON.stringify({ ok: false, error: 'forbidden' }));
   });
 
   it('returns only versioned capabilities from authenticated health', () => listening(async (port, secret) => {

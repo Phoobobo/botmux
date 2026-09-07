@@ -16,7 +16,7 @@ Preprovision a dedicated test Bot before invoking the command: add one unique `l
 
 ## Authentication
 
-The surface uses the Dashboard's local listening port but authenticates independently before ordinary Dashboard auth/routing; it grants no Dashboard administrator identity. Requests must originate from loopback and carry. If an operator explicitly enables the platform tunnel, the tunnel is a trusted transport into the local Dashboard port; HMAC remains mandatory and is the effective boundary for that opt-in path.
+The surface uses the Dashboard's local listening port but authenticates independently before ordinary Dashboard auth/routing; it grants no Dashboard administrator identity. Requests must originate from loopback and carry the headers below. If an operator explicitly enables the platform tunnel, the tunnel is a trusted transport into the local Dashboard port; HMAC remains mandatory and is the effective boundary for that opt-in path.
 
 - `X-Botmux-Companion-Timestamp`: epoch milliseconds, within 60 seconds;
 - `X-Botmux-Companion-Nonce`: a one-time random value;
