@@ -3,6 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { isAbsolute } from 'node:path';
 import { lstatSync, realpathSync } from 'node:fs';
 import { readSecureHostFileSync } from '../platform/secure-host-file.js';
+import { isLoopback } from './daemon-internal-auth.js';
 import type { RoleInjectMode } from '../core/role-resolver.js';
 import { cliModelSupportsReasoningEffort, isCodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 
@@ -12,6 +13,8 @@ export const COMPANION_MODEL_MAX_LENGTH = 200;
 export const COMPANION_OPERATION_TIMEOUT_MS = 10_000;
 const CLOCK_SKEW_MS = 60_000;
 const NONCE_TTL_MS = 10 * 60_000;
+const WRITE_RESULT_TTL_MS = 10 * 60_000;
+const WRITE_RESULT_MAX = 1_000;
 const COMPANION_ROUTES: Readonly<Record<string, 'health' | 'role-read' | 'role-write' | 'runtime-read' | 'runtime-write'>> = Object.freeze({
   'GET /__companion/v1/health': 'health',
   'GET /__companion/v1/role': 'role-read',
@@ -60,9 +63,7 @@ export function companionSignature(secret: string, input: {
   ].join('\n')).digest('base64url');
 }
 
-export function isCompanionLoopback(remote: string | undefined): boolean {
-  return remote === '127.0.0.1' || remote === '::1' || !!remote?.endsWith('::ffff:127.0.0.1');
-}
+export const isCompanionLoopback = isLoopback;
 
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -113,7 +114,7 @@ async function bounded<T>(operation: () => T | Promise<T>): Promise<T> {
 export function createCompanionApi(config: CompanionApiConfig) {
   const now = config.now ?? Date.now;
   const nonces = new Map<string, number>();
-  const writes = new Map<string, Promise<{ status: number; value: unknown }>>();
+  const writes = new Map<string, { expiresAt: number; promise: Promise<{ status: number; value: unknown }> }>();
 
   return async function handle(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<boolean> {
     if (!pathname.startsWith('/__companion/')) return false;
@@ -187,16 +188,29 @@ export function createCompanionApi(config: CompanionApiConfig) {
     }
 
     const idempotencyKey = `${operation}:${parsed.requestId}`;
-    let pending = writes.get(idempotencyKey);
-    if (!pending) {
-      pending = execute().then(
+    const currentTime = now();
+    for (const [key, entry] of writes) if (entry.expiresAt <= currentTime) writes.delete(key);
+    let entry = writes.get(idempotencyKey);
+    if (!entry) {
+      const pending = execute().then(
         value => ({ status: 200, value: { ok: true, requestId: parsed.requestId, value } }),
         error => ({ status: 500, value: { ok: false, error: error instanceof Error && error.message === 'timeout' ? 'timeout' : 'operation_failed' } }),
       );
       // Store before awaiting: concurrent retries share the same side effect.
-      writes.set(idempotencyKey, pending);
+      entry = { expiresAt: currentTime + WRITE_RESULT_TTL_MS, promise: pending };
+      writes.set(idempotencyKey, entry);
+      while (writes.size > WRITE_RESULT_MAX) {
+        const oldest = writes.keys().next().value;
+        if (!oldest) break;
+        writes.delete(oldest);
+      }
+      pending.then(result => {
+        // Failed results are never durable idempotency records: callers may
+        // retry after a transient backend failure or timeout.
+        if (result.status !== 200 && writes.get(idempotencyKey)?.promise === pending) writes.delete(idempotencyKey);
+      }).catch(() => { /* result promise already normalizes operation errors */ });
     }
-    const result = await pending;
+    const result = await entry.promise;
     json(res, result.status, result.value);
     return true;
   };

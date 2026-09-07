@@ -18,11 +18,15 @@ afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: tru
 function fixture() {
   let role: CompanionRole = { role: 'reviewer', injectMode: 'every', revision: null };
   let runtime: CompanionRuntime = { provider: 'codex', model: 'gpt-5.6-sol', reasoning: 'high' };
-  const calls = { roleWrites: 0, runtimeWrites: 0 };
+  const calls = { roleWrites: 0, runtimeWrites: 0, failRoleOnce: false };
   const secret = 'companion-test-secret';
   const api = createCompanionApi({ secret, operations: {
     readRole: () => role,
-    writeRole: value => { calls.roleWrites += 1; return role = { ...value, role: value.role.trim(), revision: null }; },
+    writeRole: value => {
+      calls.roleWrites += 1;
+      if (calls.failRoleOnce) { calls.failRoleOnce = false; throw new Error('transient'); }
+      return role = { ...value, role: value.role.trim(), revision: null };
+    },
     readRuntime: () => runtime,
     writeRuntime: value => { calls.runtimeWrites += 1; return runtime = value; },
   } });
@@ -44,7 +48,7 @@ async function request(port: number, secret: string, method: string, pathname: s
   } });
 }
 
-async function listening<T>(run: (port: number, secret: string, calls: { roleWrites: number; runtimeWrites: number }) => Promise<T>): Promise<T> {
+async function listening<T>(run: (port: number, secret: string, calls: { roleWrites: number; runtimeWrites: number; failRoleOnce: boolean }) => Promise<T>): Promise<T> {
   const f = fixture();
   await new Promise<void>(resolve => f.server.listen(0, '127.0.0.1', resolve));
   const port = (f.server.address() as { port: number }).port;
@@ -81,6 +85,19 @@ describe('closed companion API', () => {
     ]);
     expect(responses.map(response => response.status)).toEqual([200, 200]);
     expect(calls.roleWrites).toBe(1);
+  }));
+
+  it('rejects extra write fields instead of widening the closed schema', () => listening(async (port, secret) => {
+    const raw = JSON.stringify({ requestId: 'extra_field', role: 'builder', injectMode: 'once', settings: 'nope' });
+    expect((await request(port, secret, 'PUT', '/__companion/v1/role', raw)).status).toBe(400);
+  }));
+
+  it('does not permanently cache failed writes under the requestId', () => listening(async (port, secret, calls) => {
+    calls.failRoleOnce = true;
+    const raw = JSON.stringify({ requestId: 'retry_request', role: 'builder', injectMode: 'once' });
+    expect((await request(port, secret, 'PUT', '/__companion/v1/role', raw)).status).toBe(500);
+    expect((await request(port, secret, 'PUT', '/__companion/v1/role', raw)).status).toBe(200);
+    expect(calls.roleWrites).toBe(2);
   }));
 
   it('enforces the runtime allowlist and provider-specific reasoning', () => listening(async (port, secret) => {

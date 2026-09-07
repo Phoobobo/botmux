@@ -87,8 +87,17 @@ export function resolveDaemonEnv(
   refreshPersistedEnv = Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim()),
 ): Record<DaemonEnvKey, string> {
   const fileEnv = envFileText === undefined ? {} : parse(envFileText);
+  const companionKeys = new Set<DaemonEnvKey>([
+    'BOTMUX_COMPANION_SECRET_FILE',
+    'BOTMUX_COMPANION_BOT_APP_ID',
+  ]);
   const resolve = (key: DaemonEnvKey): string => {
-    const value = refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
+    // start/restart flags are authoritative even when invoked from a managed
+    // session. Do not let refreshPersistedEnv discard the freshly validated
+    // companion binding before the supervisor receives it.
+    const value = companionKeys.has(key)
+      ? inheritedEnv[key] ?? fileEnv[key]
+      : refreshPersistedEnv ? fileEnv[key] : inheritedEnv[key] ?? fileEnv[key];
     return value?.trim() ?? '';
   };
 

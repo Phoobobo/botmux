@@ -14,7 +14,7 @@ botmux start \
 
 ## 鉴权
 
-接口复用 Dashboard 的本机监听端口，但在普通 Dashboard 鉴权与路由之外独立验签；它不会授予 Dashboard 管理身份。请求只能来自 loopback。每个请求携带：
+接口复用 Dashboard 的本机监听端口，但在普通 Dashboard 鉴权与路由之外独立验签；它不会授予 Dashboard 管理身份。请求只能来自 loopback，并携带以下鉴权信息。若操作员显式开启平台 tunnel，tunnel 是进入本机 Dashboard 端口的受信传输；该路径仍强制 HMAC，HMAC 是此可选路径的实际边界。
 
 - `X-Botmux-Companion-Timestamp`：epoch 毫秒；允许偏差 60 秒；
 - `X-Botmux-Companion-Nonce`：一次性随机值；
@@ -36,4 +36,4 @@ body 上限 64 KiB。重放、过期、签名/方法/路径/body 不匹配均在
 - `GET /__companion/v1/runtime`：返回 `{provider, model?, reasoning?}`；
 - `PUT /__companion/v1/runtime`：仅接受 `{requestId, provider, model?, reasoning?}`。`provider` 为 `codex|traecli`（分别映射 Botmux `codex|traex`），model 最长 200 字符，reasoning 使用对应 provider/model 的现有闭集。
 
-写操作按 `requestId` 在进程生命周期内幂等。接口不接受 Bot ID、chat ID、任意 settings/env/URL/header/命令，也不提供 trigger/result；所有操作固定作用于启动绑定 Bot。角色文本只在通过 companion HMAC 的该路由返回，不加入 Dashboard/public DTO。响应和错误不包含密钥、文件路径或原生 ID。
+成功写操作按 `requestId` 在有界的进程内窗口中幂等。失败或超时结果不会缓存，可以重试；收到超时后仍应把底层操作视为异步进行中。接口不接受 Bot ID、chat ID、任意 settings/env/URL/header/命令，也不提供 trigger/result；所有操作固定作用于启动绑定 Bot。角色文本只在通过 companion HMAC 的该路由返回，不加入 Dashboard/public DTO。响应和错误不包含密钥、文件路径或原生 ID。

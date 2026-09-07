@@ -3437,7 +3437,8 @@ function analyticsService(): FeedbackAnalyticsService {
 }
 
 const companionApi = (() => {
-  const secretFile = config.companion.secretFile;
+  try {
+    const secretFile = config.companion.secretFile;
   const appId = config.companion.botAppId;
   if (!secretFile && !appId) return null;
   if (!secretFile || !appId) throw new Error('companion_configuration_incomplete');
@@ -3492,7 +3493,11 @@ const companionApi = (() => {
         };
       },
     },
-  });
+    });
+  } catch (error) {
+    logger.warn(`[companion] disabled: ${error instanceof Error ? error.message : 'configuration_invalid'}`);
+    return null;
+  }
 })();
 
 const server = createServer(async (req, res) => {

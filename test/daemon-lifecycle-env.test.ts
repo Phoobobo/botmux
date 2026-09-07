@@ -262,6 +262,19 @@ describe('DAEMON_ENV_KEYS enforces fleet credential boundaries', () => {
     expect(resolved.BOTMUX_COMPANION_BOT_APP_ID).toBe('local_test_bot');
   });
 
+  it('preserves freshly supplied companion flags during session refresh', () => {
+    const resolved = resolveDaemonEnv({
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_COMPANION_SECRET_FILE: '/run/secrets/companion-new',
+      BOTMUX_COMPANION_BOT_APP_ID: 'local_test_bot',
+    }, [
+      'BOTMUX_COMPANION_SECRET_FILE=/run/secrets/companion-old',
+      'BOTMUX_COMPANION_BOT_APP_ID=old_bot',
+    ].join('\n'));
+    expect(resolved.BOTMUX_COMPANION_SECRET_FILE).toBe('/run/secrets/companion-new');
+    expect(resolved.BOTMUX_COMPANION_BOT_APP_ID).toBe('local_test_bot');
+  });
+
   it('includes the audit-path and terminal-lease settings from .env.example', () => {
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH');
     expect(DAEMON_ENV_KEYS as readonly string[]).toContain('BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS');

@@ -14,7 +14,7 @@ botmux start \
 
 ## Authentication
 
-The surface uses the Dashboard's local listening port but authenticates independently before ordinary Dashboard auth/routing; it grants no Dashboard administrator identity. Requests must originate from loopback and carry:
+The surface uses the Dashboard's local listening port but authenticates independently before ordinary Dashboard auth/routing; it grants no Dashboard administrator identity. Requests must originate from loopback and carry. If an operator explicitly enables the platform tunnel, the tunnel is a trusted transport into the local Dashboard port; HMAC remains mandatory and is the effective boundary for that opt-in path.
 
 - `X-Botmux-Companion-Timestamp`: epoch milliseconds, within 60 seconds;
 - `X-Botmux-Companion-Nonce`: a one-time random value;
@@ -36,4 +36,4 @@ Bodies are capped at 64 KiB. Replay, stale timestamps, and signature/method/path
 - `GET /__companion/v1/runtime`: `{provider, model?, reasoning?}`;
 - `PUT /__companion/v1/runtime`: only `{requestId, provider, model?, reasoning?}`. `provider` is `codex|traecli` (mapped to Botmux `codex|traex`), model is at most 200 characters, and reasoning uses the existing provider/model-specific closed allowlist.
 
-Writes are idempotent by `requestId` for the process lifetime. The API accepts no Bot ID, chat ID, arbitrary settings/env/URL/header/command and exposes no trigger/result surface; every operation targets the startup-bound Bot. Role text is returned only on this companion-HMAC route and is not added to Dashboard/public DTOs. Responses and errors contain no secret, file path, or native identifier.
+Successful writes are idempotent by `requestId` for a bounded process-local window. Failed or timed-out writes are not cached and may be retried; the underlying operation must still be treated as asynchronous when a timeout is reported. The API accepts no Bot ID, chat ID, arbitrary settings/env/URL/header/command and exposes no trigger/result surface; every operation targets the startup-bound Bot. Role text is returned only on this companion-HMAC route and is not added to Dashboard/public DTOs. Responses and errors contain no secret, file path, or native identifier.
