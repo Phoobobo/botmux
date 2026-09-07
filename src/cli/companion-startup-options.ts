@@ -26,13 +26,15 @@ export function applyCompanionStartupOptions(input: {
   }
   if (!secretFile && !botAppId) return;
   if (!secretFile || !botAppId) {
-    throw new Error('companion options require both --companion-secret-file and --companion-bot');
+    throw new Error('companion configuration requires both secret-file and bot selection');
   }
   input.validateSecret(secretFile);
   const matches = input.bots.filter(bot => bot.larkAppId === botAppId);
   if (matches.length !== 1 || matches[0].sandbox !== true
     || (matches[0].cliId !== 'codex' && matches[0].cliId !== 'traex')) {
-    throw new Error('companion bot must identify exactly one sandboxed codex/traex bot');
+    // Deliberately omit the selected app id and all config details: this is a
+    // deterministic provisioning diagnostic, not a fleet inventory endpoint.
+    throw new Error('companion bot selection must match exactly one isolated codex/traex Bot');
   }
   input.env[COMPANION_SECRET_FILE_ENV] = secretFile;
   input.env[COMPANION_BOT_APP_ID_ENV] = botAppId;

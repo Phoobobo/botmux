@@ -24,10 +24,10 @@ describe('companion start/restart options', () => {
       argv: ['--companion-secret-file=/secure/companion', '--companion-bot', 'local_test_bot'],
       env: {}, bots, validateSecret: () => {},
     });
-    expect(() => applyCompanionStartupOptions({ argv: ['--companion-bot', 'local_test_bot'], env: {}, bots: [BOT], validateSecret: () => {} })).toThrow('require both');
-    expect(apply([{ ...BOT, sandbox: false }])).toThrow('exactly one sandboxed');
-    expect(apply([BOT, BOT])).toThrow('exactly one sandboxed');
-    expect(apply([{ ...BOT, cliId: 'claude-code' }])).toThrow('exactly one sandboxed');
+    expect(() => applyCompanionStartupOptions({ argv: ['--companion-bot', 'local_test_bot'], env: {}, bots: [BOT], validateSecret: () => {} })).toThrow('requires both');
+    expect(apply([{ ...BOT, sandbox: false }])).toThrow('exactly one isolated codex/traex Bot');
+    expect(apply([BOT, BOT])).toThrow('exactly one isolated codex/traex Bot');
+    expect(apply([{ ...BOT, cliId: 'claude-code' }])).toThrow('exactly one isolated codex/traex Bot');
   });
 
   it('preserves existing behavior when the capability is not configured', () => {

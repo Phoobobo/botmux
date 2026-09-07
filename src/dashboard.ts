@@ -3443,7 +3443,8 @@ const companionApi = (() => {
   if (!secretFile && !appId) return null;
   if (!secretFile || !appId) throw new Error('companion_configuration_incomplete');
   const requireBoundBot = () => {
-    const bot = readBotsJsonOrEmpty(BOTS_JSON_PATH).find((entry) => entry?.larkAppId === appId);
+    const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
+    const bot = matches.length === 1 ? matches[0] : undefined;
     if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
       throw new Error('companion_bound_bot_invalid');
     }

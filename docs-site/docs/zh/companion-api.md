@@ -10,7 +10,9 @@ botmux start \
   --companion-bot local_test_bot
 ```
 
-`restart` 接受相同选项。两个选项必须同时提供；目标必须精确匹配 `bots.json` 中一个启用 `sandbox`、且 `cliId` 为 `codex` 或 `traex` 的 Bot。密钥必须是 canonical 绝对路径上的当前用户所有、非符号链接、非空 `0600` 普通文件。校验失败时拒绝启动该配置，且错误不会包含路径或内容。
+`restart` 接受相同选项。两个选项必须同时提供。`--companion-bot` 选择一个明确的现有 Bot；fleet 中其它条目不参与匹配，但该 app id 必须精确匹配一条启用 `sandbox` 且 `cliId` 为 `codex` 或 `traex` 的记录。重复记录、记录不存在或不满足 predicate 时 fail closed，并返回确定性的通用诊断，不泄露 app id。
+
+调用前请预置专用测试 Bot：添加唯一的 `larkAppId`，设置 `sandbox: true`，并将 `cliId` 设为 `codex` 或 `traex`；与生产 Bot 分离。然后把该 app id 传给 `--companion-bot`，并传入独立的 canonical `0600` 密钥文件。仅有 `readIsolation` 或使用 `codex-app` 不满足本协议。密钥必须是 canonical 绝对路径上的当前用户所有、非符号链接、非空 `0600` 普通文件。校验失败时拒绝启动该配置，且错误不会包含路径或内容。
 
 ## 鉴权
 

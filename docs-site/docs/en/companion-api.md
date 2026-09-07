@@ -10,7 +10,9 @@ botmux start \
   --companion-bot local_test_bot
 ```
 
-`restart` accepts the same options. Both options are required together. The target must match exactly one `bots.json` entry with `sandbox` enabled and `cliId` set to `codex` or `traex`. The secret must be a nonempty, non-symlink `0600` regular file owned by the current user at a canonical absolute path. Invalid configuration fails closed without including the path or contents in the error.
+`restart` accepts the same options. Both options are required together. `--companion-bot` selects one specific existing Bot; unrelated fleet entries are ignored, but that selected app id must match exactly one entry with `sandbox` enabled and `cliId` set to `codex` or `traex`. Duplicate entries, a missing entry, or any nonqualifying entry fail closed with a deterministic generic diagnostic and no app id disclosure.
+
+Preprovision a dedicated test Bot before invoking the command: add one unique `larkAppId` entry with `sandbox: true` and `cliId: "codex"` or `"traex"`, and keep it separate from production Bots. Then pass that app id to `--companion-bot` and a separate canonical `0600` secret file to `--companion-secret-file`. `readIsolation` alone and `codex-app` are not accepted by this protocol. The secret must be a nonempty, non-symlink `0600` regular file owned by the current user at a canonical absolute path. Invalid configuration fails closed without including the path or contents in the error.
 
 ## Authentication
 
