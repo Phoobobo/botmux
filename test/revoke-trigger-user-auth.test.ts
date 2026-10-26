@@ -20,6 +20,7 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const spawns: Array<{ cmd: string; args: string[]; home?: string; homeExisted: boolean }> = [];
 let failSpawn = false;
@@ -363,6 +364,100 @@ describe('in-flight credential writes after revoke', () => {
     } finally {
       tokens.__setAfterCallbackOwnerEpochReadForTest(null);
     }
+  });
+
+  function runIsolated(source: string) {
+    const child = spawnSyncTsEvalWithRepoImports(source, {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      env: { ...process.env, HOME: homeDir },
+      timeout: 30_000,
+    });
+    const line = String(child.stdout).split('\n').findLast(row => row.trim().startsWith('{'));
+    return { status: child.status, stderr: String(child.stderr), line };
+  }
+
+  it('refuses the initiator across processes and still saves a forwarded clicker', () => {
+    const moduleUrl = join(process.cwd(), 'src/utils/user-token.ts');
+    const issue = () => {
+      const started = runIsolated(`
+        const { generateAuthUrl, clearUserToken } = await import(${JSON.stringify(moduleUrl)});
+        const first = generateAuthUrl(${JSON.stringify(APP)}, 'sec', 'feishu', [], ${JSON.stringify(ALICE)});
+        clearUserToken(${JSON.stringify(APP)}, 'feishu', ${JSON.stringify(ALICE)});
+        process.stdout.write(JSON.stringify({ url: first.authUrl }));
+      `);
+      expect(started.status, started.stderr).toBe(0);
+      return new URL(JSON.parse(started.line!).url).searchParams.get('state');
+    };
+    const finish = (openId: string, state: string | null) => {
+      const child = runIsolated(`
+        const fs = await import('node:fs');
+        const { handleCallbackUrl } = await import(${JSON.stringify(moduleUrl)});
+        globalThis.fetch = async (url) => {
+          if (String(url).includes('/oauth/token')) {
+            return { ok: true, json: async () => ({
+              access_token: 'CROSS_PROC_TOKEN', refresh_token: 'RT', token_type: 'Bearer',
+              expires_in: 7200, refresh_token_expires_in: 604800,
+              scope: ${JSON.stringify(TOKEN_SCOPE)},
+            }) };
+          }
+          return { ok: true, json: async () => ({ code: 0, data: { open_id: ${JSON.stringify(openId)}, name: 'Clicker' } }) };
+        };
+        const msg = await handleCallbackUrl(${JSON.stringify(`http://127.0.0.1:9768/callback?code=cross&state=${state}`)});
+        const path = ${JSON.stringify(join(homeDir, '.botmux', 'data', `user-token-${APP}-${openId}.json`))};
+        const landed = fs.existsSync(path);
+        process.stdout.write(JSON.stringify({ msg, landed, body: landed ? fs.readFileSync(path, 'utf8') : '' }));
+      `);
+      expect(child.status, child.stderr).toBe(0);
+      return JSON.parse(child.line!) as { msg: string; landed: boolean; body: string };
+    };
+
+    const self = finish(ALICE, issue());
+    expect(self.landed).toBe(false);
+    expect(self.body).not.toContain('CROSS_PROC_TOKEN');
+    expect(self.msg).toContain('授权已撤销');
+
+    const forwarded = finish(BOB, issue());
+    expect(forwarded.landed).toBe(true);
+    expect(forwarded.body).toContain('CROSS_PROC_TOKEN');
+    expect(forwarded.body).toContain(BOB);
+    expect(forwarded.msg.startsWith('✅')).toBe(true);
+  });
+
+  it('saves a new link issued after revoke when another process completes it', () => {
+    const moduleUrl = join(process.cwd(), 'src/utils/user-token.ts');
+    const setup = `
+      const { generateAuthUrl, clearUserToken } = await import(${JSON.stringify(moduleUrl)});
+      clearUserToken(${JSON.stringify(APP)}, 'feishu', ${JSON.stringify(ALICE)});
+      const first = generateAuthUrl(${JSON.stringify(APP)}, 'sec', 'feishu', [], ${JSON.stringify(ALICE)});
+      process.stdout.write(JSON.stringify({ url: first.authUrl }));
+    `;
+    const started = runIsolated(setup);
+    expect(started.status, started.stderr).toBe(0);
+    const state = new URL(JSON.parse(started.line!).url).searchParams.get('state');
+    const finish = `
+      const fs = await import('node:fs');
+      const { handleCallbackUrl } = await import(${JSON.stringify(moduleUrl)});
+      globalThis.fetch = async (url) => {
+        if (String(url).includes('/oauth/token')) {
+          return { ok: true, json: async () => ({
+            access_token: 'FRESH_AFTER_REVOKE', refresh_token: 'RT', token_type: 'Bearer',
+            expires_in: 7200, refresh_token_expires_in: 604800,
+            scope: ${JSON.stringify(TOKEN_SCOPE)},
+          }) };
+        }
+        return { ok: true, json: async () => ({ code: 0, data: { open_id: ${JSON.stringify(ALICE)}, name: 'Alice' } }) };
+      };
+      const msg = await handleCallbackUrl(${JSON.stringify(`http://127.0.0.1:9768/callback?code=fresh&state=${state}`)});
+      const path = ${JSON.stringify(join(homeDir, '.botmux', 'data', `user-token-${APP}-${ALICE}.json`))};
+      const landed = fs.existsSync(path);
+      process.stdout.write(JSON.stringify({ msg, landed, body: landed ? fs.readFileSync(path, 'utf8') : '' }));
+    `;
+    const saved = runIsolated(finish);
+    expect(saved.status, saved.stderr).toBe(0);
+    const body = JSON.parse(saved.line!) as { landed: boolean; body: string };
+    expect(body.landed).toBe(true);
+    expect(body.body).toContain('FRESH_AFTER_REVOKE');
   });
 
   it('known residual: a clicker revoke that lands before user_info returns still saves', async () => {

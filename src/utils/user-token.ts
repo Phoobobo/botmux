@@ -157,39 +157,18 @@ interface PendingLogin {
    */
   openId?: string;
   /**
-   * Initiator's epoch at the moment the link was created. The callback does
-   * not use this as the write authority: a forwarded link is completed by
-   * someone else, and comparing this snapshot with their file rejects a
-   * clicker who never revoked, or accepts them when the two numbers happen
-   * to match. Kept so an in-flight pending file from this version still parses.
+   * Initiator's epoch when the link was created, written into the pending file
+   * so a different process (the dashboard callback) can see it. Used only when
+   * the person who finishes the login is that same initiator. A forwarded link
+   * reads the clicker's epoch after user_info instead. Missing on a pending
+   * file from before this field existed, treated as 0: someone who has revoked
+   * since (epoch ≥ 1) is refused and must /login again.
    */
   authEpoch?: number;
   createdAt: number;
 }
 
 const pendingLogins = new Map<string, PendingLogin>(); // keyed by state
-/** States revoked while a callback or device poll might still hold them in memory. */
-const cancelledPendingStates = new Set<string>();
-
-function cancelPendingLoginsFor(appId: string, openId: string): void {
-  // Mark the initiator's in-flight states. Do not delete them: a forwarded link
-  // is completed by someone else, and that callback still needs the app
-  // credentials stored here. The callback refuses only when the clicker is the
-  // initiator who revoked, then drops the set entry.
-  for (const [state, pending] of pendingLogins) {
-    if (pending.appId !== appId || pending.openId !== openId) continue;
-    cancelledPendingStates.add(state);
-  }
-  try {
-    for (const name of readdirSync(PENDING_DIR)) {
-      if (!name.endsWith('.json')) continue;
-      const state = name.slice(0, -5);
-      const pending = loadPendingLogin(state);
-      if (!pending || pending.appId !== appId || pending.openId !== openId) continue;
-      cancelledPendingStates.add(state);
-    }
-  } catch { /* directory absent */ }
-}
 
 function pendingPath(state: string): string | null {
   return /^[a-f0-9]{64}$/.test(state) ? join(PENDING_DIR, `${state}.json`) : null;
@@ -483,7 +462,6 @@ export function lookupAuthorizedUserName(
  */
 export function clearUserToken(appId: string, brand: Brand, openId: string): boolean {
   if (!isUsableOpenId(openId) || !APP_ID_RE.test(appId)) return false;
-  cancelPendingLoginsFor(appId, openId);
   const path = tokenPathForApp(appId, openId);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   return withFileLockSync(path, () => {
@@ -1041,13 +1019,6 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
   const code = decodeURIComponent(match[1]);
   const state = decodeURIComponent(stateMatch[1]);
 
-  // Remember, but do not reject yet. This set records that the *initiator*
-  // revoked the pending login. A forwarded link is completed by someone else;
-  // refusing here would tell that person the authorization was revoked when
-  // only the initiator had logged out. The entry is removed once this callback
-  // consumes the state so the set does not grow for the life of the daemon.
-  const initiatorStateRevoked = cancelledPendingStates.delete(state);
-
   const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
     return '❌ 授权失败：state 不匹配或已过期，请重新发起授权';
@@ -1097,13 +1068,6 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
     const ownerOpenId = authorized.openId;
     const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
-    // The initiator cancelled this exact pending state and then completed it
-    // themselves. That in-flight code must not write their token back. A
-    // different person completing the same link is a new authorization for
-    // them; their own epoch below is what decides.
-    if (initiatorStateRevoked && pending.openId === ownerOpenId) {
-      return '❌ 授权已撤销，本次没有保存。请重新 /login。';
-    }
     const token: TokenStore = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -1124,22 +1088,24 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // link (or a concurrent token update) can make those two identities/states
     // differ. Never replace a broader credential with a narrower one.
     //
-    // Epoch authority is the clicker's, read now that user_info has named them.
-    // The initiator's pending.authEpoch is the wrong person's generation: using
-    // it rejects a clicker who never revoked, and accepts one whose epoch
-    // merely happens to equal that snapshot.
+    // Same person: the epoch frozen into the pending file when the link was
+    // created. That file is what the dashboard process loads, so a /logout in
+    // the daemon (which only bumps the on-disk epoch) is visible here without
+    // a cross-process cancel flag. Any revoke after the link was issued makes
+    // the locked re-read differ, including a revoke between agree and user_info.
+    // A pending file from before this field existed has no authEpoch and is
+    // treated as 0, so a person who has revoked since is refused and must
+    // /login again.
     //
-    // What this read closes: a revoke that lands after user_info returns and
-    // before the locked replace (the hook below, then the lock re-reads).
-    // What it cannot close, and must not pretend to: a revoke that already
-    // happened before user_info returns. The owner is unknowable until then,
-    // so the snapshot is already the post-revoke generation and the lock
-    // agrees. That covers both "they revoked, then consented again" (a fresh
-    // authorization, which should save) and the slice between clicking agree
-    // and user_info returning (a known residual: the consent predates the
-    // revoke, but this process cannot see a pre-revoke epoch).
+    // Someone else finished a forwarded link: their epoch is read now. A revoke
+    // of theirs after this read and before the locked replace is refused. A
+    // revoke of theirs that already happened before user_info returns still
+    // saves — the clicker is unknowable until then (known residual: both a
+    // fresh consent after their own /logout, and the slice between their agree
+    // click and user_info).
+    const samePerson = isUsableOpenId(pending.openId) && pending.openId === ownerOpenId;
     const authEpoch = isUsableOpenId(ownerOpenId)
-      ? readUserTokenEpoch(pending.appId, ownerOpenId)
+      ? (samePerson ? (pending.authEpoch ?? 0) : readUserTokenEpoch(pending.appId, ownerOpenId))
       : undefined;
     afterCallbackOwnerEpochReadForTest?.(ownerOpenId, authEpoch ?? 0);
     const replacement = replaceTokenForApp(
