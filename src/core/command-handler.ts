@@ -3861,7 +3861,20 @@ export async function handleCommand(
           brand: normalizeBrand(botCfg.brand),
           sessionDataDir: config.session.dataDir,
         });
-        await sessionReply(rootId, t('cmd.logout.ok', undefined, loc));
+        // Local homes and this app's user token are gone. A platform grant is
+        // fetched again next turn; this process cannot revoke it. Say so when
+        // this bot actually takes credentials from the platform, the same way
+        // /login points at that page.
+        const credSource = credentialSourceOf(botCfg.triggerUserAuth);
+        const platformUrl = botCfg.triggerUserAuth?.enabled && credSource !== 'local'
+          ? platformCredentialsUrl()
+          : null;
+        const platformNote = !botCfg.triggerUserAuth?.enabled || credSource === 'local'
+          ? ''
+          : platformUrl
+            ? `\n${t('cmd.logout.platform_note', { url: platformUrl }, loc)}`
+            : `\n${t('cmd.logout.platform_unbound', undefined, loc)}`;
+        await sessionReply(rootId, t('cmd.logout.ok', undefined, loc) + platformNote);
         break;
       }
 

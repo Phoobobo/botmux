@@ -23,6 +23,8 @@ import { join } from 'node:path';
 
 const spawns: Array<{ cmd: string; args: string[]; home?: string; homeExisted: boolean }> = [];
 let failSpawn = false;
+/** When set, replaces the default authenticated-status stdout for that spawn. */
+let scriptSpawn: ((args: string[], home: string | undefined) => { stdout: string; code?: number } | undefined) | null = null;
 
 vi.mock('node:child_process', async (importOriginal) => {
   const orig = await importOriginal<typeof import('node:child_process')>();
@@ -39,8 +41,10 @@ vi.mock('node:child_process', async (importOriginal) => {
       child.stderr = new EventEmitter();
       child.kill = () => {};
       setImmediate(() => {
-        child.stdout.emit('data', '{"ok":true,"status":"success","data":{"authenticated":true}}\n');
-        child.emit('close', failSpawn ? 1 : 0);
+        const scripted = scriptSpawn?.([...args], home);
+        child.stdout.emit('data', scripted?.stdout
+          ?? '{"ok":true,"status":"success","data":{"authenticated":true}}\n');
+        child.emit('close', scripted?.code ?? (failSpawn ? 1 : 0));
       });
       return child;
     }),
@@ -77,6 +81,7 @@ beforeEach(() => {
   homeDir = mkdtempSync(join(tmpdir(), 'botmux-revoke-'));
   spawns.length = 0;
   failSpawn = false;
+  scriptSpawn = null;
   vi.resetModules();
   vi.unstubAllGlobals();
 });
@@ -91,7 +96,9 @@ async function loadRevoke() {
   const byted = await import('../src/services/bytedcli-auth.js');
   const tokens = await import('../src/utils/user-token.js');
   const identity = await import('../src/core/cli-identity.js');
-  return { revoke, byted, tokens, identity };
+  const lark = await import('../src/services/lark-cli-auth.js');
+  const epoch = await import('../src/services/cli-auth-epoch.js');
+  return { revoke, byted, tokens, identity, lark, epoch };
 }
 
 function dataDir() {
@@ -277,6 +284,306 @@ describe('in-flight credential writes after revoke', () => {
     const saved = await tokens.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=new&state=${newState}`);
     expect(saved?.startsWith('✅')).toBe(true);
     expect(readFileSync(path, 'utf8')).toContain(ALICE_SECRET);
+  });
+
+  const TOKEN_SCOPE = 'im:message:readonly im:resource offline_access';
+
+  function stubCallbackFetch(openId: string, access = 'NEW_CLICKER_TOKEN') {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).includes('/oauth/token')) {
+        return {
+          ok: true,
+          json: async () => ({
+            access_token: access,
+            refresh_token: 'RT_NEW',
+            token_type: 'Bearer',
+            expires_in: 7200,
+            refresh_token_expires_in: 604800,
+            scope: TOKEN_SCOPE,
+          }),
+        };
+      }
+      return { ok: true, json: async () => ({ code: 0, data: { open_id: openId, name: 'Clicker' } }) };
+    }));
+  }
+
+  function tokenPath(openId: string) {
+    return join(dataDir(), `user-token-${APP}-${openId}.json`);
+  }
+
+  function epochPath(openId: string) {
+    return join(dataDir(), `user-token-epoch-${APP}-${openId}`);
+  }
+
+  it('saves a forwarded callback for the clicker when only the initiator has revoked', async () => {
+    const { tokens } = await loadRevoke();
+    mkdirSync(dataDir(), { recursive: true });
+    // Initiator epoch is already 1 when the link is created, which is the
+    // snapshot the old callback compared against the clicker.
+    expect(tokens.clearUserToken(APP, 'feishu', ALICE)).toBe(false);
+    const first = tokens.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    const state = new URL(first.authUrl).searchParams.get('state');
+    stubCallbackFetch(BOB);
+    const saved = await tokens.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=fwd&state=${state}`);
+    expect(saved?.startsWith('✅')).toBe(true);
+    expect(readFileSync(tokenPath(BOB), 'utf8')).toContain('NEW_CLICKER_TOKEN');
+    expect(existsSync(tokenPath(ALICE))).toBe(false);
+  });
+
+  it('still saves a forwarded callback when the initiator revoked that pending state', async () => {
+    const { tokens } = await loadRevoke();
+    mkdirSync(dataDir(), { recursive: true });
+    const first = tokens.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    const state = new URL(first.authUrl).searchParams.get('state');
+    expect(tokens.clearUserToken(APP, 'feishu', ALICE)).toBe(false);
+    stubCallbackFetch(BOB);
+    const saved = await tokens.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=fwd&state=${state}`);
+    expect(saved?.startsWith('✅')).toBe(true);
+    expect(readFileSync(tokenPath(BOB), 'utf8')).toContain('NEW_CLICKER_TOKEN');
+    expect(existsSync(tokenPath(ALICE))).toBe(false);
+  });
+
+  it('refuses a clicker whose epoch advances after user_info and before the write, even when that epoch equals the initiator snapshot', async () => {
+    const { tokens } = await loadRevoke();
+    mkdirSync(dataDir(), { recursive: true });
+    expect(tokens.clearUserToken(APP, 'feishu', ALICE)).toBe(false);
+    const first = tokens.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    const state = new URL(first.authUrl).searchParams.get('state');
+    writeFileSync(tokenPath(BOB), token(BOB, 'OLD_BOB', false).replace('offline_access', TOKEN_SCOPE));
+    tokens.__setAfterCallbackOwnerEpochReadForTest(() => {
+      mkdirSync(dataDir(), { recursive: true });
+      writeFileSync(epochPath(BOB), '1');
+    });
+    stubCallbackFetch(BOB);
+    try {
+      const saved = await tokens.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=fwd&state=${state}`);
+      expect(saved).toContain('授权已撤销');
+      expect(readFileSync(tokenPath(BOB), 'utf8')).toContain('OLD_BOB');
+      expect(readFileSync(tokenPath(BOB), 'utf8')).not.toContain('NEW_CLICKER_TOKEN');
+    } finally {
+      tokens.__setAfterCallbackOwnerEpochReadForTest(null);
+    }
+  });
+
+  it('known residual: a clicker revoke that lands before user_info returns still saves', async () => {
+    const { tokens } = await loadRevoke();
+    mkdirSync(dataDir(), { recursive: true });
+    const first = tokens.generateAuthUrl(APP, 'sec', 'feishu', [], ALICE);
+    const state = new URL(first.authUrl).searchParams.get('state');
+    // Before user_info the owner is unknowable, so the snapshot is already the
+    // post-revoke epoch. This is the agree → user_info window, and also a
+    // consent that happened after the clicker's own /logout.
+    expect(tokens.clearUserToken(APP, 'feishu', BOB)).toBe(false);
+    stubCallbackFetch(BOB);
+    const saved = await tokens.handleCallbackUrl(`http://127.0.0.1:9768/callback?code=fwd&state=${state}`);
+    expect(saved?.startsWith('✅')).toBe(true);
+    expect(readFileSync(tokenPath(BOB), 'utf8')).toContain('NEW_CLICKER_TOKEN');
+  });
+
+  it('does not recreate a token when the file disappeared but the epoch did not move', async () => {
+    const { tokens } = await loadRevoke();
+    const path = tokenPath(ALICE);
+    mkdirSync(dataDir(), { recursive: true });
+    writeFileSync(path, token(ALICE, ALICE_SECRET, true));
+
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await gate;
+      return {
+        ok: true,
+        json: async () => ({
+          access_token: 'SHOULD_NOT_LAND',
+          refresh_token: 'RT_NEW',
+          token_type: 'Bearer',
+          expires_in: 7200,
+          refresh_token_expires_in: 604800,
+          scope: 'offline_access',
+        }),
+      };
+    }));
+    const pending = tokens.resolveUserToken(APP, 'sec', 'feishu', ALICE);
+    for (let i = 0; i < 50 && vi.mocked(fetch).mock.calls.length === 0; i += 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    rmSync(path);
+    release();
+    expect(await pending).toBeNull();
+    expect(existsSync(path)).toBe(false);
+    expect(existsSync(epochPath(ALICE))).toBe(false);
+  });
+
+  it('does not replace a token when the epoch advanced and the file is still there', async () => {
+    const { tokens } = await loadRevoke();
+    const path = tokenPath(ALICE);
+    mkdirSync(dataDir(), { recursive: true });
+    writeFileSync(path, token(ALICE, ALICE_SECRET, true));
+
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      await gate;
+      return {
+        ok: true,
+        json: async () => ({
+          access_token: 'SHOULD_NOT_LAND',
+          refresh_token: 'RT_NEW',
+          token_type: 'Bearer',
+          expires_in: 7200,
+          refresh_token_expires_in: 604800,
+          scope: 'offline_access',
+        }),
+      };
+    }));
+    const pending = tokens.resolveUserToken(APP, 'sec', 'feishu', ALICE);
+    for (let i = 0; i < 50 && vi.mocked(fetch).mock.calls.length === 0; i += 1) {
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    writeFileSync(epochPath(ALICE), '1');
+    release();
+    expect(await pending).toBeNull();
+    expect(readFileSync(path, 'utf8')).toContain(ALICE_SECRET);
+    expect(readFileSync(path, 'utf8')).not.toContain('SHOULD_NOT_LAND');
+  });
+
+  it('does not save a device-code poll that becomes ready after revoke', async () => {
+    const { tokens } = await loadRevoke();
+    mkdirSync(dataDir(), { recursive: true });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let tokenFetches = 0;
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (String(url).includes('/oauth/v1/device_authorization')) {
+        return {
+          ok: true,
+          json: async () => ({
+            device_code: 'device-1',
+            verification_uri_complete: 'https://example.test/device',
+            expires_in: 300,
+            interval: 1,
+          }),
+        };
+      }
+      if (String(url).includes('/user_info')) {
+        return { ok: true, json: async () => ({ code: 0, data: { open_id: ALICE, name: 'Alice' } }) };
+      }
+      tokenFetches += 1;
+      await gate;
+      return {
+        ok: true,
+        json: async () => ({
+          access_token: 'SHOULD_NOT_LAND',
+          refresh_token: 'RT_NEW',
+          token_type: 'Bearer',
+          expires_in: 7200,
+          refresh_token_expires_in: 604800,
+          scope: TOKEN_SCOPE,
+        }),
+      };
+    }));
+    const started = await tokens.requestUserAuthorization(APP, 'sec', 'feishu', [], ALICE, () => true);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const pending = started.poll();
+    for (let i = 0; i < 50 && tokenFetches === 0; i += 1) await new Promise(resolve => setImmediate(resolve));
+    expect(tokenFetches).toBe(1);
+    expect(tokens.clearUserToken(APP, 'feishu', ALICE)).toBe(false);
+    release();
+    const result = await pending;
+    expect(result).toEqual({ status: 'failed', error: 'authorization_revoked' });
+    expect(existsSync(tokenPath(ALICE))).toBe(false);
+  });
+});
+
+describe('cli epoch gates', () => {
+  const BYTED_LOGIN = JSON.stringify({
+    status: 'success',
+    data: { verification_uri_complete: 'https://example.test/byted', complete_token: 'ctok' },
+  });
+  const LARK_LOGIN = JSON.stringify({ verification_url: 'https://example.test/lark', device_code: 'dc' });
+
+  function plantIssuer(openId: string) {
+    const root = join(dataDir(), `lark-cli-issuer-${openId}`);
+    mkdirSync(join(root, '.lark-cli'), { recursive: true });
+    mkdirSync(join(root, '.local', 'share', 'lark-cli'), { recursive: true });
+    writeFileSync(join(root, '.lark-cli', 'config.json'), JSON.stringify({
+      apps: [{ appId: APP, brand: 'feishu', lang: 'zh', users: [] }],
+    }));
+    writeFileSync(join(root, '.local', 'share', 'lark-cli', 'master.key'), 'k');
+    writeFileSync(join(root, '.local', 'share', 'lark-cli', `appsecret_${APP}.enc`), 's');
+  }
+
+  function writeLarkToken(home: string, openId: string) {
+    const dir = join(home, '.local', 'share', 'lark-cli');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${APP}_${openId}.enc`), 'tok');
+  }
+
+  it('does not treat a lark HOME rewritten after revoke as logged in', async () => {
+    const { epoch, lark } = await loadRevoke();
+    epoch.bumpCliAuthEpoch(ALICE);
+    const home = lark.larkCliHomeFor(ALICE);
+    mkdirSync(join(home, '.lark-cli'), { recursive: true });
+    writeFileSync(join(home, '.lark-cli', 'config.json'), '{}');
+    writeLarkToken(home, ALICE);
+    expect(lark.hasLarkCliHome(ALICE)).toBe(false);
+  });
+
+  it('drops a bytedcli login whose CLI returns after revoke, and a later login stamps the new epoch', async () => {
+    const { byted, epoch } = await loadRevoke();
+    scriptSpawn = (args) => {
+      if (args.includes('--begin')) {
+        epoch.bumpCliAuthEpoch(ALICE);
+        return { stdout: BYTED_LOGIN };
+      }
+      return undefined;
+    };
+    expect(await byted.beginBytedcliLogin(ALICE)).toBeNull();
+    expect(await byted.hasBytedcliHome(ALICE)).toBe(false);
+
+    scriptSpawn = (args) => args.includes('--begin') ? { stdout: BYTED_LOGIN } : undefined;
+    const again = await byted.beginBytedcliLogin(ALICE);
+    expect(again?.authUrl).toBe('https://example.test/byted');
+    const home = byted.bytedcliHomeFor(ALICE);
+    expect(readFileSync(join(home, '.botmux-auth-epoch'), 'utf8').trim()).toBe('1');
+    expect(await byted.hasBytedcliHome(ALICE)).toBe(true);
+  });
+
+  it('drops a lark-cli login whose CLI returns after revoke, and a later login stamps the new epoch', async () => {
+    const { lark, epoch } = await loadRevoke();
+    plantIssuer(ALICE);
+    scriptSpawn = (args, home) => {
+      if (!args.includes('--no-wait') || !home) return undefined;
+      writeLarkToken(home, ALICE);
+      epoch.bumpCliAuthEpoch(ALICE);
+      return { stdout: LARK_LOGIN };
+    };
+    expect(await lark.beginLarkCliLogin(ALICE)).toBeNull();
+    expect(lark.hasLarkCliHome(ALICE)).toBe(false);
+
+    scriptSpawn = (args, home) => {
+      if (!args.includes('--no-wait') || !home) return undefined;
+      writeLarkToken(home, ALICE);
+      return { stdout: LARK_LOGIN };
+    };
+    const again = await lark.beginLarkCliLogin(ALICE);
+    expect(again?.authUrl).toBe('https://example.test/lark');
+    const home = lark.larkCliHomeFor(ALICE);
+    expect(readFileSync(join(home, '.botmux-auth-epoch'), 'utf8').trim()).toBe('1');
+    expect(lark.hasLarkCliHome(ALICE)).toBe(true);
+  });
+
+  it('does not publish a bytedcli JWT minted after the epoch moved', async () => {
+    const { byted, epoch } = await loadRevoke();
+    mkdirSync(byted.bytedcliHomeFor(ALICE), { recursive: true });
+    scriptSpawn = (args) => {
+      if (args.includes('get-bytecloud-jwt-token')) {
+        epoch.bumpCliAuthEpoch(ALICE);
+        return { stdout: 'cloud-jwt\n' };
+      }
+      if (args.includes('get-codebase-jwt-token')) return { stdout: 'code-jwt\n' };
+      return undefined;
+    };
+    expect(await byted.mintBytedcliJwts(ALICE)).toBeNull();
   });
 });
 

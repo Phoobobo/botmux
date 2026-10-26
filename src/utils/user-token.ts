@@ -95,6 +95,18 @@ function readUserTokenEpoch(appId: string, openId: string): number {
   return readUserTokenEpochUnlocked(appId, openId);
 }
 
+/**
+ * Test-only. Runs after the callback has read the clicker's epoch and before
+ * the locked replace, so a test can advance that epoch in the gap a second
+ * process would win. Production leaves this null.
+ */
+let afterCallbackOwnerEpochReadForTest: ((openId: string, epoch: number) => void) | null = null;
+export function __setAfterCallbackOwnerEpochReadForTest(
+  fn: ((openId: string, epoch: number) => void) | null,
+): void {
+  afterCallbackOwnerEpochReadForTest = fn;
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface TokenStore {
@@ -145,10 +157,11 @@ interface PendingLogin {
    */
   openId?: string;
   /**
-   * User-token epoch captured when this login started. A revoke bumps the
-   * on-disk epoch; the callback passes this value and the locked replace
-   * refuses to write when they differ. Missing on a pending file from before
-   * this field existed, which is treated as 0 so a revoke (epoch ≥ 1) rejects it.
+   * Initiator's epoch at the moment the link was created. The callback does
+   * not use this as the write authority: a forwarded link is completed by
+   * someone else, and comparing this snapshot with their file rejects a
+   * clicker who never revoked, or accepts them when the two numbers happen
+   * to match. Kept so an in-flight pending file from this version still parses.
    */
   authEpoch?: number;
   createdAt: number;
@@ -159,11 +172,13 @@ const pendingLogins = new Map<string, PendingLogin>(); // keyed by state
 const cancelledPendingStates = new Set<string>();
 
 function cancelPendingLoginsFor(appId: string, openId: string): void {
-  for (const [state, pending] of [...pendingLogins]) {
+  // Mark the initiator's in-flight states. Do not delete them: a forwarded link
+  // is completed by someone else, and that callback still needs the app
+  // credentials stored here. The callback refuses only when the clicker is the
+  // initiator who revoked, then drops the set entry.
+  for (const [state, pending] of pendingLogins) {
     if (pending.appId !== appId || pending.openId !== openId) continue;
-    pendingLogins.delete(state);
     cancelledPendingStates.add(state);
-    removePendingLogin(state);
   }
   try {
     for (const name of readdirSync(PENDING_DIR)) {
@@ -172,7 +187,6 @@ function cancelPendingLoginsFor(appId: string, openId: string): void {
       const pending = loadPendingLogin(state);
       if (!pending || pending.appId !== appId || pending.openId !== openId) continue;
       cancelledPendingStates.add(state);
-      removePendingLogin(state);
     }
   } catch { /* directory absent */ }
 }
@@ -1027,11 +1041,12 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
   const code = decodeURIComponent(match[1]);
   const state = decodeURIComponent(stateMatch[1]);
 
-  if (cancelledPendingStates.has(state)) {
-    pendingLogins.delete(state);
-    removePendingLogin(state);
-    return '❌ 授权已撤销，本次没有保存。请重新 /login。';
-  }
+  // Remember, but do not reject yet. This set records that the *initiator*
+  // revoked the pending login. A forwarded link is completed by someone else;
+  // refusing here would tell that person the authorization was revoked when
+  // only the initiator had logged out. The entry is removed once this callback
+  // consumes the state so the set does not grow for the life of the daemon.
+  const initiatorStateRevoked = cancelledPendingStates.delete(state);
 
   const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
@@ -1082,6 +1097,13 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
     const ownerOpenId = authorized.openId;
     const mismatched = isUsableOpenId(pending.openId) && pending.openId !== authorized.openId;
+    // The initiator cancelled this exact pending state and then completed it
+    // themselves. That in-flight code must not write their token back. A
+    // different person completing the same link is a new authorization for
+    // them; their own epoch below is what decides.
+    if (initiatorStateRevoked && pending.openId === ownerOpenId) {
+      return '❌ 授权已撤销，本次没有保存。请重新 /login。';
+    }
     const token: TokenStore = {
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -1101,7 +1123,25 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // Re-check against the actual clicker before overwrite as well: a forwarded
     // link (or a concurrent token update) can make those two identities/states
     // differ. Never replace a broader credential with a narrower one.
-    const authEpoch = isUsableOpenId(ownerOpenId) ? (pending.authEpoch ?? 0) : undefined;
+    //
+    // Epoch authority is the clicker's, read now that user_info has named them.
+    // The initiator's pending.authEpoch is the wrong person's generation: using
+    // it rejects a clicker who never revoked, and accepts one whose epoch
+    // merely happens to equal that snapshot.
+    //
+    // What this read closes: a revoke that lands after user_info returns and
+    // before the locked replace (the hook below, then the lock re-reads).
+    // What it cannot close, and must not pretend to: a revoke that already
+    // happened before user_info returns. The owner is unknowable until then,
+    // so the snapshot is already the post-revoke generation and the lock
+    // agrees. That covers both "they revoked, then consented again" (a fresh
+    // authorization, which should save) and the slice between clicking agree
+    // and user_info returning (a known residual: the consent predates the
+    // revoke, but this process cannot see a pre-revoke epoch).
+    const authEpoch = isUsableOpenId(ownerOpenId)
+      ? readUserTokenEpoch(pending.appId, ownerOpenId)
+      : undefined;
+    afterCallbackOwnerEpochReadForTest?.(ownerOpenId, authEpoch ?? 0);
     const replacement = replaceTokenForApp(
       token, pending.appId, pending.brand, ownerOpenId, undefined, 'authorization', authEpoch,
     );

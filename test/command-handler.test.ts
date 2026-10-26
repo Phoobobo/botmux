@@ -7093,6 +7093,31 @@ describe('handleCommand', () => {
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
       expect(replyContent.length).toBeGreaterThan(0);
     });
+
+    it('points at the platform credentials page when this bot takes platform grants', async () => {
+      const page = 'https://platform.example.test/credentials';
+      const previousGetBot = vi.mocked(getBot).getMockImplementation();
+      vi.mocked(platformCredentialsUrl).mockReturnValue(page);
+      vi.mocked(getBot).mockImplementation((() => ({
+        botName: 'Claude',
+        config: {
+          larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+          workingDir: '~/projects', workingDirs: ['~/projects'],
+          triggerUserAuth: parseTriggerUserAuthConfig({
+            enabled: true, tools: ['lark-cli'], credentialSource: 'platform',
+          }) ?? undefined,
+        },
+      })) as any);
+      const deps = makeDeps();
+      try {
+        await handleCommand('/logout', ROOT_ID, makeLarkMessage('/logout'), deps, LARK_APP_ID);
+        const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(replyContent).toContain(t('cmd.logout.platform_note', { url: page }, 'zh'));
+      } finally {
+        vi.mocked(platformCredentialsUrl).mockReturnValue(null);
+        if (previousGetBot) vi.mocked(getBot).mockImplementation(previousGetBot);
+      }
+    });
   });
 
   describe('/login', () => {
