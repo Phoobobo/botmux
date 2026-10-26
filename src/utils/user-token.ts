@@ -60,6 +60,41 @@ function tokenPathForApp(appId: string, openId?: string): string {
     : join(TOKEN_DIR, `user-token-${appId}.json`);
 }
 
+/** appId is concatenated into a filename next to the token. Same shape rule as open_id. */
+const APP_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+
+function userTokenEpochPath(appId: string, openId: string): string {
+  return join(TOKEN_DIR, `user-token-epoch-${appId}-${openId}`);
+}
+
+function parseUserTokenEpoch(text: string): number {
+  const n = Number(text.trim());
+  return Number.isInteger(n) && n >= 0 && n < Number.MAX_SAFE_INTEGER ? n : 0;
+}
+
+/** Unlocked read. Callers inside `withFileLockSync(tokenPath)` must use this, not a locking wrapper. */
+function readUserTokenEpochUnlocked(appId: string, openId: string): number {
+  try {
+    return parseUserTokenEpoch(readFileSync(userTokenEpochPath(appId, openId), 'utf8'));
+  } catch {
+    return 0;
+  }
+}
+
+function writeUserTokenEpochUnlocked(appId: string, openId: string, epoch: number): void {
+  atomicWriteFileSync(userTokenEpochPath(appId, openId), String(epoch), { mode: 0o600 });
+}
+
+/**
+ * Snapshot of the per-person epoch. Taken outside the token lock at the start
+ * of a login or refresh; the lock re-reads it before any write. A revoke that
+ * lands in between makes the two differ and the write is dropped.
+ */
+function readUserTokenEpoch(appId: string, openId: string): number {
+  if (!isUsableOpenId(openId) || !APP_ID_RE.test(appId)) return 0;
+  return readUserTokenEpochUnlocked(appId, openId);
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface TokenStore {
@@ -109,10 +144,38 @@ interface PendingLogin {
    * 具体的人而不是整个 bot。缺省（旧链路 / 无 sender 的入口）→ 写 per-app 文件。
    */
   openId?: string;
+  /**
+   * User-token epoch captured when this login started. A revoke bumps the
+   * on-disk epoch; the callback passes this value and the locked replace
+   * refuses to write when they differ. Missing on a pending file from before
+   * this field existed, which is treated as 0 so a revoke (epoch ≥ 1) rejects it.
+   */
+  authEpoch?: number;
   createdAt: number;
 }
 
 const pendingLogins = new Map<string, PendingLogin>(); // keyed by state
+/** States revoked while a callback or device poll might still hold them in memory. */
+const cancelledPendingStates = new Set<string>();
+
+function cancelPendingLoginsFor(appId: string, openId: string): void {
+  for (const [state, pending] of [...pendingLogins]) {
+    if (pending.appId !== appId || pending.openId !== openId) continue;
+    pendingLogins.delete(state);
+    cancelledPendingStates.add(state);
+    removePendingLogin(state);
+  }
+  try {
+    for (const name of readdirSync(PENDING_DIR)) {
+      if (!name.endsWith('.json')) continue;
+      const state = name.slice(0, -5);
+      const pending = loadPendingLogin(state);
+      if (!pending || pending.appId !== appId || pending.openId !== openId) continue;
+      cancelledPendingStates.add(state);
+      removePendingLogin(state);
+    }
+  } catch { /* directory absent */ }
+}
 
 function pendingPath(state: string): string | null {
   return /^[a-f0-9]{64}$/.test(state) ? join(PENDING_DIR, `${state}.json`) : null;
@@ -180,6 +243,8 @@ interface TokenReplacementResult {
   token: TokenStore;
   droppedScopes: string[];
   superseded: boolean;
+  /** The file is gone, or this login's epoch was revoked. Do not keep the in-memory token. */
+  absent?: boolean;
 }
 
 type TokenReplacementPolicy = 'authorization' | 'refresh';
@@ -207,12 +272,33 @@ function replaceTokenForApp(
   openId?: string,
   expected?: TokenStore,
   policy: TokenReplacementPolicy = 'authorization',
+  epoch?: number,
 ): TokenReplacementResult {
   const path = tokenPathForApp(appId, openId);
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
   return withFileLockSync(path, () => {
+    if (isUsableOpenId(openId) && epoch !== undefined && readUserTokenEpochUnlocked(appId, openId) !== epoch) {
+      return {
+        saved: false,
+        token,
+        droppedScopes: [],
+        superseded: true,
+        absent: true,
+      };
+    }
     const current = loadTokenForApp(appId, brand, openId);
+    // Refresh must not recreate a file a revoke deleted while the network
+    // request was in flight. `expected && !current` used to fall through and save.
+    if (expected && !current) {
+      return {
+        saved: false,
+        token,
+        droppedScopes: [],
+        superseded: true,
+        absent: true,
+      };
+    }
     if (expected && current && !sameTokenVersion(current.token, expected)) {
       return {
         saved: false,
@@ -373,6 +459,29 @@ export function lookupAuthorizedUserName(
   return token.userName;
 }
 
+/**
+ * Delete this person's token for this app and bump the epoch so an in-flight
+ * refresh, device poll, or OAuth callback cannot write it back.
+ *
+ * Only the per-person file is removed. The legacy per-app file and
+ * `user-token.json` have no provable owner and stay. The epoch file stays too:
+ * it is what makes the next write fail.
+ */
+export function clearUserToken(appId: string, brand: Brand, openId: string): boolean {
+  if (!isUsableOpenId(openId) || !APP_ID_RE.test(appId)) return false;
+  cancelPendingLoginsFor(appId, openId);
+  const path = tokenPathForApp(appId, openId);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withFileLockSync(path, () => {
+    const next = readUserTokenEpochUnlocked(appId, openId) + 1;
+    writeUserTokenEpochUnlocked(appId, openId, next);
+    const current = loadTokenFromPath(path);
+    if (!current || current.openId !== openId || !tokenMatches(current, appId, brand)) return false;
+    try { unlinkSync(path); } catch { /* already absent */ }
+    return !existsSync(path);
+  }, { maxWaitMs: 30_000 });
+}
+
 // ─── Token refresh ────────────────────────────────────────────────────────────
 
 async function refreshToken(
@@ -382,6 +491,7 @@ async function refreshToken(
   brand: Brand = 'feishu',
   signal?: AbortSignal,
 ): Promise<TokenStore | null> {
+  const authEpoch = isUsableOpenId(token.openId) ? readUserTokenEpoch(appId, token.openId) : undefined;
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
@@ -428,6 +538,7 @@ async function refreshToken(
         token.openId,
         token,
         'refresh',
+        authEpoch,
       );
       if (replacement.saved) {
         if (replacement.droppedScopes.length > 0) {
@@ -439,6 +550,9 @@ async function refreshToken(
           logger.info('[user-token] Refreshed User Access Token');
         }
       }
+      // Revoked or deleted while the refresh was in flight. The body we just
+      // received must not be handed back or written later.
+      if (!replacement.saved && replacement.absent) return null;
       return replacement.token;
     } catch {
       return null;
@@ -581,6 +695,7 @@ export async function requestUserAuthorization(
   poll: () => Promise<UserAuthorizationPollResult>;
 }> {
   if (!isUsableOpenId(openId) || !isCurrent()) throw new Error('authorization_origin_changed');
+  const authEpoch = readUserTokenEpoch(appId, openId);
   const scopes = authorizationScopes(appId, brand, extraScopes, openId);
   const response = await fetch(`${larkHosts(brand).accounts}/oauth/v1/device_authorization`, {
     method: 'POST',
@@ -666,9 +781,12 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
-      }, appId, brand, openId);
+      }, appId, brand, openId, undefined, 'authorization', authEpoch);
       if (!replacement.saved) {
-        return { status: 'failed', error: 'authorization_scope_stale' };
+        return {
+          status: 'failed',
+          error: replacement.absent ? 'authorization_revoked' : 'authorization_scope_stale',
+        };
       }
       return { status: 'ready', token: data.access_token };
     } catch {
@@ -779,7 +897,7 @@ export function generateAuthUrl(
     appId,
     appSecret,
     brand,
-    ...(isUsableOpenId(openId) ? { openId } : {}),
+    ...(isUsableOpenId(openId) ? { openId, authEpoch: readUserTokenEpoch(appId, openId) } : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -909,6 +1027,12 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
   const code = decodeURIComponent(match[1]);
   const state = decodeURIComponent(stateMatch[1]);
 
+  if (cancelledPendingStates.has(state)) {
+    pendingLogins.delete(state);
+    removePendingLogin(state);
+    return '❌ 授权已撤销，本次没有保存。请重新 /login。';
+  }
+
   const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
     return '❌ 授权失败：state 不匹配或已过期，请重新发起授权';
@@ -977,7 +1101,13 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // Re-check against the actual clicker before overwrite as well: a forwarded
     // link (or a concurrent token update) can make those two identities/states
     // differ. Never replace a broader credential with a narrower one.
-    const replacement = replaceTokenForApp(token, pending.appId, pending.brand, ownerOpenId);
+    const authEpoch = isUsableOpenId(ownerOpenId) ? (pending.authEpoch ?? 0) : undefined;
+    const replacement = replaceTokenForApp(
+      token, pending.appId, pending.brand, ownerOpenId, undefined, 'authorization', authEpoch,
+    );
+    if (!replacement.saved && replacement.absent) {
+      return '❌ 授权已撤销，本次没有保存。请重新 /login。';
+    }
     if (!replacement.saved) {
       logger.warn(`[user-token] 放弃保存：新 token 缺少旧 scope（${replacement.droppedScopes.join(', ')}）`);
       return `❌ 授权未完成：新 token 缺少已有权限 ${replacement.droppedScopes.join(' ')}，`
