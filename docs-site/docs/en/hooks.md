@@ -78,6 +78,7 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 | `session.exit` | A worker exits, crashes, or the session is closed (silenced by default on daemon shutdown) |
 | `session.idle` | A session enters or leaves idle, deduplicated per session + state over 10s |
 | `session.requires_attention` | A TUI prompt or a worker `user_notify` needs the user to act |
+| `turn.finished` | A turn reaches `turn_terminal`. Emitted once per session, turn, and dispatch attempt. `GET /api/events` also sends `event: turn.finished` |
 
 ## Payload Fields
 
@@ -98,10 +99,13 @@ Different events carry extra fields:
 | `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
 | `session.idle` | `prevState`, `newState`, `transition`, `source` |
 | `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
+| `turn.finished` | `turnId`, `status` (`success` or `error`), `senderOpenId` (only when this turn's reply target has a sender), `dispatchAttempt` when present |
 
 `schedule.fired.status` and the task's `lastStatus` use `ok`, `error`, or `skipped`: `ok` means the task was handed to the executor, not that model generation or message delivery has completed; `error` means the precondition check or dispatch failed; `skipped` means the precondition did not pass and no model was called. A skip does not consume the repeat count or delete the task, precondition configuration, or execution logs. Enabled one-shot tasks remain enabled and become eligible for another scheduler check after at least 30 seconds; if an early manual run is skipped, subsequent automatic checks do not precede the original scheduled time. Recurring tasks keep their existing cadence.
 
 `skipped` is a new status and requires no migration of existing tasks. Custom hooks that accept only `ok/error` must handle it separately instead of treating it as a successful execution.
+
+`turn.finished` maps a worker `completed` terminal to `success`, and `failed`, `cancelled`, or `ambiguous` to `error`. `senderOpenId` comes only from that turn's reply target. When the turn has no sender the field is absent; the session owner, creator, and previous caller are not filled in. The event is a notification, not a gate. A worker that exits without `turn_terminal` does not synthesize one (`session.exit` still covers the process exit).
 
 By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
 

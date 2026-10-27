@@ -78,6 +78,7 @@ tail -f /tmp/botmux-hook.log
 | `session.exit` | worker 退出、崩溃或会话被关闭（daemon shutdown 默认静音） |
 | `session.idle` | session 进入或离开 idle，按 session + 状态 10s 去重 |
 | `session.requires_attention` | TUI prompt 或 worker `user_notify` 需要用户处理 |
+| `turn.finished` | 一轮到达 `turn_terminal`。同一 session、turn、dispatch attempt 只发一次。Dashboard `GET /api/events` 同时推 `event: turn.finished` |
 
 ## Payload 字段
 
@@ -98,10 +99,13 @@ tail -f /tmp/botmux-hook.log
 | `session.exit` | `reason`、`code`（worker 退出路径；`dashboard_close` 为 `null`） |
 | `session.idle` | `prevState`、`newState`、`transition`、`source` |
 | `session.requires_attention` | `reason`、`description`、`optionsCount`、`optionsPreview`、`multiSelect`、`message` |
+| `turn.finished` | `turnId`、`status`（`success` 或 `error`）、`senderOpenId`（仅当这一轮的 reply target 有发送者）、`dispatchAttempt`（有则带） |
 
 `schedule.fired.status` 与任务的 `lastStatus` 使用 `ok`、`error`、`skipped`：`ok` 表示已交给执行器，不代表模型已完成或消息已送达；`error` 表示前置检查或提交报错；`skipped` 表示前置条件未通过、未调用模型。跳过不消耗重复次数，也不删除任务、前置配置或执行日志。已启用的一次性任务跳过后保持启用，等待至少 30 秒后由调度器重新检查；若提前手动运行被跳过，后续自动检查不会早于原定执行时间。周期任务仍按原周期检查。
 
 `skipped` 是新增状态，旧任务无需迁移；只接受 `ok/error` 的自定义 Hook 需增加该分支，不能把它当作执行成功。
+
+`turn.finished` 的 `status` 把 worker 的 `completed` 记为 `success`，把 `failed`、`cancelled`、`ambiguous` 记为 `error`。`senderOpenId` 只来自这一轮自己的 reply target；没有发送者时字段不出现，不会用会话 owner、创建者或上一位调用者填上。它是通知，不是 gate。worker 没发出 `turn_terminal` 就退出时不会补这一条（进程退出仍走 `session.exit`）。
 
 默认会把 `content`、`message`、`description`、`finalOutput`、`lastScreenContent` 截断到 **600 字符**，并补充 `xxxLength` / `xxxTruncated`；只有 `redact.fullContentEvents` 内的事件透传全文。
 

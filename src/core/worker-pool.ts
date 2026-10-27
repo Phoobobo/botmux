@@ -672,6 +672,7 @@ export function mergeModelFallbackObservation(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { publishTurnFinished } from './turn-finished-event.js';
 import {
   publishSessionPreviewCleared,
   takeSessionPreviewTarget,
@@ -18652,6 +18653,7 @@ function setupWorkerHandlers(
           );
           break;
         }
+        publishTurnFinished(ds, msg);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -19785,6 +19787,11 @@ function setupWorkerHandlers(
                   // the daemon ACK long enough to emit a later terminal IPC.
                   // Persist the exact completed attempt first; the worker's
                   // ordered duplicate terminal remains idempotent.
+                  publishTurnFinished(ds, {
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    status: 'completed',
+                  });
                   await cb.onTurnTerminal?.(ds, {
                     type: 'turn_terminal',
                     sessionId: ds.session.sessionId,
