@@ -88,6 +88,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
+import { parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -611,6 +612,8 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   );
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
+
+const groupSendStorePath = (larkAppId: string): string => join(config.session.dataDir, `group-sends-${larkAppId}.json`);
 
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
@@ -6983,6 +6986,42 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
     jsonRes(res, 502, { error: String(e) });
   }
 }));
+
+/**
+ * Request-bound send (see services/request-bound-group-send.ts): body exactly
+ * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
+ * The same requestId never produces a second visible message; an attempt whose
+ * outcome cannot be reconciled any more is `409 outcome_unknown`.
+ */
+ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  const input = parseGroupSendBody(body);
+  if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const larkAppId = cachedLarkAppId;
+  try {
+    const result = await sendRequestBoundGroupMessage({
+      larkAppId, storePath: groupSendStorePath(larkAppId),
+      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid),
+    }, { chatId: p.chatId, ...input });
+    const { status, ...rest } = result;
+    return jsonRes(res, status, rest);
+  } catch (e) {
+    // Store unreadable/unwritable: fail closed, nothing was sent.
+    return jsonRes(res, 503, { ok: false, error: 'store_unavailable', detail: String(e) });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+/** Read-back of one message in this chat: sender, deleted flag, text and the bound requestId (if any). */
+ipcRoute('GET', '/api/groups/:chatId/messages/:messageId', requireBoundBot(async (_req, res, p) => {
+  const larkAppId = cachedLarkAppId;
+  const result = await readRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId),
+    detail: id => getMessageDetail(larkAppId, id, { userCardContent: false, timeoutMs: 10000 }),
+  }, p.chatId, p.messageId);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, result);
+}, NOT_BOUND_BODY.okFalse));
 
 /** Host-only rename through this daemon's exact bot identity. */
 ipcRoute('PUT', '/api/groups/:chatId/name', requireBoundBot(async (req, res, p) => {
