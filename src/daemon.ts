@@ -194,6 +194,7 @@ import {
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
+import { createCardClickTurnBinder } from './services/card-click-turn-bind.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setTurnResultRuntime } from './core/turn-result-runtime.js';
 
@@ -468,7 +469,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -7070,6 +7071,16 @@ function scheduleCompletionProposalStartupRecovery(larkAppId: string): void {
   }
 }
 
+const cardClickTurns = createCardClickTurnBinder({
+  activeSessions,
+  dataDir: () => config.session.dataDir,
+  noteTurnReceived,
+  beginNewTurn,
+  trustedCallerForInboundTurn: (larkAppId, senderOpenId, senderUnionId) =>
+    trustedCallerForInboundTurn(larkAppId, senderOpenId, senderUnionId, false),
+});
+setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body));
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
@@ -7140,6 +7151,7 @@ const cardDeps: CardHandlerDeps = {
       senderIsBot: opts.senderIsBot,
       substitute: false,
     }),
+  cardClickTurn: (input) => cardClickTurns.accept(input),
 };
 
 // Plugin routing is resolved from the persistent registry and current Bot

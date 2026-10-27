@@ -1618,6 +1618,19 @@ function composeDashboardSessionRows(
 let cachedLarkAppId = '';
 export function setLarkAppId(id: string): void { cachedLarkAppId = id; }
 
+export type CardClickTurnPostResult =
+  | { ok: true; messageId: string; exp: number }
+  | { ok: false; status: number; error: string };
+
+let cardClickTurnPoster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null = null;
+
+/** Daemon injects the signer that posts a single-use card into a chat. */
+export function setCardClickTurnPoster(
+  poster: ((larkAppId: string, body: unknown) => Promise<CardClickTurnPostResult>) | null,
+): void {
+  cardClickTurnPoster = poster;
+}
+
 let decisionBoardService: DecisionBoardService | null = null;
 /** daemon 启动时注入（只有 daemon 进程会写看板；core-only / 测试缺省为 null → 503）。 */
 export function setDecisionBoardService(service: DecisionBoardService | null): void { decisionBoardService = service; }
@@ -4536,6 +4549,17 @@ ipcRoute('POST', '/api/sessions/spawn', requireBoundBot(async (req, res) => {
   }
   jsonRes(res, 200, r);
   });
+}, NOT_BOUND_BODY.botNotFound));
+
+// Local integrator: post a signed single-use card. The click, not this call,
+// starts the turn, and the clicker — not the session owner — is the sender.
+ipcRoute('POST', '/api/cards/click-turn', requireBoundBot(async (req, res) => {
+  if (!cardClickTurnPoster) return jsonRes(res, 503, { ok: false, error: 'card_click_turn_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const result = await cardClickTurnPoster(cachedLarkAppId, body);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, { ok: true, messageId: result.messageId, exp: result.exp });
 }, NOT_BOUND_BODY.botNotFound));
 
 function parseHeadlessCreateBody(body: unknown): {

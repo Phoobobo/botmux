@@ -178,6 +178,15 @@ export interface CardHandlerDeps {
       replyRootId?: string;
     },
   ) => void;
+  /** Signed single-use button. The handler admits the clicker and returns a
+   *  continuation that starts the turn after the card callback is acked. */
+  cardClickTurn?: (input: {
+    larkAppId: string;
+    operatorOpenId?: string;
+    operatorUnionId?: string;
+    payload?: string;
+    sig?: string;
+  }) => Promise<{ ok: true; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1548,6 +1557,26 @@ function buildMenuModelPickerCard(
   });
 }
 
+function cardClickTurnToastKey(reason: string): string {
+  switch (reason) {
+    case 'expired': return 'card.click_turn.expired';
+    case 'replayed': return 'card.click_turn.replayed';
+    case 'no_identity': return 'card.click_turn.no_identity';
+    case 'bot_or_app': return 'card.click_turn.bot_or_app';
+    case 'blocked': return 'card.click_turn.blocked';
+    case 'not_allowed': return 'card.click_turn.not_allowed';
+    case 'cannot_operate': return 'card.click_turn.cannot_operate';
+    case 'grant_blocked': return 'card.click_turn.grant_blocked';
+    case 'session_not_found': return 'card.action.session_gone';
+    case 'working_dir_mismatch': return 'card.click_turn.working_dir_mismatch';
+    case 'working_dir_required': return 'card.click_turn.working_dir_required';
+    case 'working_dir_missing': return 'card.click_turn.working_dir_missing';
+    case 'chat_type_mismatch': return 'card.click_turn.chat_type_mismatch';
+    case 'delivery_failed': return 'card.click_turn.delivery_failed';
+    default: return 'card.click_turn.rejected';
+  }
+}
+
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
   const data = normalizeCardActionData(input);
   logCardActionDiagnostics('handler', input, data);
@@ -1996,6 +2025,31 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         if (cardMessageId) await updateMessage(larkAppId, cardMessageId, resultCard);
         else await sendUserMessage(larkAppId, operatorOpenId, resultCard, 'interactive');
       },
+    };
+  }
+
+  if (value?.action === 'card_click_turn' && larkAppId) {
+    const loc = localeForBot(larkAppId);
+    if (!deps.cardClickTurn) {
+      return { toast: { type: 'error', content: t('card.click_turn.unavailable', undefined, loc) } };
+    }
+    const accepted = await deps.cardClickTurn({
+      larkAppId,
+      operatorOpenId,
+      operatorUnionId: typeof data?.operator?.union_id === 'string' ? data.operator.union_id : undefined,
+      payload: value.payload,
+      sig: value.sig,
+    });
+    if (!accepted.ok) {
+      return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };
+    }
+    return {
+      toast: { type: 'info', content: t('card.click_turn.started', undefined, loc) },
+      afterAck: () => accepted.run().then(result => {
+        if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
+          logger.warn(`[card-click-turn] delivery failed: ${String((result as { reason?: unknown }).reason ?? 'delivery_failed')}`);
+        }
+      }),
     };
   }
 

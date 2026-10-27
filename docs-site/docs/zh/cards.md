@@ -168,3 +168,27 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"te
 - **执行耗时**：从输入实际交给 CLI，到最终输出被观察到；Codex App 使用原生完成时间。两项都不包含飞书投递耗时。
 
 仅展示当前轮次和尝试的已知计时；缺失或无效的数值不显示。带独立 dispatch attempt 的重试不展示等待时间，以免把之前的执行也算进等待。旧 worker、恢复后无法确定起点的轮次，以及模型通过 `botmux send` 提前发出的消息不会补猜耗时。此配置不改变动态单卡已有的计时标题。
+
+## 签名按钮：以点击者身份开始一轮
+
+本机集成方可以让机器人往它所在的群里发一张一次性按钮。点击后，daemon 用**点击者**的 open_id 作为这一轮的 `senderOpenId` 开始会话，和这个人自己发了一条消息一样：若开启了 `triggerUserAuth`（`credentialSource: local`），凭证按这一轮的发送者签发，不会退回会话 owner 或创建者。
+
+按钮上的内容（提示词、目标群或会话、可选工作目录与会话类型、nonce、过期时间）由 daemon 用单独的密钥 HMAC 签名。篡改、过期、重放的点击会被拒绝。过期的令牌在核销 nonce 之前就拒绝，所以报的是过期而不是已使用。nonce 会落盘，daemon 重启后未过期的按钮也不能再用第二次。
+
+点击者必须同时通过与发消息相同的 `evaluateTalk`（含 allowed users、blocked users、grant）、`canOperate`，以及 `grantCommandRestriction`。因此只有对话授权、没有操作权限的人点不了；`restrictGrantCommands` 打开时，对话来源是 chatGrant / globalGrant 的点击也会被拒绝。应用或机器人（已知同机 peer，或身份缓存类型为 `bot` / `app`）没有身份，不会开轮，也不会改用 owner。缓存里没有记录的点击者仍按真人处理。卡片回调没有平台 `sender_type`，不要为了探测身份去 `resolveSender`（那会把未知 id 写成 user）。
+
+目标必须是且只能是一个 `chatId` 或一个 `sessionId`。`sessionId` 只匹配本机器人当前活跃会话，找不到就拒绝，不会另开一条、也不会借用那条会话的 owner。`chatId` 在本群还没有 chat-scope 会话时会新建一条，owner 和创建者都是点击者，并且必须带一个已存在的绝对路径工作目录。已有会话如果工作目录和签名不一致，点击被拒绝。新建会话未签名 `chatType` 时按群聊鉴权；私聊要显式签 `p2p`，否则 `p2pOpen` 不会放行。
+
+发卡片的接口是 daemon IPC `POST /api/cards/click-turn`（与 `/api/sessions/spawn` 相同的本机 HMAC，且 daemon 已绑定当前机器人）。它不是 core-only 的公开路由。请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `prompt` | 必填，点下去之后原样作为这一轮的用户输入，最长 1500 字 |
+| `chatId` / `sessionId` | 二选一，轮次打到哪个群的 chat-scope 会话，或哪一个已有会话 |
+| `postChatId` | 卡片发到哪个群，默认同 `chatId`；只给了 `sessionId` 时必填 |
+| `workingDir` | 可选，必须是已存在的绝对路径。新建会话时必填 |
+| `chatType` | 可选，`group` 或 `p2p` |
+| `ttlMs` | 可选，1 分钟到 7 天，默认 1 小时 |
+| `buttonLabel` / `title` | 可选 |
+
+成功时返回 `{ ok, messageId, exp }`。机器人不在目标群时返回 403 `bot_not_in_chat`。
