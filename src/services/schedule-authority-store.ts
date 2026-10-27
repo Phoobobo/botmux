@@ -12,6 +12,7 @@ import type { ScheduledTask } from '../types.js';
 import type { TriggerUserAuthTool } from './trigger-user-auth.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { canonicalScheduleInput } from './schedule-store.js';
+import { absorbLegacyFailureStats } from './schedule-until-done.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 
 export type ScheduleAuthorityKind = 'legacy' | 'direct' | 'delegated';
@@ -41,6 +42,30 @@ export interface ScheduleAuthorityRecord {
   targetTurnId?: string;
   targetGeneration?: number;
 }
+
+/** Why a scheduled run found no usable identity (claim card wording). */
+export type ScheduleIdentityGapReason = 'no_creator' | 'creator_revoked' | 'claimant_revoked';
+
+/** The single claim card kept per task (see core/schedule-identity-claim). */
+export interface ScheduleClaimCardRecord {
+  appId: string;
+  taskId: string;
+  messageId: string;
+  chatId: string;
+  /** `pending` = still asking for a claimant; `claimed` = last rendered with a
+   *  claimant; `resolved` = the creator regained access before anyone claimed.
+   *  Only a pending card is refreshed in place on later fires. */
+  status: 'pending' | 'claimed' | 'resolved';
+  reason?: ScheduleIdentityGapReason;
+  /** Scheduled turn that last refreshed the card: a re-publication of the same
+   *  turn (restore, identity-model replay) must not count as another fire. */
+  lastTurnId?: string;
+  lastFiredAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const CLAIM_CARD_REASONS: readonly ScheduleIdentityGapReason[] = ['no_creator', 'creator_revoked', 'claimant_revoked'];
 
 export type CommitDelegatedScheduleResult =
   | { ok: true; task: ScheduledTask; replay: boolean }
@@ -76,6 +101,16 @@ function parseTask(raw: unknown, expectedAppId?: string): ScheduledTask {
   }
   if (expectedAppId && task.larkAppId !== undefined && task.larkAppId !== expectedAppId) {
     throw new Error('schedule_authority_app_mismatch');
+  }
+  // #2334 persisted the failure counter top-level in task_json; the ledger is
+  // the only counter now. Absorb on read (max wins, idempotent) so an upgrade
+  // never resets an in-flight streak; the next settlement persists the folded
+  // ledger back. `failureAlertSent` stays top-level (still the admin watermark).
+  const legacyRaw = task as ScheduledTask & { consecutiveFailures?: unknown };
+  const runStats = absorbLegacyFailureStats(task.runStats, legacyRaw.consecutiveFailures);
+  if (runStats) {
+    delete legacyRaw.consecutiveFailures;
+    task = { ...task, runStats };
   }
   return task;
 }
@@ -174,6 +209,21 @@ export class ScheduleAuthorityStore {
         db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN self_manage INTEGER NOT NULL DEFAULT 0;');
       }
       migrateLegacyGrantUnique(db);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS schedule_identity_claim_cards (
+          app_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','claimed','resolved')),
+          reason TEXT,
+          last_turn_id TEXT,
+          last_fired_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY (app_id, task_id)
+        );
+      `);
       db.exec('COMMIT;');
       return new ScheduleAuthorityStore(db);
     } catch (error) {
@@ -419,6 +469,45 @@ export class ScheduleAuthorityStore {
       WHERE app_id = ? AND task_id = ? AND state != 'revoked'
     `).run(new Date().toISOString(), appId, taskId);
     return Number(result.changes) > 0;
+  }
+
+  getClaimCard(appId: string, taskId: string): ScheduleClaimCardRecord | undefined {
+    const row = this.db.prepare(`
+      SELECT message_id, chat_id, status, reason, last_turn_id, last_fired_at, created_at, updated_at
+      FROM schedule_identity_claim_cards WHERE app_id = ? AND task_id = ?
+    `).get(appId, taskId) as Record<string, unknown> | undefined;
+    if (!row) return;
+    const reason = CLAIM_CARD_REASONS.find(r => r === row.reason);
+    return {
+      appId,
+      taskId,
+      messageId: String(row.message_id),
+      chatId: String(row.chat_id),
+      status: row.status === 'claimed' || row.status === 'resolved' ? row.status : 'pending',
+      ...(reason ? { reason } : {}),
+      ...(typeof row.last_turn_id === 'string' ? { lastTurnId: row.last_turn_id } : {}),
+      ...(typeof row.last_fired_at === 'string' ? { lastFiredAt: row.last_fired_at } : {}),
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  putClaimCard(record: Omit<ScheduleClaimCardRecord, 'createdAt' | 'updatedAt'>): void {
+    const now = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO schedule_identity_claim_cards
+        (app_id, task_id, message_id, chat_id, status, reason, last_turn_id, last_fired_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(app_id, task_id) DO UPDATE SET
+        created_at = CASE WHEN schedule_identity_claim_cards.message_id = excluded.message_id
+          THEN schedule_identity_claim_cards.created_at ELSE excluded.created_at END,
+        message_id = excluded.message_id, chat_id = excluded.chat_id, status = excluded.status,
+        reason = excluded.reason, last_turn_id = excluded.last_turn_id,
+        last_fired_at = excluded.last_fired_at, updated_at = excluded.updated_at
+    `).run(
+      record.appId, record.taskId, record.messageId, record.chatId, record.status,
+      record.reason ?? null, record.lastTurnId ?? null, record.lastFiredAt ?? null, now, now,
+    );
   }
 
   /** Compensation for a direct create whose protected companion setup failed

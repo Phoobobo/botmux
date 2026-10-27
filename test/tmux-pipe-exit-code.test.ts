@@ -26,19 +26,6 @@ let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
 /**
- * Hook ceiling for these LIVE-tmux fixtures. The vitest `unit` project gives
- * test bodies 30s but leaves hooks at vitest's 10s default — these beforeEach/
- * afterEach hooks spawn/kill a real per-test tmux server, and on a scheduler-
- * starved shard (this file runs in the unit project alongside the whole suite)
- * that can take longer than 10s while the bodies legitimately run to the
- * lifecycle watcher's ~14s worst case. Give the hooks the SAME 30s ceiling as
- * the bodies. This does NOT mask a broken fixture: the corpse setup still
- * asserts a concrete status and its waiter has its own (shorter) deadline, so
- * a genuinely wrong setup fails instead of hanging.
- */
-const REAL_TMUX_HOOK_TIMEOUT_MS = 30_000;
-
-/**
  * Backend 退出检测依赖它自己的生命周期轮询（1s 起步、缺会话要连续 3 次才
  * 判定），单例最坏 ~14s。给足余量且不靠固定 sleep。
  */
@@ -91,7 +78,7 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     process.env.SHELL = '/bin/sh';
     delete process.env.TMUX;
     delete process.env.TMUX_PANE;
-  }, REAL_TMUX_HOOK_TIMEOUT_MS);
+  });
 
   afterEach(() => {
     for (const [key, value] of Object.entries(saved)) {
@@ -100,7 +87,7 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     }
     tmux('kill-server');
     rmSandboxScratch(dir);
-  }, REAL_TMUX_HOOK_TIMEOUT_MS);
+  });
 
   // 这两条是 PR 的全部意义所在：默认 tmux 后端必须能把「重试无意义」的退出码
   // 交给 daemon，否则 restart-policy 的永久通道在生产上是死代码。
@@ -219,7 +206,7 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     const deadStatus = await waitForDeadPane('bmx-corpse');
     expect(deadStatus.dead).toBe(true);
     expect(deadStatus.status).toBe('77');
-  }, REAL_TMUX_HOOK_TIMEOUT_MS);
+  });
 
   afterEach(() => {
     for (const [key, value] of Object.entries(saved)) {
@@ -228,7 +215,7 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     }
     tmux('kill-server');
     rmSandboxScratch(dir);
-  }, REAL_TMUX_HOOK_TIMEOUT_MS);
+  });
 
   /**
    * Wait until the pane is dead AND tmux has published its status.
@@ -361,21 +348,21 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
  * exactly the window that turned a real `exit 3` into the fallback code 1
  * under CI load, so it must not rely on a timing-dependent end-to-end test.
  */
-describe('resolvePaneDeath waits for pane_dead_status without inventing one', () => {
+describe('resolvePaneDeath three-way verdict: alive / dead / unknown', () => {
   const noSleep = () => {};
   const OPTS = { attempts: 5, intervalMs: 0 };
 
-  it('returns the status immediately when the first read already carries it (no re-read)', () => {
+  it('returns the dead status immediately when the first read carries it (no re-read)', () => {
     let reads = 0;
     const r = resolvePaneDeath('1:77', () => { reads += 1; return '1:77'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 77 });
+    expect(r).toEqual({ kind: 'dead', status: 77 });
     expect(reads).toBe(0);
   });
 
-  it('a live pane (dead=0) is not dead and never re-read', () => {
+  it('a live pane (0:) is alive and never re-read', () => {
     let reads = 0;
     const r = resolvePaneDeath('0:', () => { reads += 1; return '0:'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: false, status: null });
+    expect(r).toEqual({ kind: 'alive' });
     expect(reads).toBe(0);
   });
 
@@ -383,42 +370,83 @@ describe('resolvePaneDeath waits for pane_dead_status without inventing one', ()
     const lines = ['1:', '1:3'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 3 });
+    expect(r).toEqual({ kind: 'dead', status: 3 });
     expect(reads).toBe(2);
   });
 
-  it('accepts a permanently-empty status as null after the budget (signal death has no status)', () => {
+  it('accepts a permanently-empty status as a status-less dead verdict (signal death)', () => {
     let reads = 0;
     const r = resolvePaneDeath('1:', () => { reads += 1; return '1:'; }, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: null });
+    expect(r).toEqual({ kind: 'dead', status: null });
     expect(reads).toBe(OPTS.attempts);
   });
 
-  it('an inconclusive mid-poll read does not undo the already-confirmed death', () => {
-    // empty line = tmux error/timeout; the pane was already seen dead, so this
-    // contributes no status but must not flip the verdict back to alive.
+  it('an unreadable mid-poll line does not undo an already-confirmed death', () => {
     const lines = ['1:', '', '1:127'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 127 });
+    expect(r).toEqual({ kind: 'dead', status: 127 });
   });
 
-  // The discriminating case for "inconclusive never undoes a confirmed death":
-  // AFTER the transient error there is no further successful read at all. If an
-  // empty line were allowed to overwrite the confirmed death, this returns
-  // {dead:false} and the corpse would never be reaped (a real session leak).
-  it('keeps the confirmed death when every read AFTER the transient error is inconclusive', () => {
+  it('keeps the confirmed death when every read after a transient error is unreadable', () => {
     const lines = ['1:', '', '', ''];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: null });
+    expect(r).toEqual({ kind: 'dead', status: null });
   });
 
   it('respects the attempt bound when the status lands exactly on the last poll', () => {
     const lines = ['1:', '1:', '1:', '1:', '1:77'];
     let reads = 0;
     const r = resolvePaneDeath('1:', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
-    expect(r).toEqual({ dead: true, status: 77 });
+    expect(r).toEqual({ kind: 'dead', status: 77 });
     expect(reads).toBe(5);
   });
-});
+
+  // #2408 exit B: an UNREADABLE FIRST read used to return {dead:false} with
+  // ZERO re-reads, collapsing a transient tmux timeout into "pane is fine" and
+  // dropping both the real code and the corpse reap. It must retry.
+  it('retries when the FIRST read is unreadable and then adopts the dead code', () => {
+    // firstLine ('') is the unreadable first read and is passed directly; the
+    // injected reader returns only SUBSEQUENT reads (so it starts at 1:77).
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return '1:77'; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'dead', status: 77 });
+    expect(reads).toBe(1);
+  });
+
+  it('retries an unreadable first read through the 1: → 1:<code> gap', () => {
+    const lines = ['1:', '1:127'];
+    let reads = 0;
+    const r = resolvePaneDeath('', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'dead', status: 127 });
+    expect(reads).toBe(2);
+  });
+
+  it('retries an unreadable first read and adopts an explicit alive answer', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return '0:'; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'alive' });
+    expect(reads).toBe(1);
+  });
+
+  it('returns unknown only after the whole budget stays unreadable (never invents alive/dead)', () => {
+    let reads = 0;
+    const r = resolvePaneDeath('', () => { reads += 1; return ''; }, noSleep, OPTS);
+    expect(r).toEqual({ kind: 'unknown' });
+    // first read + attempts re-reads
+    expect(reads).toBe(OPTS.attempts);
+  });
+
+  it('a 0: after death was already observed does not un-latch the dead verdict (dead is irreversible)', () => {
+    const lines = ['1:77', '0:']; // first read already carries the code; returns at once
+    let reads = 0;
+    const r0 = resolvePaneDeath('1:77', () => lines[Math.min(reads++, lines.length - 1)]!, noSleep, OPTS);
+    expect(r0).toEqual({ kind: 'dead', status: 77 });
+    // and a glitch 0: while waiting on a status-less corpse does not revive it
+    const glitch = ['1:', '0:', '1:127'];
+    let r2 = 0;
+    const r1 = resolvePaneDeath('1:', () => glitch[Math.min(r2++, glitch.length - 1)]!, noSleep, OPTS);
+    expect(r1).toEqual({ kind: 'dead', status: 127 });
+  });
+});;

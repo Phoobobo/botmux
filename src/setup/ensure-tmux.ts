@@ -154,12 +154,46 @@ export function getTmuxVersionCached(): TmuxVersion | null {
   return version;
 }
 
+/**
+ * Force a fresh `tmux -V` probe, bypassing the short null-result TTL.
+ *
+ * The cached getter deliberately serves `null` for a few seconds after a failed
+ * probe; that is right for hot paths, but session creation is a once-per-session
+ * decision — without a re-probe, a single transient `tmux -V` timeout on a
+ * modern host would downgrade that ENTIRE session's crash exit-code channel
+ * even though the binary is fine (`tmux -V` answers in ~2ms normally). At a
+ * session-start boundary it is worth re-asking once. Never throws.
+ */
+export function refreshTmuxVersion(): TmuxVersion | null {
+  cachedTmuxVersion = undefined;
+  cachedTmuxVersionNullAt = 0;
+  return getTmuxVersionCached();
+}
+
 /** Version comparison: true iff `version` is a known release >= major.minor.
  *  Deliberately false for null (unknown) — callers keep legacy behaviour on an
  *  unknown version rather than silently skipping commands. */
 export function tmuxVersionAtLeast(version: TmuxVersion | null, major: number, minor: number): boolean {
   if (!version) return false;
   return version.major > major || (version.major === major && version.minor >= minor);
+}
+
+/**
+ * Minimum tmux that accepts the `failed` value for the `remain-on-exit` window
+ * option. CHANGES (3.1c → 3.2 block): "Add a value for remain-on-exit that
+ * only keeps the pane if the program failed". tmux 3.1c and older reject it
+ * with `bad value: failed`, which (because we chain it atomically into
+ * new-session) makes every new session fail to start — a v3.53.0 regression on
+ * Debian's tmux 3.1c.
+ */
+export const TMUX_REMAIN_ON_EXIT_FAILED: TmuxVersion = { major: 3, minor: 2 };
+
+/** Whether this tmux supports `set-option remain-on-exit failed`. Unknown
+ *  version is false on purpose: skipping the option keeps the pre-#2164 default
+ *  (sessions always start; crash exit-code semantics just degrade), while
+ *  sending it to an old tmux blocks session creation entirely. */
+export function tmuxSupportsRemainOnExitFailed(version: TmuxVersion | null): boolean {
+  return tmuxVersionAtLeast(version, TMUX_REMAIN_ON_EXIT_FAILED.major, TMUX_REMAIN_ON_EXIT_FAILED.minor);
 }
 
 /**

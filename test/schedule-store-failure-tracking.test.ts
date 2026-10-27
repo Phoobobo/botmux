@@ -53,7 +53,7 @@ describe('markRun consecutive-failure tracking', () => {
     for (let i = 1; i < N; i += 1) {
       const r = markRun(id, false, 'boom');
       expect(r.crossedFailureThreshold).toBe(false);
-      expect(getTask(id).consecutiveFailures).toBe(i);
+      expect(getTask(id).runStats?.consecutiveFailures).toBe(i);
       expect(getTask(id).failureAlertSent).toBeFalsy();
     }
     const crossed = markRun(id, false, 'boom');
@@ -72,8 +72,8 @@ describe('markRun consecutive-failure tracking', () => {
     markRun(id, false, 'x');
     markRun(id, true);
     const t = getTask(id);
-    expect(t.consecutiveFailures).toBe(0);
-    expect(t.failureAlertSent).toBe(false);
+    expect(t.runStats?.consecutiveFailures).toBe(0);
+    expect(t.failureAlertSent).toBeFalsy();
     expect(t.lastError).toBeUndefined();
 
     // 恢复后再次失败，水印已清，达到阈值可再发一次。
@@ -90,41 +90,96 @@ describe('markRun consecutive-failure tracking', () => {
     a.markRun(id, false, 'perm');
 
     const b = await freshImport();
-    expect(b.getTask(id).consecutiveFailures).toBe(2);
+    expect(b.getTask(id).runStats?.consecutiveFailures).toBe(2);
     const r = b.markRun(id, false, 'perm');
     expect(r.crossedFailureThreshold).toBe(true);
+  });
+
+  it('advances the shared counter for until-done settlements too (single ledger)', async () => {
+    const { createTask, markRun, getTask, SCHEDULE_FAILURE_ALERT_THRESHOLD } = await freshImport();
+    const id = 'wf_failuntil';
+    createTask({
+      ...BASE_PARAMS,
+      id,
+      untilDone: { status: 'open', attempts: 0, deadline: new Date(Date.now() + 3_600_000).toISOString() },
+    });
+    for (let i = 0; i < SCHEDULE_FAILURE_ALERT_THRESHOLD; i += 1) markRun(id, false, 'late');
+    expect(getTask(id).runStats?.consecutiveFailures).toBe(SCHEDULE_FAILURE_ALERT_THRESHOLD);
+    // closing 串同样只越线一次。
+    expect(markRun(id, false, 'late').crossedFailureThreshold).toBe(false);
   });
 });
 
 describe('nextFailureTracking (shared rule for JSON store and authority runtime)', () => {
-  it('advances the streak and crosses the alert threshold exactly once', async () => {
+  it('advances the ledger streak and crosses the alert threshold exactly once', async () => {
     const { nextFailureTracking, SCHEDULE_FAILURE_ALERT_THRESHOLD } = await freshImport();
-    let current: { consecutiveFailures?: number; failureAlertSent?: boolean } = {};
+    let current: Parameters<typeof nextFailureTracking>[0] = undefined;
     for (let i = 1; i < SCHEDULE_FAILURE_ALERT_THRESHOLD; i += 1) {
-      current = nextFailureTracking(current, false);
-      expect(current.crossedFailureThreshold).toBe(false);
-      expect(current.consecutiveFailures).toBe(i);
-      expect(current.failureAlertSent).toBe(false);
+      const r = nextFailureTracking(current, false);
+      current = r.runStats;
+      expect(r.crossedFailureThreshold).toBe(false);
+      expect(r.consecutiveFailures).toBe(i);
     }
-    current = nextFailureTracking(current, false);
-    expect(current.crossedFailureThreshold).toBe(true);
-    expect(current.failureAlertSent).toBe(true);
+    const crossed = nextFailureTracking(current, false);
+    expect(crossed.crossedFailureThreshold).toBe(true);
+    expect(crossed.consecutiveFailures).toBe(SCHEDULE_FAILURE_ALERT_THRESHOLD);
+    current = crossed.runStats;
     // 阈值之后继续失败不重复 crossed。
     expect(nextFailureTracking(current, false).crossedFailureThreshold).toBe(false);
   });
 
-  it('a success clears streak and watermark so the next streak can alert again', async () => {
+  it('a success clears the ledger streak (and the owner marker) so the next streak can alert again', async () => {
     const { nextFailureTracking } = await freshImport();
-    let current = nextFailureTracking(nextFailureTracking(nextFailureTracking({}, false), false), false);
+    let current = nextFailureTracking(nextFailureTracking(nextFailureTracking(undefined, false).runStats, false).runStats, false);
     expect(current.crossedFailureThreshold).toBe(true);
-    current = nextFailureTracking(current, true);
-    expect(current).toEqual({ consecutiveFailures: 0, failureAlertSent: false, crossedFailureThreshold: false });
-    expect(nextFailureTracking(nextFailureTracking(nextFailureTracking(current, false), false), false).crossedFailureThreshold)
+    const cleared = nextFailureTracking(current.runStats, true);
+    expect(cleared.crossedFailureThreshold).toBe(false);
+    expect(cleared.consecutiveFailures).toBe(0);
+    expect(cleared.runStats.failingNotifiedAt).toBeUndefined();
+    expect(nextFailureTracking(nextFailureTracking(nextFailureTracking(cleared.runStats, false).runStats, false).runStats, false).crossedFailureThreshold)
       .toBe(true);
   });
 
   it('treats undefined input (legacy task) as zero streak', async () => {
     const { nextFailureTracking } = await freshImport();
     expect(nextFailureTracking(undefined, false).consecutiveFailures).toBe(1);
+  });
+});
+
+describe('#2334 → ledger migration absorb', () => {
+  it('folds a persisted top-level consecutiveFailures into runStats on reload', async () => {
+    const a = await freshImport();
+    const id = 'wf_failabsorb';
+    a.createTask({ ...BASE_PARAMS, id });
+    // Simulate a task persisted by #2334's model: top-level counter, no ledger.
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    const fp = a.scheduleFilePathFor(TEST_APP);
+    const disk = JSON.parse(readFileSync(fp, 'utf-8'));
+    disk[id] = { ...disk[id], consecutiveFailures: 2 };
+    writeFileSync(fp, JSON.stringify(disk));
+
+    const b = await freshImport();
+    const t = b.getTask(id);
+    expect(t?.runStats?.consecutiveFailures).toBe(2);
+    expect(t?.consecutiveFailures).toBeUndefined();
+    // Absorbed streak keeps counting: one more failure crosses the threshold.
+    const r = b.markRun(id, false, 'boom');
+    expect(r.crossedFailureThreshold).toBe(true);
+  });
+
+  it('max wins: an existing ledger streak is never regressed by the legacy field', async () => {
+    const a = await freshImport();
+    const id = 'wf_failmax';
+    a.createTask({ ...BASE_PARAMS, id });
+    a.markRun(id, false, 'x');
+    a.markRun(id, false, 'x'); // ledger streak = 2
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    const fp = a.scheduleFilePathFor(TEST_APP);
+    const disk = JSON.parse(readFileSync(fp, 'utf-8'));
+    disk[id].consecutiveFailures = 1; // stale smaller top-level value
+    writeFileSync(fp, JSON.stringify(disk));
+
+    const b = await freshImport();
+    expect(b.getTask(id).runStats?.consecutiveFailures).toBe(2);
   });
 });

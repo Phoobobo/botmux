@@ -11,6 +11,8 @@ import {
   probeTmuxFunctionalWithRetry,
   classifyTmuxProbeFailure,
   parseTmuxVersion,
+  tmuxSupportsRemainOnExitFailed,
+  TMUX_REMAIN_ON_EXIT_FAILED,
 } from '../src/setup/ensure-tmux.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
@@ -135,5 +137,31 @@ describe('parseTmuxVersion', () => {
   it('returns null for unparseable output', () => {
     expect(parseTmuxVersion('garbage')).toBeNull();
     expect(parseTmuxVersion('')).toBeNull();
+  });
+});
+
+// #2164 v3.53.0 regression gate: `remain-on-exit failed` only exists on
+// tmux >= 3.2 (CHANGES, 3.1c -> 3.2). Sending it to 3.1c fails new-session
+// with "bad value: failed" and blocks every new session.
+describe('tmuxSupportsRemainOnExitFailed', () => {
+  it('is supported starting at the documented floor (3.2)', () => {
+    expect(TMUX_REMAIN_ON_EXIT_FAILED).toEqual({ major: 3, minor: 2 });
+  });
+
+  it.each([
+    ['tmux 3.3a', true],  // local dev box
+    ['tmux 3.2a', true],  // Ubuntu 22.04 shipped
+    ['tmux 3.2', true],
+    ['tmux 3.1c', false], // affected user machine — the regression
+    ['tmux 3.1a', false],
+    ['tmux 3.0', false],
+    ['tmux 2.9', false],
+  ])('tmux %j -> %s', (raw, expected) => {
+    expect(tmuxSupportsRemainOnExitFailed(parseTmuxVersion(raw))).toBe(expected);
+  });
+
+  it('treats an unknown/unreadable version as unsupported (never block session creation)', () => {
+    expect(tmuxSupportsRemainOnExitFailed(null)).toBe(false);
+    expect(tmuxSupportsRemainOnExitFailed(parseTmuxVersion('nonsense'))).toBe(false);
   });
 });

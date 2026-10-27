@@ -68,7 +68,7 @@ import {
   setStartupTmuxRetrySleepForTests,
   buildPipePaneStartupError,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
-import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
+import { resetTmuxVersionCacheForTests, getTmuxVersionCached } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
 import { takePaneLaunchFile } from './helpers/pane-launch.js';
 import { TmuxCommandTooLongError } from '../src/adapters/backend/pane-launch.js';
@@ -146,6 +146,14 @@ beforeEach(() => {
   mockedWriteSync.mockReset();
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
+  // Default emulation is a modern tmux (dev/CI box): `tmux -V` answers 3.3a,
+  // so version-gated options (new-session -e, remain-on-exit failed) are
+  // emitted. Tests that exercise OLD tmux behaviour override this with
+  // emulateTmux()/their own mockImplementation.
+  mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+    if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a';
+    return Buffer.from('') as any;
+  }) as typeof execFileSync);
   resetTmuxVersionCacheForTests();
 });
 
@@ -213,7 +221,7 @@ describe('TmuxPipeBackend.spawn', () => {
     }
   });
 
-  it('still throws (and fires exit) when pipe-pane keeps hitting connect errors after all retries', () => {
+  it('throws but does NOT fire an exit when pipe-pane keeps failing (startup failure, not a crash)', () => {
     const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {
       let pipeAttempts = 0;
@@ -229,13 +237,98 @@ describe('TmuxPipeBackend.spawn', () => {
         return Buffer.from('') as any;
       }) as any);
 
-      const be = new TmuxPipeBackend('0:2.0');
+      const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
       const exits: unknown[] = [];
       be.onExit((code, signal) => exits.push([code, signal]));
       expect(() => be.spawn('', [], spawnOpts())).toThrow();
 
       expect(pipeAttempts).toBe(3);            // initial + 2 retries
+      // Startup failure: spawn throws and NO process-exit event is emitted —
+      // a tmux stall must not be reported as a crashed CLI (code 1) and feed
+      // the crash-restart channel (#2408). The throw carries the startup error.
+      expect(exits).toEqual([]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  // Worker ordering: backend.onExit is wired only AFTER a successful spawn.
+  // The failed-spawn path therefore must not leave a sticky phantom exit code
+  // cached that a later onExit would replay — that used to mislabel a tmux
+  // stall as a crashed CLI once fireExit became sticky (#2408).
+  it('a failed spawn leaves no sticky exit for an onExit registered afterwards', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1, signal: null,
+            stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)'),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      // FRESH create: a startup failure leaves no sticky phantom exit.
+      const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
+      expect(() => be.spawn('', [], spawnOpts())).toThrow();
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal])); // worker wires this only now
+      expect(exits).toEqual([]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  // Biased reattach path (createSession: false): we are attaching to a pane
+  // that was expected to already exist. If pipe-pane finds it gone, that is a
+  // lost SESSION (not a failed fresh startup), so the backend reports exit 1
+  // so the worker recovers — the pre-#2408 contract that must be kept.
+  it('fires exit 1 (and throws) when a biased reattach pipe-pane finds the pane gone', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1, signal: null,
+            stderr: Buffer.from("can't find pane: 0:2.0"),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      const be = new TmuxPipeBackend('0:2.0', { ownsSession: true, isReattach: true });
+      const exits: unknown[] = [];
+      be.onExit((code, signal) => exits.push([code, signal]));
+      expect(() => be.spawn('', [], { ...spawnOpts(), strictEnvReattach: true })).toThrow();
       expect(exits).toEqual([[1, null]]);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  // Worker ordering on the reattach path: even though onExit is wired only
+  // after spawn (which throws), the sticky exit must NOT be delivered there
+  // for a fresh create — but for a reattach it is a genuine loss. This test
+  // pins that a fresh failed spawn (no new-session) never caches a phantom.
+  it('reattach-pane-gone caches exit 1 for an onExit wired after spawn, fresh does not', () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      mockedExecSync.mockImplementation(((cmd: any) => {
+        if (String(cmd).includes('pipe-pane')) {
+          throw Object.assign(new Error('cmd failed'), {
+            status: 1, signal: null,
+            stderr: Buffer.from("can't find pane: 0:2.0"),
+          });
+        }
+        return Buffer.from('') as any;
+      }) as any);
+
+      const reattach = new TmuxPipeBackend('0:2.0', { ownsSession: true, isReattach: true });
+      expect(() => reattach.spawn('', [], { ...spawnOpts(), strictEnvReattach: true })).toThrow();
+      const rExits: unknown[] = [];
+      reattach.onExit((code, signal) => rExits.push([code, signal]));
+      expect(rExits).toEqual([[1, null]]); // genuine reattach loss replays
     } finally {
       errSpy.mockRestore();
     }
@@ -257,13 +350,17 @@ describe('TmuxPipeBackend.spawn', () => {
         return Buffer.from('') as any;
       }) as any);
 
-      const be = new TmuxPipeBackend('0:2.0');
+      // FRESH create: deterministic "pane gone" during startup throws and
+      // emits no process-exit event.
+      const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
       const exits: unknown[] = [];
       be.onExit((code, signal) => exits.push([code, signal]));
       expect(() => be.spawn('', [], spawnOpts())).toThrow();
 
       expect(pipeAttempts).toBe(1);            // no pointless retries
-      expect(exits).toEqual([[1, null]]);
+      // Same for a deterministic rejection: it is a startup failure (throws),
+      // never a process-exit event (#2408).
+      expect(exits).toEqual([]);
     } finally {
       errSpy.mockRestore();
     }
@@ -407,37 +504,45 @@ describe('TmuxPipeBackend.spawn', () => {
   });
 });
 
-describe('TmuxPipeBackend identity marker vs tmux version (#1959)', () => {
-  const IDENTITY_PRINTED = '1234 $7 5678';
-  const bindingOpts = () => ({ ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } });
+const TMUX_EMULATED_IDENTITY = '1234 $7 5678';
 
   /** Emulates a real tmux that rejects `new-session -e` before 3.2, prints
-   *  the created-session identity on success, and answers the identity fence. */
-  function emulateTmux(versionString: string, opts: { rejectE?: boolean; duplicate?: boolean } = {}) {
-    let attempts = 0;
-    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
-      if (args[0] === '-V') return versionString;
-      if (args[0] === 'new-session') {
-        if (opts.rejectE && args.includes('-e')) {
-          throw Object.assign(new Error('flag'), { status: 1, signal: null, stderr: 'command new-session: unknown flag -e' });
-        }
-        attempts += 1;
-        if (opts.duplicate && attempts === 1) {
-          throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', status: 1, signal: null });
-        }
-        if (opts.duplicate) {
-          throw Object.assign(new Error('dup'), { status: 1, signal: null, stderr: 'duplicate session: bmx-ver' });
-        }
-        return IDENTITY_PRINTED;
+ *  the created-session identity on success, and answers the identity fence.
+ *  `rejectFailed` makes it behave like a pre-3.2 tmux that does not know the
+ *  `remain-on-exit failed` value (real 3.1c: "bad value: failed"). */
+function emulateTmux(versionString: string, opts: { rejectE?: boolean; duplicate?: boolean; rejectFailed?: boolean } = {}) {
+  let attempts = 0;
+  mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+    if (args[0] === '-V') return versionString;
+    if (args[0] === 'new-session') {
+      if (opts.rejectE && args.includes('-e')) {
+        throw Object.assign(new Error('flag'), { status: 1, signal: null, stderr: 'command new-session: unknown flag -e' });
       }
-      // has-session (probe) succeeds and the fence reads back our marker.
-      if (args[0] === 'show-environment' && args.includes('BOTMUX_CODEX_INSTANCE_BINDING')) {
-        return 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a';
+      // A pre-3.2 tmux rejects the value itself, so the chained new-session
+      // (and a standalone set-option) must never be sent on those versions.
+      if (opts.rejectFailed && args.includes('remain-on-exit') && args.includes('failed')) {
+        throw Object.assign(new Error('bad value'), { status: 1, signal: null, stderr: 'bad value: failed' });
       }
-      return '';
-    }) as typeof execFileSync);
-    return () => attempts;
-  }
+      attempts += 1;
+      if (opts.duplicate && attempts === 1) {
+        throw Object.assign(new Error('timeout'), { code: 'ETIMEDOUT', status: 1, signal: null });
+      }
+      if (opts.duplicate) {
+        throw Object.assign(new Error('dup'), { status: 1, signal: null, stderr: 'duplicate session: bmx-ver' });
+      }
+      return TMUX_EMULATED_IDENTITY;
+    }
+    // has-session (probe) succeeds and the fence reads back our marker.
+    if (args[0] === 'show-environment' && args.includes('BOTMUX_CODEX_INSTANCE_BINDING')) {
+      return 'BOTMUX_CODEX_INSTANCE_BINDING=binding-a';
+    }
+    return '';
+  }) as typeof execFileSync);
+  return () => attempts;
+}
+
+describe('TmuxPipeBackend identity marker vs tmux version (#1959)', () => {
+  const bindingOpts = () => ({ ...spawnOpts(), env: { ...spawnOpts().env, BOTMUX_CODEX_INSTANCE_BINDING: 'binding-a' } });
 
   const setEnvironmentCalls = () => mockedExecFileSync.mock.calls
     .filter(([, a]) => (a as string[])[0] === 'set-environment')
@@ -489,6 +594,94 @@ describe('TmuxPipeBackend identity marker vs tmux version (#1959)', () => {
       expect(newSessionArgs().includes('-e')).toBe(false);
       expect(attempts()).toBe(1);
       expect(setEnvironmentCalls()).toHaveLength(1);
+    } finally { be.kill(); }
+  });
+});
+
+// v3.53.0 regression (#2164): `set-option remain-on-exit failed` is chained
+// atomically into new-session, but `failed` only exists on tmux >= 3.2. On a
+// tmux that rejects the value (3.1c: "bad value: failed") sending the chain
+// makes new-session FAIL — i.e. every new session fails to start. The chain
+// must be omitted on old/unknown tmux, falling back to the pre-#2164 default
+// (sessions always start; the crash exit-code channel simply degrades).
+describe('TmuxPipeBackend remain-on-exit failed vs tmux version (v3.53.0 regression)', () => {
+  const newSessionArgv = (): string[] => newSessionArgs();
+  const hasFailedChain = (): boolean =>
+    newSessionArgv().includes('remain-on-exit') && newSessionArgv().includes('failed');
+
+  it.each([
+    ['tmux 3.3a'], // local dev
+    ['tmux 3.2a'], // Ubuntu 22.04
+    ['tmux 3.2'],
+  ])('chains remain-on-exit failed into new-session on supported %s', (versionString) => {
+    emulateTmux(versionString);
+    const be = new TmuxPipeBackend('bmx-roe', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(hasFailedChain()).toBe(true);
+    } finally { be.kill(); }
+  });
+
+  it('OMITS the chain on tmux 3.1c that rejects "failed", and still creates the session', () => {
+    // Faithful old-tmux fake: it would return "bad value: failed" if we sent
+    // the option. Sending it is exactly the regression (new-session fails).
+    emulateTmux('tmux 3.1c', { rejectFailed: true });
+    const be = new TmuxPipeBackend('bmx-roe', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(hasFailedChain()).toBe(false);
+    } finally { be.kill(); }
+  });
+
+  it('omits the chain on older tmux 2.9 (never block start on an old recognized tmux)', () => {
+    emulateTmux('tmux 2.9', { rejectFailed: true });
+    const be = new TmuxPipeBackend('bmx-roe-29', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(hasFailedChain()).toBe(false);
+    } finally { be.kill(); }
+  });
+
+  // The most dangerous failure direction is FAIL-OPEN on an UNREADABLE version:
+  // treating null as "supported" would send the option to an unknown old tmux
+  // and block EVERY session — a regression as bad as (or worse than) the
+  // original. This needs its OWN test; bundling it with the 2.9 case used to
+  // let a null->true mutation hide behind the independently-passing 2.9 half.
+  it('omits the chain when the tmux version is unreadable (unknown must fail CLOSED, not open)', () => {
+    emulateTmux('tmux not-a-version', { rejectFailed: true });
+    const be = new TmuxPipeBackend('bmx-roe-unknown', { createSession: true, ownsSession: true });
+    try {
+      // The fake rejects "failed": a fail-open implementation would throw here.
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(hasFailedChain()).toBe(false);
+    } finally { be.kill(); }
+  });
+
+  // Session creation re-probes an unknown cached version ONCE instead of
+  // downgrading the whole session on a single transient `tmux -V` timeout.
+  it('re-probes tmux -V at session start when the cached version is unknown, then uses the chain', () => {
+    resetTmuxVersionCacheForTests();
+    let vCalls = 0;
+    mockedExecFileSync.mockImplementation(((_bin: unknown, args: string[]) => {
+      if (args[0] === '-V') {
+        vCalls += 1;
+        // First read (cached during an earlier gate attempt) is a transient
+        // timeout; the boundary re-probe succeeds with a modern tmux.
+        if (vCalls === 1) throw Object.assign(new Error('ETIMEDOUT'), { code: 'ETIMEDOUT' });
+        return 'tmux 3.3a';
+      }
+      if (args[0] === 'new-session') return '1234 $7 5678';
+      return '';
+    }) as typeof execFileSync);
+    // Prime the cache with a null result inside its null-TTL window.
+    expect(getTmuxVersionCached()).toBeNull();
+    expect(vCalls).toBe(1);
+
+    const be = new TmuxPipeBackend('bmx-roe-reprobe', { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('sleep', ['60'], spawnOpts())).not.toThrow();
+      expect(vCalls).toBe(2);                 // the boundary re-probed
+      expect(hasFailedChain()).toBe(true);    // modern tmux → chain enabled
     } finally { be.kill(); }
   });
 });
@@ -1722,7 +1915,9 @@ describe('TmuxPipeBackend pipe-pane death evidence', () => {
         return '' as any;
       }) as any);
 
-      const be = new TmuxPipeBackend('0:2.0');
+      // FRESH create whose CLI died instantly: startup-failure message, no
+      // process-exit event (it never came up).
+      const be = new TmuxPipeBackend('0:2.0', { createSession: true, ownsSession: true });
       const exits: unknown[] = [];
       be.onExit((code, signal) => exits.push([code, signal]));
       let thrown: unknown;
@@ -1740,7 +1935,9 @@ describe('TmuxPipeBackend pipe-pane death evidence', () => {
       expect(message).toContain('command not found');
       // The raw pipe-pane error's first line is retained.
       expect(message).toContain('Command failed: tmux pipe-pane');
-      expect(exits).toEqual([[1, null]]);
+      // Startup failure path: throws the readable error and emits NO process
+      // exit event (the CLI never started; #2408 keeps it off crash-restart).
+      expect(exits).toEqual([]);
     } finally {
       errSpy.mockRestore();
     }
