@@ -105,11 +105,13 @@ describe('GET /api/bot-trigger-user-auth-status', () => {
     expect(rest).toEqual(bare);
     expect(user).toEqual({
       openId: OPEN,
+      coverage: 'local-stores',
       tools: {
-        bytedcli: { state: 'needs-login' },
-        'lark-cli': { state: 'authorized' },
+        bytedcli: { state: 'needs-login', basis: 'provider-probe' },
+        'lark-cli': { state: 'authorized', basis: 'file-present' },
         'user-token': {
           state: 'authorized',
+          basis: 'expiry-check',
           expiresAt: '2099-01-01T00:00:00.000Z',
           refreshExpiresAt: '2099-06-01T00:00:00.000Z',
         },
@@ -129,10 +131,11 @@ describe('GET /api/bot-trigger-user-auth-status', () => {
     expect(rest).toEqual(bare);
     expect(user).toEqual({
       openId: OTHER,
+      coverage: 'local-stores',
       tools: {
-        bytedcli: { state: 'needs-login' },
-        'lark-cli': { state: 'needs-login' },
-        'user-token': { state: 'needs-login' },
+        bytedcli: { state: 'needs-login', basis: 'provider-probe' },
+        'lark-cli': { state: 'needs-login', basis: 'file-present' },
+        'user-token': { state: 'needs-login', basis: 'expiry-check' },
       },
     });
   });

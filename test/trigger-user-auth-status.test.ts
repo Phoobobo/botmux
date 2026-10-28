@@ -34,6 +34,7 @@ vi.mock('node:child_process', () => ({
 const APP = 'cli_statusprobe';
 const ALICE = 'ou_statusalice';
 const BOB = 'ou_statusbob';
+const CAROL = 'ou_statuscarol';
 const ACCESS = 'probe-access-token-do-not-leak';
 const REFRESH = 'probe-refresh-token-do-not-leak';
 const ENC = 'enc-secret-bytes-do-not-leak';
@@ -90,6 +91,11 @@ describe('queryTriggerUserAuthStatus', () => {
       expires_at: '2000-01-01T00:00:00.000Z',
       refresh_expires_at: '2000-02-01T00:00:00.000Z',
     });
+    tokenFile(CAROL, {
+      access_token: 'carol-access-token',
+      expires_at: '2098-01-01T00:00:00.000Z',
+      refresh_expires_at: '2098-06-01T00:00:00.000Z',
+    });
     larkLogin(ALICE);
     const home = bytedcliHomeFor(ALICE);
     mkdirSync(home, { recursive: true });
@@ -108,14 +114,17 @@ describe('queryTriggerUserAuthStatus', () => {
 
     const alice = await queryTriggerUserAuthStatus({ appId: APP, brand: 'feishu', openId: ALICE });
     const bob = await queryTriggerUserAuthStatus({ appId: APP, brand: 'feishu', openId: BOB });
+    const carol = await queryTriggerUserAuthStatus({ appId: APP, brand: 'feishu', openId: CAROL });
 
     expect(alice).toEqual({
       openId: ALICE,
+      coverage: 'local-stores',
       tools: {
-        bytedcli: { state: 'authorized', expiresAt: '2030-01-01T00:00:00.000Z' },
-        'lark-cli': { state: 'authorized' },
+        bytedcli: { state: 'authorized', basis: 'provider-probe', expiresAt: '2030-01-01T00:00:00.000Z' },
+        'lark-cli': { state: 'authorized', basis: 'file-present' },
         'user-token': {
           state: 'authorized',
+          basis: 'expiry-check',
           expiresAt: '2099-01-01T00:00:00.000Z',
           refreshExpiresAt: '2099-06-01T00:00:00.000Z',
         },
@@ -123,22 +132,47 @@ describe('queryTriggerUserAuthStatus', () => {
     });
     expect(bob).toEqual({
       openId: BOB,
+      coverage: 'local-stores',
       tools: {
-        bytedcli: { state: 'needs-login' },
-        'lark-cli': { state: 'needs-login' },
+        bytedcli: { state: 'needs-login', basis: 'provider-probe' },
+        'lark-cli': { state: 'needs-login', basis: 'file-present' },
         'user-token': {
           state: 'needs-login',
+          basis: 'expiry-check',
           expiresAt: '2000-01-01T00:00:00.000Z',
           refreshExpiresAt: '2000-02-01T00:00:00.000Z',
         },
       },
     });
-    const packed = JSON.stringify({ alice, bob });
+    // No device-login file, but a still-usable legacy user token: the turn
+    // path injects that token for lark-cli, so this status must not say
+    // needs-login.
+    expect(carol).toEqual({
+      openId: CAROL,
+      coverage: 'local-stores',
+      tools: {
+        bytedcli: { state: 'needs-login', basis: 'provider-probe' },
+        'lark-cli': {
+          state: 'authorized',
+          basis: 'expiry-check',
+          expiresAt: '2098-01-01T00:00:00.000Z',
+          refreshExpiresAt: '2098-06-01T00:00:00.000Z',
+        },
+        'user-token': {
+          state: 'authorized',
+          basis: 'expiry-check',
+          expiresAt: '2098-01-01T00:00:00.000Z',
+          refreshExpiresAt: '2098-06-01T00:00:00.000Z',
+        },
+      },
+    });
+    const packed = JSON.stringify({ alice, bob, carol });
     expect(packed).not.toContain(ACCESS);
     expect(packed).not.toContain(REFRESH);
     expect(packed).not.toContain(ENC);
     expect(packed).not.toContain(JWT);
     expect(packed).not.toContain('bob-access-token');
+    expect(packed).not.toContain('carol-access-token');
     expect(spawned).toEqual([['auth', 'status', '--json']]);
   });
 });

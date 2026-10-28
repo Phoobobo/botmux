@@ -180,6 +180,25 @@ describe('describeBytedcliAuth — status without credentials', () => {
     expect(await mod.describeBytedcliAuth(ALICE)).toEqual({ state: 'authorized', expiresAt });
   });
 
+  it('ignores an out-of-range expiry and still treats the login as authorized', async () => {
+    const mod = await fresh();
+    authorize(mod, ALICE);
+    statuses.set(mod.bytedcliHomeFor(ALICE), {
+      code: 0,
+      stdout: envelope({
+        authenticated: true,
+        bytecloud_auth: { authType: 'user', expires_at: 1.75e18 },
+      }),
+    });
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(await mod.describeBytedcliAuth(ALICE)).toEqual({ state: 'authorized' });
+    replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 0, stdout: 'code.jwt.value\n' }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
+      cloudJwt: 'cloud.jwt.value',
+      codeJwt: 'code.jwt.value',
+    });
+  });
+
   it('maps a provider outage to unknown instead of clearing the login', async () => {
     const mod = await fresh();
     authorize(mod, ALICE);

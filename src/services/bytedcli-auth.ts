@@ -117,18 +117,25 @@ function providerExpiry(
   return undefined;
 }
 
+/** ECMAScript time values outside ±8.64e15 ms make `Date#toISOString` throw. */
+const MAX_DATE_MS = 8.64e15;
+
+function isoFromMs(ms: number): string | undefined {
+  // A provider clock (for example a nanosecond Unix time) must not be able to
+  // throw out of a status read. Login state is independent of that field.
+  if (!Number.isFinite(ms) || ms < 1_000_000_000_000 || ms > MAX_DATE_MS) return undefined;
+  return new Date(ms).toISOString();
+}
+
 function isoTimestamp(value: unknown): string | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     const ms = value < 10_000_000_000 ? value * 1000 : value;
-    if (ms < 1_000_000_000_000) return undefined;
-    return new Date(ms).toISOString();
+    return isoFromMs(ms);
   }
   if (typeof value !== 'string') return undefined;
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > 40) return undefined;
-  const ms = Date.parse(trimmed);
-  if (!Number.isFinite(ms)) return undefined;
-  return new Date(ms).toISOString();
+  return isoFromMs(Date.parse(trimmed));
 }
 
 export async function hasBytedcliHome(openId: string): Promise<boolean> {

@@ -10077,9 +10077,17 @@ botConfigPutRoute<{ enabled?: unknown; larkToolBinding?: unknown }>('/api/bot-la
 //
 // `?openId=` 是给已经知道 open_id 的集成方（例如管共享机器的 device daemon）
 // 按人查询的入口。不带这个参数时响应与以前完全一致。带了且格式合法时，在同一
-// 份聚合字段之外追加 `user.tools`：bytedcli / lark-cli / legacy user-token 各自
-// authorized | needs-login | unknown，以及已知的过期时间。不回 token 内容，
-// 也不因为查询一个人而列出其他人。非法 open_id 直接 400，避免拼进文件路径。
+// 份聚合字段之外追加 `user`：
+//   • `coverage` 恒为 `local-stores`。平台签发的授权（credentialSource 为
+//     platform / auto）不在 `tools` 里；这里的 needs-login 不等于 turn 会被拒。
+//   • `tools.bytedcli.basis=provider-probe`：实时 `bytedcli auth status`。
+//   • `tools['lark-cli']`：有设备登录文件则为 authorized / file-present（不读
+//     密文、不轮询进行中的 device flow）；否则若该人 legacy user-token 仍可用
+//     （access 有效或还可刷新）则为 authorized / expiry-check，与 turn 的
+//     lark-cli 回落一致。两者都没有才是 needs-login。
+//   • `tools['user-token'].basis=expiry-check`：只看该人自己的 token 文件。
+// 已知过期时间才带 expiresAt / refreshExpiresAt。不回 token 内容，也不因为
+// 查询一个人而列出其他人。非法 open_id 直接 400，避免拼进文件路径。
 ipcRoute('GET', '/api/bot-trigger-user-auth-status', requireBoundBot(async (req, res) => {
   try {
     const openIdRaw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('openId');
