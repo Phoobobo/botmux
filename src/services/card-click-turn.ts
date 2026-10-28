@@ -7,7 +7,7 @@
  * clicker's own open_id into {@link admitCardClickSender}.
  */
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { callbackButton, simpleCard } from '../im/lark/card-primitives.js';
 
@@ -211,17 +211,50 @@ export class CardClickNonceStore implements CardClickNonceConsume {
   }
 
   consume(nonce: string, exp: number, now: number): 'ok' | 'replayed' | 'expired' {
-    this.prune(now);
-    if (now >= exp) return 'expired';
-    if (this.used.has(nonce)) return 'replayed';
-    this.used.set(nonce, exp);
-    try {
-      this.persist();
-    } catch (err) {
-      this.used.delete(nonce);
-      throw err;
+    return this.withLock(() => {
+      // Disk is the fleet record. Reload under the lock so another daemon's
+      // consume is not overwritten by this process's stale memory.
+      this.reload();
+      this.prune(now);
+      if (now >= exp) return 'expired';
+      if (this.used.has(nonce)) return 'replayed';
+      this.used.set(nonce, exp);
+      try {
+        this.persist();
+      } catch (err) {
+        this.used.delete(nonce);
+        throw err;
+      }
+      return 'ok';
+    });
+  }
+
+  private withLock<T>(fn: () => T): T {
+    const filePath = this.filePath;
+    if (!filePath) return fn();
+    const lockPath = `${filePath}.lock`;
+    mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+    const deadline = Date.now() + 2_000;
+    let fd: number | undefined;
+    while (fd === undefined) {
+      try {
+        fd = openSync(lockPath, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'EEXIST') throw err;
+        try {
+          if (Date.now() - statSync(lockPath).mtimeMs > 10_000) unlinkSync(lockPath);
+        } catch { /* the owner released it, or we lost the race */ }
+        if (Date.now() > deadline) throw new Error('card click nonce lock timeout');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
     }
-    return 'ok';
+    try {
+      return fn();
+    } finally {
+      closeSync(fd);
+      try { unlinkSync(lockPath); } catch { /* already released */ }
+    }
   }
 
   private prune(now: number): void {
@@ -231,10 +264,20 @@ export class CardClickNonceStore implements CardClickNonceConsume {
   }
 
   private load(): void {
+    this.reload();
+  }
+
+  private reload(): void {
     const filePath = this.filePath;
+    // No file: this process is the only record. Wiping it would forget a nonce
+    // that was consumed a moment ago.
     if (!filePath) return;
+    const fresh = new Map<string, number>();
     let info;
-    try { info = lstatSync(filePath); } catch { return; }
+    try { info = lstatSync(filePath); } catch {
+      this.used = fresh;
+      return;
+    }
     if (info.isSymbolicLink() || !info.isFile()) {
       throw new Error('card click nonce store is not a regular file');
     }
@@ -243,8 +286,9 @@ export class CardClickNonceStore implements CardClickNonceConsume {
     if (!nonces || typeof nonces !== 'object') throw new Error('card click nonce store is unreadable');
     const now = Date.now();
     for (const [nonce, exp] of Object.entries(nonces)) {
-      if (NONCE_RE.test(nonce) && Number.isSafeInteger(exp) && exp > now) this.used.set(nonce, exp);
+      if (NONCE_RE.test(nonce) && Number.isSafeInteger(exp) && exp > now) fresh.set(nonce, exp);
     }
+    this.used = fresh;
   }
 
   private persist(): void {

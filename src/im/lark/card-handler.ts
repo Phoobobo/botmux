@@ -186,7 +186,7 @@ export interface CardHandlerDeps {
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
-  }) => Promise<{ ok: true; run: () => Promise<unknown> } | { ok: false; reason: string }>;
+  }) => Promise<{ ok: true; chatId: string; run: () => Promise<unknown> } | { ok: false; reason: string }>;
 }
 
 /**
@@ -1573,6 +1573,8 @@ function cardClickTurnToastKey(reason: string): string {
     case 'working_dir_missing': return 'card.click_turn.working_dir_missing';
     case 'chat_type_mismatch': return 'card.click_turn.chat_type_mismatch';
     case 'delivery_failed': return 'card.click_turn.delivery_failed';
+    case 'principal_lane': return 'card.click_turn.principal_lane';
+    case 'cross_principal': return 'card.click_turn.cross_principal';
     default: return 'card.click_turn.rejected';
   }
 }
@@ -2044,10 +2046,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'error', content: t(cardClickTurnToastKey(accepted.reason), undefined, loc) } };
     }
     return {
-      toast: { type: 'info', content: t('card.click_turn.started', undefined, loc) },
-      afterAck: () => accepted.run().then(result => {
-        if (result && typeof result === 'object' && 'ok' in result && result.ok === false) {
-          logger.warn(`[card-click-turn] delivery failed: ${String((result as { reason?: unknown }).reason ?? 'delivery_failed')}`);
+      toast: { type: 'info', content: t('card.click_turn.pending', undefined, loc) },
+      afterAck: () => accepted.run().then(async result => {
+        const failed = result && typeof result === 'object' && 'ok' in result && result.ok === false;
+        const key = failed ? 'card.click_turn.delivery_failed' : 'card.click_turn.started';
+        try {
+          await sendMessage(larkAppId, accepted.chatId, t(key, undefined, loc), 'text');
+        } catch (err) {
+          logger.warn(`[card-click-turn] ${failed ? 'failure' : 'started'} notice failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }),
     };

@@ -1,7 +1,10 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { resolveCurrentTurnProvenance } from '../src/core/current-turn-provenance.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import {
   CARD_CLICK_TURN_ACTION,
   CardClickNonceStore,
@@ -10,7 +13,9 @@ import {
   issueCardClickTurn,
   parseCardClickTurnPost,
   readCardClickTurnClaims,
+  signCardClickTurnPayload,
 } from '../src/services/card-click-turn.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import {
   acceptCardClickTurn,
   type CardClickBoundSession,
@@ -45,6 +50,14 @@ describe('card click turn token', () => {
     expect(readCardClickTurnClaims(issued.payload, issued.sig, 'other-secret', NOW)).toEqual({ ok: false, reason: 'bad_signature' });
   });
 
+  it('rejects a payload that is not the canonical encoding even when its own signature matches', () => {
+    const issued = issue();
+    const spaced = issued.payload.replace(',', ', ');
+    const sig = signCardClickTurnPayload(spaced, SECRET);
+    expect(spaced).not.toBe(issued.payload);
+    expect(readCardClickTurnClaims(spaced, sig, SECRET, NOW)).toEqual({ ok: false, reason: 'bad_signature' });
+  });
+
   it('rejects an expired token before a caller could treat it as a replay', () => {
     const issued = issue({ ttlMs: 60_000 });
     expect(readCardClickTurnClaims(issued.payload, issued.sig, SECRET, issued.claims.exp)).toEqual({ ok: false, reason: 'expired' });
@@ -61,6 +74,24 @@ describe('card click turn token', () => {
       expect(first.consume('nonce-nonce-nonce', now + 60_000, now)).toBe('ok');
       const second = CardClickNonceStore.open(file);
       expect(second.consume('nonce-nonce-nonce', now + 60_000, now)).toBe('replayed');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not drop a nonce consumed by another store on the same file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'card-click-nonce-'));
+    const now = Date.now();
+    const exp = now + 60_000;
+    try {
+      const file = join(dir, 'nonces.json');
+      const first = CardClickNonceStore.open(file);
+      const second = CardClickNonceStore.open(file);
+      expect(first.consume('nonce-aaaaaaaaaaaa', exp, now)).toBe('ok');
+      expect(second.consume('nonce-bbbbbbbbbbbb', exp, now)).toBe('ok');
+      const reloaded = CardClickNonceStore.open(file);
+      expect(reloaded.consume('nonce-aaaaaaaaaaaa', exp, now)).toBe('replayed');
+      expect(reloaded.consume('nonce-bbbbbbbbbbbb', exp, now)).toBe('replayed');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -275,8 +306,83 @@ describe('acceptCardClickTurn', () => {
     }, deps);
     expect(accepted).toEqual({ ok: false, reason: 'grant_blocked' });
     expect(talk).toHaveBeenCalledWith(APP, 'oc_chat', 'ou_clicker', 'group', 'on_member');
-    expect(operate).toHaveBeenCalledWith(APP, 'oc_chat', 'ou_clicker');
+    expect(operate).toHaveBeenCalledWith(APP, 'oc_chat', 'ou_clicker', 'on_member');
     expect(grant).toHaveBeenCalledWith(APP, 'oc_chat', 'ou_clicker');
     expect(started).toEqual([]);
+  });
+
+  it('rejects a token minted for a different bot before any turn starts', async () => {
+    const { deps, started, created } = harness();
+    const issued = issue();
+    const accepted = await acceptCardClickTurn({
+      larkAppId: 'cli_other', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    }, deps);
+    expect(accepted).toEqual({ ok: false, reason: 'app_mismatch' });
+    expect(started).toEqual([]);
+    expect(created).toEqual([]);
+  });
+
+  it('requires a working directory before creating a session', async () => {
+    const { deps, created } = harness();
+    const issued = issue({ workingDir: undefined });
+    const accepted = await acceptCardClickTurn({
+      larkAppId: APP, operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    }, deps);
+    expect(accepted).toEqual({ ok: false, reason: 'working_dir_required' });
+    expect(created).toEqual([]);
+  });
+
+  it('rejects a principal-lane session before the nonce is consumed', async () => {
+    const consumed = vi.fn(() => 'ok' as const);
+    const { deps, started } = harness({
+      nonces: { consume: consumed },
+      sessionBlockedShape: () => 'principal_lane',
+    });
+    const issued = issue();
+    const accepted = await acceptCardClickTurn({
+      larkAppId: APP, operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    }, deps);
+    expect(accepted).toEqual({ ok: false, reason: 'principal_lane' });
+    expect(consumed).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+  });
+});
+
+describe('card click turn provenance', () => {
+  it('resolves the clicker from lastCallerOpenId even though cct_ is outside the human registry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'card-click-prov-'));
+    const dataDir = join(root, 'sessions');
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    try {
+      const turnId = 'cct_11111111-2222-4333-8444-555555555555';
+      expect(registryTurnMayAuthenticateHuman({}, turnId)).toBe(false);
+      const procStart = readProcessStartIdentity(process.pid);
+      if (!procStart) throw new Error('test process start identity unavailable');
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: 'sess-click', turnId, procStart,
+      }));
+      seedPersistedSessionRows(dataDir, 'cli_app', {
+        'sess-click': {
+          sessionId: 'sess-click',
+          status: 'active',
+          scope: 'chat',
+          larkAppId: 'cli_app',
+          chatId: 'oc_chat',
+          chatType: 'group',
+          rootMessageId: 'oc_chat',
+          ownerOpenId: 'ou_previous',
+          lastCallerOpenId: 'ou_clicker',
+          quoteTargetId: turnId,
+          currentReplyTarget: { turnId, rootMessageId: 'oc_chat' },
+        },
+      });
+      expect(resolveCurrentTurnProvenance({ dataDir, startPid: process.pid })).toMatchObject({
+        sessionId: 'sess-click',
+        turnId,
+        callerOpenId: 'ou_clicker',
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

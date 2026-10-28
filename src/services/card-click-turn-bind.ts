@@ -9,9 +9,18 @@ import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getBot } from '../bot-registry.js';
+import { config } from '../config.js';
 import { loadOrCreateDashboardSecret } from '../dashboard/auth.js';
 import { localeForBot } from '../i18n/index.js';
-import { canOperate, evaluateTalk, grantCommandRestriction, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
+import {
+  canOperate,
+  evaluateTalk,
+  grantCommandRestriction,
+  isKnownPeerBot,
+  isTrustedSameOwnerSiblingBot,
+} from '../im/lark/event-dispatcher.js';
+import { isPlatformTeamBot } from './platform-team-store.js';
+import { isTeamBot } from './team-bots-store.js';
 import { getIdentity, resolveSender } from '../im/lark/identity-cache.js';
 import { sendMessage } from '../im/lark/client.js';
 import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
@@ -77,19 +86,49 @@ function directoryReady(dir: string): boolean {
   try { return existsSync(dir) && statSync(dir).isDirectory(); } catch { return false; }
 }
 
-export function cardClickOperatorIsBotOrApp(dataDir: string, larkAppId: string, openId: string): boolean {
-  if (isKnownPeerBot(dataDir, larkAppId, openId)) return true;
-  const cached = getIdentity(larkAppId, openId);
-  return cached?.type === 'bot' || cached?.type === 'app';
+const APP_ID_RE = /^[A-Za-z0-9_]{4,64}$/;
+
+/** Per-bot directory. The session data dir is shared by every bot daemon in a fleet. */
+export function cardClickTurnDir(dataDir: string, larkAppId: string): string {
+  if (!APP_ID_RE.test(larkAppId)) throw new Error('invalid app id');
+  return join(dataDir, 'card-click-turn', larkAppId);
+}
+
+/**
+ * Known bot/app evidence for a card clicker. A cache miss is not evidence.
+ * The three union tables are authoritative bot sources even when the open_id
+ * cache has never seen this operator. Do not call resolveSender here.
+ */
+export function cardClickOperatorIsBotOrApp(
+  dataDir: string,
+  larkAppId: string,
+  openId: string,
+  unionId?: string,
+): boolean {
+  if (openId && isKnownPeerBot(dataDir, larkAppId, openId)) return true;
+  if (openId) {
+    const cached = getIdentity(larkAppId, openId);
+    if (cached?.type === 'bot' || cached?.type === 'app') return true;
+  }
+  const memberUnionId = unionId?.startsWith('on_') ? unionId : undefined;
+  if (!memberUnionId) return false;
+  return isTeamBot(dataDir, memberUnionId)
+    || isPlatformTeamBot(dataDir, memberUnionId)
+    || isTrustedSameOwnerSiblingBot(dataDir, larkAppId, memberUnionId);
 }
 
 export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
-  let nonces: CardClickNonceStore | undefined;
-  const nonceStore = () => {
-    nonces ??= CardClickNonceStore.open(join(deps.dataDir(), 'card-click-turn-nonces.json'));
-    return nonces;
+  const nonceStores = new Map<string, CardClickNonceStore>();
+  const nonceStore = (larkAppId: string) => {
+    const existing = nonceStores.get(larkAppId);
+    if (existing) return existing;
+    const store = CardClickNonceStore.open(join(cardClickTurnDir(deps.dataDir(), larkAppId), 'nonces.json'));
+    nonceStores.set(larkAppId, store);
+    return store;
   };
-  const secret = () => loadOrCreateDashboardSecret(join(deps.dataDir(), 'card-click-turn.secret'));
+  const secret = (larkAppId: string) => loadOrCreateDashboardSecret(
+    join(cardClickTurnDir(deps.dataDir(), larkAppId), 'secret'),
+  );
 
   function findSession(larkAppId: string, claims: CardClickTurnClaims): CardClickBoundSession | undefined {
     if (claims.sessionId) {
@@ -115,7 +154,9 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       const current = deps.activeSessions.get(key);
       if (current) return { ds: current, created: false };
       const title = claims.prompt.replace(/\s+/g, ' ').slice(0, 40) || 'card click';
-      const session = sessionStore.createSession(claims.chatId!, claims.chatId!, title, chatType, 'chat');
+      const session = sessionStore.createSession(
+        claims.chatId!, claims.chatId!, title, chatType, 'chat', { source: 'ordinary-feishu' },
+      );
       const now = Date.now();
       session.larkAppId = larkAppId;
       session.scope = 'chat';
@@ -158,12 +199,42 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
   ): Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> {
     const ds = liveSession(session);
     const senderOpenId = args.senderOpenId;
+    // Admission already rejected bots. This second read is what the daemon
+    // passes into trustedCallerForInboundTurn, so a literal `false` cannot
+    // vouch for a union-table bot the cache has never seen.
+    if (cardClickOperatorIsBotOrApp(deps.dataDir(), ds.larkAppId, senderOpenId, args.memberUnionId)) {
+      return { ok: false, reason: 'delivery_failed' };
+    }
     const trustedCaller = await deps.trustedCallerForInboundTurn(ds.larkAppId, senderOpenId, args.memberUnionId);
     if (!trustedCaller || trustedCaller.senderType !== 'user' || trustedCaller.requestUserOpenId !== senderOpenId) {
       return { ok: false, reason: 'delivery_failed' };
     }
     const turnId = `cct_${randomUUID()}`;
     const sender = await resolveSender(ds.larkAppId, senderOpenId, 'user');
+    const prior = {
+      quoteTargetId: ds.session.quoteTargetId,
+      quoteTargetSenderOpenId: ds.session.quoteTargetSenderOpenId,
+      quoteTargetSenderIsBot: ds.session.quoteTargetSenderIsBot,
+      lastCallerOpenId: ds.session.lastCallerOpenId,
+      replyTargets: ds.session.replyTargets ? structuredClone(ds.session.replyTargets) : undefined,
+      currentReplyTarget: ds.session.currentReplyTarget ? structuredClone(ds.session.currentReplyTarget) : undefined,
+      turnReplyContexts: ds.session.turnReplyContexts ? structuredClone(ds.session.turnReplyContexts) : undefined,
+      activeInteractiveTurn: ds.activeInteractiveTurn,
+    };
+    const rollback = () => {
+      ds.session.quoteTargetId = prior.quoteTargetId;
+      ds.session.quoteTargetSenderOpenId = prior.quoteTargetSenderOpenId;
+      ds.session.quoteTargetSenderIsBot = prior.quoteTargetSenderIsBot;
+      ds.session.lastCallerOpenId = prior.lastCallerOpenId;
+      ds.session.replyTargets = prior.replyTargets;
+      ds.session.currentReplyTarget = prior.currentReplyTarget;
+      ds.session.turnReplyContexts = prior.turnReplyContexts;
+      ds.activeInteractiveTurn = prior.activeInteractiveTurn;
+      try { sessionStore.updateSession(ds.session); } catch (err) {
+        logger.warn(`[card-click-turn] rollback persist failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
+    ds.session.lastCallerOpenId = senderOpenId;
     ds.session.quoteTargetId = turnId;
     ds.session.quoteTargetSenderOpenId = senderOpenId;
     ds.session.quoteTargetSenderIsBot = false;
@@ -200,7 +271,13 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
         promptInjection: sessionPromptInjection(ds),
         trustedCaller,
       });
-    await deps.noteTurnReceived(ds, turnId, args.prompt, sender, turnId);
+    try {
+      await deps.noteTurnReceived(ds, turnId, args.prompt, sender, turnId);
+    } catch (err) {
+      rollback();
+      logger.warn(`[card-click-turn] noteTurnReceived failed for ${turnId}: ${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, reason: 'delivery_failed' };
+    }
     ds.activeInteractiveTurn = {
       turnId,
       caller: { ...trustedCaller },
@@ -210,7 +287,10 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     const sent = live
       ? sendWorkerInput(ds, input, turnId, { trustedCaller })
       : forkWorker(ds, input, { resume: ds.hasHistory, turnId, trustedCaller });
-    if (!sent) return { ok: false, reason: 'delivery_failed' };
+    if (!sent) {
+      rollback();
+      return { ok: false, reason: 'delivery_failed' };
+    }
     try { deps.beginNewTurn(ds, args.prompt, turnId); } catch (err) {
       logger.warn(`[card-click-turn] beginNewTurn failed for ${turnId}: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -221,15 +301,15 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     return { ok: true, turnId };
   }
 
-  const runtimeDeps = (): CardClickTurnRuntimeDeps => ({
+  const runtimeDeps = (larkAppId: string): CardClickTurnRuntimeDeps => ({
     now: () => Date.now(),
-    secret,
-    nonces: { consume: (nonce, exp, now) => nonceStore().consume(nonce, exp, now) },
-    isBotOrApp: (larkAppId, openId) => cardClickOperatorIsBotOrApp(deps.dataDir(), larkAppId, openId),
-    evaluateTalk: (larkAppId, chatId, openId, chatType, unionId) =>
-      evaluateTalk(larkAppId, chatId, openId, undefined, unionId, chatType),
-    canOperate: (larkAppId, chatId, openId) => canOperate(larkAppId, chatId, openId),
-    grantCommandRestriction: (larkAppId, chatId, openId) => grantCommandRestriction(larkAppId, chatId, openId),
+    secret: () => secret(larkAppId),
+    nonces: { consume: (nonce, exp, now) => nonceStore(larkAppId).consume(nonce, exp, now) },
+    isBotOrApp: (appId, openId, unionId) => cardClickOperatorIsBotOrApp(deps.dataDir(), appId, openId, unionId),
+    evaluateTalk: (appId, chatId, openId, chatType, unionId) =>
+      evaluateTalk(appId, chatId, openId, undefined, unionId, chatType),
+    canOperate: (appId, chatId, openId, unionId) => canOperate(appId, chatId, openId, unionId),
+    grantCommandRestriction: (appId, chatId, openId) => grantCommandRestriction(appId, chatId, openId),
     findSession,
     createSession,
     workingDirReady: directoryReady,
@@ -238,6 +318,11 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       ds.workingDir = dir;
       ds.session.workingDir = dir;
       sessionStore.updateSession(ds.session);
+    },
+    sessionBlockedShape: (session) => {
+      if (session && liveSession(session).session.principalLane) return 'principal_lane';
+      if (config.crossPrincipalInterruption) return 'cross_principal';
+      return 'ok';
     },
     startTurn,
   });
@@ -250,7 +335,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       payload?: string;
       sig?: string;
     }) {
-      return acceptCardClickTurn(input, runtimeDeps());
+      return acceptCardClickTurn(input, runtimeDeps(input.larkAppId));
     },
     async post(larkAppId: string, body: unknown): Promise<
       | { ok: true; messageId: string; exp: number }
@@ -264,7 +349,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       let issued: ReturnType<typeof issueCardClickTurn>;
       try {
         issued = issueCardClickTurn({
-          secret: secret(),
+          secret: secret(larkAppId),
           larkAppId,
           prompt: parsed.prompt,
           chatId: parsed.chatId,

@@ -23,7 +23,7 @@ export interface CardClickTurnRuntimeDeps {
   now(): number;
   secret(): string;
   nonces: CardClickNonceConsume;
-  isBotOrApp(larkAppId: string, openId: string): boolean;
+  isBotOrApp(larkAppId: string, openId: string, unionId?: string): boolean;
   evaluateTalk(
     larkAppId: string,
     chatId: string,
@@ -31,7 +31,7 @@ export interface CardClickTurnRuntimeDeps {
     chatType: 'group' | 'p2p',
     memberUnionId?: string,
   ): { allowed: boolean; reason?: string };
-  canOperate(larkAppId: string, chatId: string, openId: string): boolean;
+  canOperate(larkAppId: string, chatId: string, openId: string, unionId?: string): boolean;
   grantCommandRestriction(larkAppId: string, chatId: string, openId: string): { blocked: boolean };
   findSession(larkAppId: string, claims: CardClickTurnClaims): CardClickBoundSession | undefined;
   createSession(
@@ -42,6 +42,8 @@ export interface CardClickTurnRuntimeDeps {
   ): Promise<{ ok: true; session: CardClickBoundSession } | { ok: false; reason: string }>;
   workingDirReady(dir: string): boolean;
   setWorkingDir(session: CardClickBoundSession, dir: string): void;
+  /** `principal_lane` wins over `cross_principal` when both apply. */
+  sessionBlockedShape?(session: CardClickBoundSession | undefined): 'ok' | 'principal_lane' | 'cross_principal';
   startTurn(
     session: CardClickBoundSession,
     args: { senderOpenId: string; memberUnionId?: string; prompt: string },
@@ -64,7 +66,9 @@ export type CardClickTurnFailure =
   | 'working_dir_missing'
   | 'chat_type_mismatch'
   | 'delivery_failed'
-  | 'app_mismatch';
+  | 'app_mismatch'
+  | 'principal_lane'
+  | 'cross_principal';
 
 function memberUnionId(unionId: string | undefined): string | undefined {
   return unionId?.startsWith('on_') ? unionId : undefined;
@@ -83,7 +87,7 @@ export async function acceptCardClickTurn(
     sig?: string;
   },
   deps: CardClickTurnRuntimeDeps,
-): Promise<{ ok: true; run: () => Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> }
+): Promise<{ ok: true; chatId: string; run: () => Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> }
   | { ok: false; reason: CardClickTurnFailure }> {
   const now = deps.now();
   let secret: string;
@@ -95,7 +99,7 @@ export async function acceptCardClickTurn(
 
   const openId = input.operatorOpenId;
   if (!openId) return { ok: false, reason: 'no_identity' };
-  if (deps.isBotOrApp(input.larkAppId, openId)) return { ok: false, reason: 'bot_or_app' };
+  if (deps.isBotOrApp(input.larkAppId, openId, input.operatorUnionId)) return { ok: false, reason: 'bot_or_app' };
 
   let session = deps.findSession(input.larkAppId, claims);
   if (claims.sessionId && !session) return { ok: false, reason: 'session_not_found' };
@@ -109,7 +113,7 @@ export async function acceptCardClickTurn(
 
   const talk = deps.evaluateTalk(input.larkAppId, chatId, openId, chatType, unionId);
   const grant = deps.grantCommandRestriction(input.larkAppId, chatId, openId);
-  const operate = deps.canOperate(input.larkAppId, chatId, openId);
+  const operate = deps.canOperate(input.larkAppId, chatId, openId, unionId);
   const admitted = admitCardClickSender({
     openId,
     isBotOrApp: false,
@@ -126,6 +130,8 @@ export async function acceptCardClickTurn(
   if (session && claims.workingDir && session.workingDir && pathsDiffer(claims.workingDir, session.workingDir)) {
     return { ok: false, reason: 'working_dir_mismatch' };
   }
+  const blockedShape = deps.sessionBlockedShape?.(session) ?? 'ok';
+  if (blockedShape !== 'ok') return { ok: false, reason: blockedShape };
 
   let consumed: 'ok' | 'replayed' | 'expired';
   try {
@@ -158,6 +164,7 @@ export async function acceptCardClickTurn(
   const prompt = claims.prompt;
   return {
     ok: true,
+    chatId,
     run: async () => {
       if (assignDir) {
         deps.setWorkingDir(bound, assignDir);

@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   getIdentity: vi.fn(),
   createSession: vi.fn(),
   updateSession: vi.fn(),
+  isTeamBot: vi.fn(() => false),
+  secretPaths: [] as string[],
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
@@ -39,12 +41,22 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   evaluateTalk: () => ({ allowed: true, reason: 'allowedUser' }),
   canOperate: () => true,
   grantCommandRestriction: () => ({ blocked: false }),
+  isTrustedSameOwnerSiblingBot: () => false,
+}));
+vi.mock('../src/services/team-bots-store.js', () => ({
+  isTeamBot: (...args: unknown[]) => mocks.isTeamBot(...args),
+}));
+vi.mock('../src/services/platform-team-store.js', () => ({
+  isPlatformTeamBot: () => false,
 }));
 vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ botName: 'Bot', botOpenId: 'ou_bot', config: { cliId: 'claude' } }),
 }));
 vi.mock('../src/dashboard/auth.js', () => ({
-  loadOrCreateDashboardSecret: () => 'secret',
+  loadOrCreateDashboardSecret: (path: string) => {
+    mocks.secretPaths.push(path);
+    return 'secret';
+  },
 }));
 vi.mock('../src/im/lark/client.js', () => ({
   sendMessage: async () => 'om_card',
@@ -63,9 +75,16 @@ import type { DaemonSession } from '../src/core/types.js';
 const dirs: string[] = [];
 afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-  mocks.forkWorker.mockClear();
-  mocks.sendWorkerInput.mockClear();
+  mocks.forkWorker.mockReset();
+  mocks.forkWorker.mockReturnValue(true);
+  mocks.sendWorkerInput.mockReset();
+  mocks.sendWorkerInput.mockReturnValue(true);
   mocks.getIdentity.mockReset();
+  mocks.isTeamBot.mockReset();
+  mocks.isTeamBot.mockReturnValue(false);
+  mocks.createSession.mockReset();
+  mocks.secretPaths.length = 0;
+  delete process.env.BOTMUX_XPI_ENABLED;
 });
 
 function session(partial: Partial<DaemonSession> = {}): DaemonSession {
@@ -127,6 +146,9 @@ describe('card click turn binder', () => {
     expect(started.ok).toBe(true);
     expect(callers).toEqual(['ou_clicker']);
     expect(ds.session.ownerOpenId).toBe('ou_owner');
+    expect(ds.session.lastCallerOpenId).toBe('ou_clicker');
+    expect(ds.session.quoteTargetId).toBe(started.ok ? started.turnId : undefined);
+    expect(mocks.secretPaths.some(path => path.includes('/card-click-turn/cli_app/secret'))).toBe(true);
     expect(ds.session.replyTargets?.[started.ok ? started.turnId : '']).toMatchObject({
       senderOpenId: 'ou_clicker',
       participants: [{ openId: 'ou_clicker', isBot: false }],
@@ -178,6 +200,10 @@ describe('card click turn binder', () => {
     expect(created?.ownerOpenId).toBe('ou_clicker');
     expect(created?.session.ownerOpenId).toBe('ou_clicker');
     expect(created?.session.creatorOpenId).toBe('ou_clicker');
+    expect(created?.session.lastCallerOpenId).toBe('ou_clicker');
+    expect(mocks.createSession).toHaveBeenCalledWith(
+      'oc_new', 'oc_new', expect.any(String), 'group', 'chat', { source: 'ordinary-feishu' },
+    );
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({
       trustedCaller: { requestUserOpenId: 'ou_clicker', senderType: 'user' },
@@ -209,5 +235,138 @@ describe('card click turn binder', () => {
     expect(accepted).toEqual({ ok: false, reason: 'bot_or_app' });
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
     expect(ds.session.replyTargets).toBeUndefined();
+  });
+
+  it('treats a union-table team bot as a bot before any turn starts', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.isTeamBot.mockReturnValue(true);
+    const ds = session();
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async () => { throw new Error('stamped a team bot'); },
+    });
+    const issued = issueCardClickTurn({
+      secret: 'secret', larkAppId: 'cli_app', prompt: 'do the thing', chatId: 'oc_chat', now: Date.now(), nonce: 'nonce-nonce-nonce4',
+    });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_team', operatorUnionId: 'on_team_bot', payload: issued.payload, sig: issued.sig,
+    });
+    expect(accepted).toEqual({ ok: false, reason: 'bot_or_app' });
+    expect(mocks.isTeamBot).toHaveBeenCalled();
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+  });
+
+  it('does not deliver when the trusted caller is not the clicker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    const ds = session();
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async () => ({
+        requestUserOpenId: 'ou_owner', requestLarkAppId: 'cli_app', senderType: 'user' as const,
+      }),
+    });
+    const issued = issueCardClickTurn({
+      secret: 'secret', larkAppId: 'cli_app', prompt: 'do the thing', chatId: 'oc_chat', now: Date.now(), nonce: 'nonce-nonce-nonce5',
+    });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    expect(ds.session.lastCallerOpenId).toBeUndefined();
+  });
+
+  it('rolls back a failed delivery so the session has no ghost turn', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.sendWorkerInput.mockReturnValue(false);
+    const ds = session();
+    ds.session.lastCallerOpenId = 'ou_previous';
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async (_app, openId) => ({
+        requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const,
+      }),
+    });
+    const issued = issueCardClickTurn({
+      secret: 'secret', larkAppId: 'cli_app', prompt: 'do the thing', chatId: 'oc_chat', now: Date.now(), nonce: 'nonce-nonce-nonce6',
+    });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    });
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) return;
+    expect(await accepted.run()).toEqual({ ok: false, reason: 'delivery_failed' });
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    expect(ds.session.lastCallerOpenId).toBe('ou_previous');
+    expect(ds.session.quoteTargetSenderOpenId).toBeUndefined();
+    expect(ds.session.replyTargets).toBeUndefined();
+  });
+
+  it('refuses a principal-lane session without consuming the button or writing a turn', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    const ds = session();
+    ds.session.principalLane = { ownerOpenId: 'ou_owner' } as never;
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async () => { throw new Error('lane click started'); },
+    });
+    const issued = issueCardClickTurn({
+      secret: 'secret', larkAppId: 'cli_app', prompt: 'do the thing', chatId: 'oc_chat', now: Date.now(), nonce: 'nonce-nonce-nonce7',
+    });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    });
+    expect(accepted).toEqual({ ok: false, reason: 'principal_lane' });
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    const again = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    });
+    expect(again).toEqual({ ok: false, reason: 'principal_lane' });
+  });
+
+  it('refuses every click while cross-principal interruption is enabled', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    process.env.BOTMUX_XPI_ENABLED = '1';
+    const ds = session();
+    const binder = createCardClickTurnBinder({
+      activeSessions: new Map([['oc_chat::cli_app', ds]]),
+      dataDir: () => dataDir,
+      noteTurnReceived: async () => undefined,
+      beginNewTurn: () => undefined,
+      trustedCallerForInboundTurn: async () => { throw new Error('xpi click started'); },
+    });
+    const issued = issueCardClickTurn({
+      secret: 'secret', larkAppId: 'cli_app', prompt: 'do the thing', chatId: 'oc_chat', now: Date.now(), nonce: 'nonce-nonce-nonce8',
+    });
+    if (!issued.ok) throw new Error(issued.error);
+    const accepted = await binder.accept({
+      larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig,
+    });
+    expect(accepted).toEqual({ ok: false, reason: 'cross_principal' });
+    expect(ds.activeInteractiveTurn).toBeUndefined();
   });
 });

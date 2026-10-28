@@ -194,7 +194,7 @@ import {
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
-import { createCardClickTurnBinder } from './services/card-click-turn-bind.js';
+import { cardClickOperatorIsBotOrApp, createCardClickTurnBinder } from './services/card-click-turn-bind.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
 import { setTurnResultRuntime } from './core/turn-result-runtime.js';
 
@@ -7077,7 +7077,15 @@ const cardClickTurns = createCardClickTurnBinder({
   noteTurnReceived,
   beginNewTurn,
   trustedCallerForInboundTurn: (larkAppId, senderOpenId, senderUnionId) =>
-    trustedCallerForInboundTurn(larkAppId, senderOpenId, senderUnionId, false),
+    trustedCallerForInboundTurn(
+      larkAppId,
+      senderOpenId,
+      senderUnionId,
+      // Card clicks have no platform sender_type. The predicate is peer
+      // cross-ref, identity-cache bot/app, and the three union-id bot tables.
+      // A literal false here would vouch for a team bot as a person.
+      cardClickOperatorIsBotOrApp(config.session.dataDir, larkAppId, senderOpenId ?? '', senderUnionId),
+    ),
 });
 setCardClickTurnPoster((larkAppId, body) => cardClickTurns.post(larkAppId, body));
 
