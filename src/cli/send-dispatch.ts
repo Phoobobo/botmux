@@ -1,0 +1,473 @@
+import { extname } from 'node:path';
+import { formatLarkError } from '../bot-registry.js';
+import {
+  contentAuditSendRemediation,
+  isLarkContentAuditError,
+  larkErrorCode,
+} from '../im/lark/content-audit.js';
+import {
+  findDisallowedCardCallback,
+  type InteractiveCardCallbackPolicy,
+} from '../core/card-callback-policy.js';
+import type { ManagedHookOrigin } from '../services/hook-runner.js';
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+
+export type SendMessageFn = (
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  msgType?: string,
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+  options?: OutboundMessageOptions,
+) => Promise<string>;
+
+export type ReplyMessageFn = (
+  larkAppId: string,
+  messageId: string,
+  content: string,
+  msgType?: string,
+  replyInThread?: boolean,
+  uuid?: string,
+  hookContext?: Record<string, unknown>,
+  options?: OutboundMessageOptions,
+) => Promise<string>;
+
+export type DispatchPrimaryDeps = {
+  sendMessage: SendMessageFn;
+  replyMessage: ReplyMessageFn;
+};
+
+/** Keep provider details visible without leaking Axios config or headers.
+ *  Content-audit rejections are permanent and content-specific: append an
+ *  actionable remediation line so the model in the worker PTY corrects the
+ *  payload instead of resending verbatim (which fails identically). */
+export function describeSendFailure(err: unknown): string {
+  const detail = formatLarkError(err)
+    ?? (err instanceof Error && err.message ? err.message : String(err));
+  return isLarkContentAuditError(err)
+    ? `${detail}\n${contentAuditSendRemediation(larkErrorCode(err))}`
+    : detail;
+}
+
+/**
+ * Paths that resolve to the process's own stdin. `botmux send` reads stdin for
+ * the message body (the documented `echo "msg" | botmux send` form), so passing
+ * one of these to `--file`/`--image` makes a single stdin serve two consumers:
+ * the body is read first, then the attachment read sees EOF. The attachment
+ * upload then fails *after* the primary message was already delivered, so the
+ * command exits non-zero for an already-sent message and the caller resends —
+ * producing duplicate messages. Reject these up front instead.
+ */
+const STDIN_ALIAS_PATHS = new Set(['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0']);
+
+/** First attachment path that aliases stdin, or null if none do. */
+export function findStdinAliasAttachment(paths: readonly string[]): string | null {
+  for (const p of paths) {
+    if (STDIN_ALIAS_PATHS.has(p.trim())) return p;
+  }
+  return null;
+}
+
+export type SlashSendValidation =
+  | { ok: true; command: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate the body of a `botmux send --slash "<cmd>"`.
+ *
+ * `--slash` exists so one bot can hand another a NATIVE slash command that the
+ * receiving daemon relays into the CLI verbatim (passthrough: /clear, /model,
+ * …) or routes as a daemon command (/close, …). The ordinary `send` path wraps
+ * every message in an interactive card whose body picks up a `[🔊 语音总结]`
+ * footer line, so the receiver sees a MULTI-LINE message and
+ * `parseSlashCommandInvocation` (which only treats /schedule|/role|/fork as
+ * multi-line commands) drops it to an ordinary prompt — the command never
+ * reaches the passthrough/daemon router. A `--slash` send therefore MUST go out
+ * as a single-line plain-`text` message.
+ *
+ * Fail LOUD rather than silently sending junk: the content has to be exactly one
+ * line and start with `/`. Leading/trailing whitespace is trimmed (a trailing
+ * newline from a heredoc is the common case); an interior newline is rejected so
+ * the caller notices instead of the daemon quietly treating it as prose.
+ */
+export function validateSlashSend(raw: string): SlashSendValidation {
+  const command = raw.trim();
+  if (!command) return { ok: false, error: '--slash 需要一条斜杠命令，例如 --slash "/clear"' };
+  if (/[\r\n]/.test(command)) {
+    return { ok: false, error: '--slash 只能发送单行斜杠命令（收到含换行的多行内容）' };
+  }
+  if (!command.startsWith('/')) {
+    return { ok: false, error: `--slash 内容必须以 / 开头（收到 ${JSON.stringify(command.slice(0, 24))}）` };
+  }
+  return { ok: true, command };
+}
+
+export type SendFileAttachmentsDeps = {
+  uploadFile: (appId: string, path: string) => Promise<string>;
+  dispatch: (content: string, msgType: string) => Promise<string>;
+  beforeEffect?: () => void | Promise<void>;
+};
+
+export type SendFileAttachmentsResult = {
+  sent: string[];                              // message ids of delivered attachments
+  failed: { path: string; error: string }[];  // attachments that failed to upload/send
+};
+
+/**
+ * Upload + post each file as its own message, best-effort. By the time this
+ * runs the primary message has already been delivered, so a failure on one
+ * attachment must NOT throw: letting it bubble would make the caller report
+ * total failure (exit 1) for an already-sent message, which drives resends and
+ * duplicates. Collect failures so the caller can surface them as a warning
+ * while still reporting the primary send as the success it was.
+ */
+export async function sendFileAttachments(
+  deps: SendFileAttachmentsDeps,
+  appId: string,
+  files: readonly string[],
+): Promise<SendFileAttachmentsResult> {
+  const sent: string[] = [];
+  const failed: { path: string; error: string }[] = [];
+  for (const fp of files) {
+    try {
+      await deps.beforeEffect?.();
+      const fileKey = await deps.uploadFile(appId, fp);
+      await deps.beforeEffect?.();
+      sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
+    } catch (err: unknown) {
+      failed.push({ path: fp, error: describeSendFailure(err) });
+    }
+  }
+  return { sent, failed };
+}
+
+const VIDEO_EXTENSIONS = new Set(['.mp4']);
+const VIDEO_COVER_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp']);
+
+/**
+ * Decide whether a send is a "pure video" send — one delivered as a standalone
+ * Lark media message with no text/card primary.
+ *
+ * A media message CANNOT embed an `<at>`, so a send that also carries mentions
+ * must NOT be pure-video: it has to go through the card path (which renders the
+ * @ on the footer) and send the video as a follow-up attachment. Otherwise the
+ * mention silently never fires while the success output still reports it.
+ */
+export function shouldSendAsPureVideo(input: {
+  hasBodyText: boolean;
+  imageCount: number;
+  fileCount: number;
+  videoCount: number;
+  mentionCount: number;
+}): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && input.fileCount === 0
+    && input.videoCount > 0
+    && input.mentionCount === 0;
+}
+
+export type VideoAttachmentInput = {
+  videoPath: string;
+  coverPath: string;
+  durationMs: number;
+};
+
+export type VideoAttachmentValidationResult =
+  | { ok: true; videos: VideoAttachmentInput[] }
+  | { ok: false; error: string };
+
+export function validateVideoAttachments(
+  videos: readonly string[],
+  covers: readonly string[],
+): VideoAttachmentValidationResult {
+  if (videos.length === 0 && covers.length > 0) {
+    return { ok: false, error: '--video-covers 需要配套 --videos 使用' };
+  }
+  if (videos.length !== covers.length) {
+    return {
+      ok: false,
+      error: `--videos 与 --video-covers 数量必须一致（videos=${videos.length}, covers=${covers.length}）`,
+    };
+  }
+
+  const out: VideoAttachmentInput[] = [];
+  for (let i = 0; i < videos.length; i++) {
+    const videoPath = videos[i];
+    const coverPath = covers[i];
+    const videoExt = extname(videoPath).toLowerCase();
+    if (!VIDEO_EXTENSIONS.has(videoExt)) {
+      return { ok: false, error: `不支持的视频格式: ${videoPath}（目前仅支持 .mp4）` };
+    }
+    const coverExt = extname(coverPath).toLowerCase();
+    if (!VIDEO_COVER_EXTENSIONS.has(coverExt)) {
+      return {
+        ok: false,
+        error: `不支持的视频封面格式: ${coverPath}（支持 .png/.jpg/.jpeg/.gif/.webp/.bmp）`,
+      };
+    }
+    out.push({ videoPath, coverPath, durationMs: 0 });
+  }
+  return { ok: true, videos: out };
+}
+
+export type NormalizedInteractiveCardResult =
+  | { ok: true; card: Record<string, unknown>; cardJson: string }
+  | { ok: false; error: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseJson(raw: string, label: string): { ok: true; value: unknown } | { ok: false; error: string } {
+  try {
+    return { ok: true, value: JSON.parse(raw) };
+  } catch (err: any) {
+    return { ok: false, error: `${label} 不是合法 JSON: ${err?.message ?? String(err)}` };
+  }
+}
+
+function cardObjectFromValue(value: unknown, label: string): { ok: true; card: Record<string, unknown> } | { ok: false; error: string } {
+  let card = value;
+  if (typeof card === 'string') {
+    const parsed = parseJson(card, label);
+    if (!parsed.ok) return parsed;
+    card = parsed.value;
+  }
+  if (!isRecord(card)) {
+    return { ok: false, error: `${label} 必须是 JSON object` };
+  }
+  return { ok: true, card };
+}
+
+/**
+ * Normalize user-supplied Lark/Feishu interactive card JSON into the raw card
+ * body expected by the Lark send/reply APIs. Accepts either:
+ *   - direct card JSON: {"schema":"2.0", ...}
+ *   - webhook/openapi-style wrapper: {"msg_type":"interactive","card":{...}}
+ *   - wrapper with string/object content: {"msg_type":"interactive","content":"{...}"}
+ *
+ * Rejects callback actions by default. botmux owns a broad card-action
+ * namespace (close/restart/ask/relay/dashboard/etc.); arbitrary callbacks from
+ * a CLI-created card would be routed through those handlers with host-side
+ * privileges after a user clicks. An explicit callbackPolicy may admit only
+ * actions that resolve to one selected, enabled plugin; built-in key/root
+ * discriminators remain sealed. Display cards and open-url buttons still work.
+ */
+export function normalizeInteractiveCardInput(
+  raw: string,
+  options: { callbackPolicy?: InteractiveCardCallbackPolicy } = {},
+): NormalizedInteractiveCardResult {
+  if (!raw.trim()) return { ok: false, error: '自定义卡片 JSON 不能为空' };
+
+  const parsed = parseJson(raw, '自定义卡片 JSON');
+  if (!parsed.ok) return parsed;
+
+  let cardSource = parsed.value;
+  if (isRecord(parsed.value)) {
+    const msgType = typeof parsed.value.msg_type === 'string'
+      ? parsed.value.msg_type
+      : typeof parsed.value.msgType === 'string'
+        ? parsed.value.msgType
+        : undefined;
+    if (msgType !== undefined) {
+      if (msgType !== 'interactive') {
+        return { ok: false, error: `自定义卡片 wrapper 的 msg_type 必须是 interactive（当前: ${msgType}）` };
+      }
+      if ('card' in parsed.value) cardSource = parsed.value.card;
+      else if ('content' in parsed.value) cardSource = parsed.value.content;
+      else return { ok: false, error: 'interactive wrapper 必须包含 card 或 content 字段' };
+    }
+  }
+
+  const normalized = cardObjectFromValue(cardSource, '自定义卡片');
+  if (!normalized.ok) return normalized;
+
+  const callbackPath = findDisallowedCardCallback(
+    normalized.card,
+    'card',
+    options.callbackPolicy,
+  );
+  if (callbackPath) {
+    return {
+      ok: false,
+      error: `自定义卡片暂不允许 callback 行为（${callbackPath}），请改用 open_url 等展示/跳转能力`,
+    };
+  }
+
+  return { ok: true, card: normalized.card, cardJson: JSON.stringify(normalized.card) };
+}
+
+export type SendVideoAttachmentsDeps = {
+  uploadFile: (appId: string, path: string) => Promise<string>;
+  uploadImage: (appId: string, path: string) => Promise<string>;
+  dispatch: (content: string, msgType: string) => Promise<string>;
+  // Optional: dispatch used for the FIRST successfully-sent video only. A
+  // pure-video send (no text/card primary) has no other message to carry the
+  // quote/reply chain, so its first media message must go through the primary
+  // dispatch (which applies the chat-scope quoteTargetId) to stay consistent
+  // with card/file/image sends. Later videos remain best-effort via `dispatch`.
+  // Omitted for secondary sends (card is already the primary) → all use `dispatch`.
+  primaryDispatch?: (content: string, msgType: string) => Promise<string>;
+  /** Optional hard cap checked before any upload/dispatch. Managed VC pure-video
+   * replies set this to one because only the primary media message has a durable
+   * action/provider identity; later bare media sends would duplicate on replay. */
+  maxMessages?: number;
+  beforeEffect?: () => void | Promise<void>;
+};
+
+export type SendVideoAttachmentsResult = {
+  sent: string[];
+  failed: { path: string; coverPath: string; error: string }[];
+};
+
+export async function sendVideoAttachments(
+  deps: SendVideoAttachmentsDeps,
+  appId: string,
+  videos: readonly VideoAttachmentInput[],
+): Promise<SendVideoAttachmentsResult> {
+  if (deps.maxMessages !== undefined && videos.length > deps.maxMessages) {
+    throw new Error(
+      `受管 VC 回复一次最多发送 ${deps.maxMessages} 个视频；多视频请拆分为受管 action`,
+    );
+  }
+  const sent: string[] = [];
+  const failed: { path: string; coverPath: string; error: string }[] = [];
+  // The first video that actually goes out uses `primaryDispatch` (quote chain);
+  // every later one uses plain `dispatch`. Tracked on success only, so if the
+  // first video's upload fails the next one inherits the primary slot.
+  let primaryUsed = false;
+  for (const video of videos) {
+    try {
+      await deps.beforeEffect?.();
+      const fileKey = await deps.uploadFile(appId, video.videoPath);
+      await deps.beforeEffect?.();
+      const imageKey = await deps.uploadImage(appId, video.coverPath);
+      const content = JSON.stringify({
+        file_key: fileKey,
+        image_key: imageKey,
+        duration: video.durationMs,
+      });
+      const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
+      await deps.beforeEffect?.();
+      const messageId = await send(content, 'media');
+      primaryUsed = true;
+      sent.push(messageId);
+    } catch (err: unknown) {
+      failed.push({
+        path: video.videoPath,
+        coverPath: video.coverPath,
+        error: describeSendFailure(err),
+      });
+    }
+  }
+  return { sent, failed };
+}
+
+export type DispatchPrimaryOptions = {
+  appId: string;
+  targetChatId: string;
+  quoteTargetId: string | null | undefined;
+  content: string;
+  msgType: string;
+  hookContext: Record<string, unknown>;
+  /** Stable provider idempotency key for a crash-replayed primary effect. */
+  uuid?: string;
+  MessageWithdrawnError: new (...args: any[]) => Error;
+  dispatch: (content: string, msgType: string, uuid?: string, suppressHook?: boolean) => Promise<string>;
+  /** Provider UUID reconciliation must not repeat the local outbound hook. */
+  suppressHook?: boolean;
+  /** Revalidate immediately before the distinct post-provider hook effect. */
+  beforeHook?: () => void | Promise<void>;
+  hookOrigin?: ManagedHookOrigin;
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
+  /** Revalidate any side-effect authority after an awaited quote failure and
+   * immediately before the fallback creates a top-level message. */
+  beforeQuoteFallback?: () => void | Promise<void>;
+  /** Passed into the transport gate, including its queued retries. */
+  beforeWrite?: () => void | Promise<void>;
+  /** Revalidate managed authority immediately before each provider call. */
+  beforeEffect?: () => void | Promise<void>;
+  onQuoteWithdrawn?: (messageId: string) => void;
+};
+
+export type DispatchPrimaryResult = {
+  messageId: string;
+  primaryQuotedId: string | null;
+};
+
+export async function dispatchPrimaryMessage(
+  deps: DispatchPrimaryDeps,
+  opts: DispatchPrimaryOptions,
+): Promise<DispatchPrimaryResult> {
+  if (!opts.quoteTargetId) {
+    await opts.beforeEffect?.();
+    return {
+      messageId: await (opts.suppressHook
+        ? opts.dispatch(opts.content, opts.msgType, opts.uuid, true)
+        : opts.dispatch(opts.content, opts.msgType, opts.uuid)),
+      primaryQuotedId: null,
+    };
+  }
+
+  const hookOptions: OutboundMessageOptions | undefined = opts.suppressHook || opts.beforeHook || opts.groupContextAuthorOrigin || opts.beforeWrite
+    ? {
+        ...(opts.suppressHook ? { suppressHook: true } : opts.beforeHook ? {
+          beforeHook: opts.beforeHook,
+          ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+        } : {}),
+        ...(opts.groupContextAuthorOrigin ? { groupContextAuthorOrigin: opts.groupContextAuthorOrigin } : {}),
+        ...(opts.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+      }
+    : undefined;
+  try {
+    await opts.beforeEffect?.();
+    const args = [
+      opts.appId,
+      opts.quoteTargetId,
+      opts.content,
+      opts.msgType,
+      false,
+      opts.uuid,
+      opts.hookContext,
+    ] as const;
+    const messageId = hookOptions
+      ? await deps.replyMessage(...args, hookOptions)
+      : await deps.replyMessage(...args);
+    return { messageId, primaryQuotedId: opts.quoteTargetId };
+  } catch (err: any) {
+    if (err instanceof opts.MessageWithdrawnError) {
+      // A quote failure is an awaited provider boundary.  Revalidate once
+      // immediately before the fallback effect: callers may provide a
+      // fallback-specific composite fence (for example VC + managed-origin),
+      // otherwise reuse the ordinary per-effect fence.
+      if (opts.beforeQuoteFallback) await opts.beforeQuoteFallback();
+      else await opts.beforeEffect?.();
+      opts.onQuoteWithdrawn?.(opts.quoteTargetId);
+      return {
+        messageId: await (hookOptions
+          ? deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+              hookOptions,
+            )
+          : deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+            )),
+        primaryQuotedId: null,
+      };
+    }
+    throw err;
+  }
+}

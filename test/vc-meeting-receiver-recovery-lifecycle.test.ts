@@ -1,0 +1,156 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { VcMeetingDeliveryRequest } from '../src/services/vc-meeting-delivery-protocol.js';
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  return { Client: FakeClient, LoggerLevel: { error: 0, warn: 1, info: 2 } };
+});
+
+import { __testOnly_vcMeetingReceiverRecovery as recovery } from '../src/daemon.js';
+
+function delivery(sessionId: string, memberId: string): VcMeetingDeliveryRequest {
+  return {
+    schemaVersion: 1,
+    meeting: {
+      listenerAppId: 'listener_test',
+      meetingId: 'meeting_test',
+      ownerBootId: 'owner_boot',
+      ownerEpoch: 1,
+    },
+    member: {
+      memberId,
+      agentAppId: 'agent_test',
+      role: 'reviewer',
+      epoch: 1,
+      membershipGeneration: 1,
+    },
+    stream: {
+      fromSeq: 1,
+      toSeq: 1,
+      batchId: `batch_${memberId}`,
+      inputHash: 'unused_by_gate',
+      final: false,
+    },
+    entries: [{ deliverySeq: 1, kind: 'item', rawText: 'hello' }],
+    target: { sessionId, chatId: 'chat_test' },
+    instructionVersion: 'v1',
+  };
+}
+
+describe('VC meeting receiver boot-recovery lifecycle', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    recovery.reset();
+  });
+
+  afterEach(() => {
+    recovery.reset();
+    vi.useRealTimers();
+  });
+
+  it('ignores a reset-ready ACK that arrives after timeout escalation until orphan teardown completes', async () => {
+    recovery.setBackingMissingProbe(() => true);
+    const key = recovery.start('sess_late_ack', 'delivery_late_ack', 4, {
+      memberId: 'member_a',
+    });
+    recovery.finishScheduling();
+
+    expect(recovery.snapshot(key)).toMatchObject({
+      ready: false,
+      pending: true,
+      timerArmed: true,
+    });
+    expect(recovery.isBlocked(delivery('sess_late_ack', 'member_a'))).toBe(true);
+    // Per-receiver recovery: A's stuck reset never creates a daemon-global
+    // barrier for unrelated receiver/member B.
+    expect(recovery.isBlocked(delivery('sess_b', 'member_b'))).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(recovery.snapshot(key)).toMatchObject({
+      ready: false,
+      pending: true,
+      timerArmed: true,
+    });
+
+    // The worker ACK belongs to the pre-escalation reset request. Once the
+    // daemon has committed to kill + orphan teardown it must not cancel phase 2.
+    recovery.acknowledge('sess_late_ack', 'delivery_late_ack', 4);
+    expect(recovery.snapshot(key)).toMatchObject({
+      ready: false,
+      pending: true,
+      timerArmed: true,
+    });
+
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(recovery.snapshot(key).ready).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(recovery.snapshot(key)).toMatchObject({
+      ready: true,
+      pending: false,
+      timerArmed: false,
+    });
+  });
+
+  it('does not trust reset-ready without authoritative backing-missing proof', async () => {
+    recovery.setBackingMissingProbe(() => false);
+    const key = recovery.start('sess_unproven_ack', 'delivery_unproven_ack', 2, {
+      memberId: 'member_unproven',
+    });
+    recovery.finishScheduling();
+
+    recovery.acknowledge('sess_unproven_ack', 'delivery_unproven_ack', 2);
+    expect(recovery.snapshot(key)).toMatchObject({
+      ready: false,
+      pending: true,
+      timerArmed: true,
+    });
+
+    recovery.setBackingMissingProbe(() => true);
+    await vi.advanceTimersByTimeAsync(7_999);
+    expect(recovery.isBlocked(delivery('sess_unproven_ack', 'member_unproven'))).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
+  });
+
+  it('keeps the boot fence until exact dispatch retirement persists after backing is missing', async () => {
+    recovery.setBackingMissingProbe(() => true);
+    let retirementWorks = false;
+    const retired: Array<[string, string, number]> = [];
+    recovery.setDispatchRetirement((sessionId, turnId, dispatchAttempt) => {
+      retired.push([sessionId, turnId, dispatchAttempt]);
+      return retirementWorks;
+    });
+    const key = recovery.start('sess_retire', 'delivery_retire', 5, {
+      memberId: 'member_retire',
+    });
+    recovery.finishScheduling();
+
+    recovery.acknowledge('sess_retire', 'delivery_retire', 5);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: false, pending: true, timerArmed: true });
+    expect(retired).toEqual([['sess_retire', 'delivery_retire', 5]]);
+
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: false, pending: true, timerArmed: true });
+    expect(retired).toEqual([
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+    ]);
+
+    retirementWorks = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(retired).toEqual([
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+      ['sess_retire', 'delivery_retire', 5],
+    ]);
+    expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
+  });
+
+  it('Plan B: a session with no durable delivery receipt is not boot-recovery blocked', () => {
+    // A plain user turn's session never gets a delivery ledger entry, so the boot
+    // gate must not block it. No recovery started for this sessionId → not blocked.
+    recovery.finishScheduling();
+    expect(recovery.isBlocked(delivery('sess_plain_user_turn', 'member_none'))).toBe(false);
+  });
+});

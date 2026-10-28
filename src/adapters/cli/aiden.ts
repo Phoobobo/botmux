@@ -1,16 +1,18 @@
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { writeTextThenEnter } from './tui-input.js';
+import type { CliAdapter } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 export function createAidenAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'aiden');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'aiden';
+  let cachedBin: string | undefined;
   return {
     id: 'aiden',
-    resolvedBin: bin,
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, disableCliBypass }) {
       const args: string[] = [];
@@ -28,22 +30,10 @@ export function createAidenAdapter(pathOverride?: string): CliAdapter {
       return `aiden --resume ${sessionId}`;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
+    writeInput: writeTextThenEnter,
 
     completionPattern: undefined,  // quiescence only
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,
   };
 }
-
-export const create = createAidenAdapter;

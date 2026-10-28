@@ -13,6 +13,8 @@
  * keeping first occurrence. Unresolvable ref → reported in `invalid` list.
  */
 
+import type { ChatMode } from '../services/groups-store.js';
+
 export interface BotConfigForResolve {
   larkAppId: string;
   cliId: string;
@@ -23,6 +25,15 @@ export interface BotInfoForResolve {
   botName: string | null;
 }
 
+export interface BotInfoForKickoff {
+  larkAppId: string;
+  botOpenId: string | null;
+}
+
+export type ResolvedKickoff =
+  | { ok: true; targetLarkAppId?: string; prompt?: string }
+  | { ok: false; error: string };
+
 export interface ResolvedBots {
   /** Resolved larkAppIds in input order, deduped. First element is creator. */
   larkAppIds: string[];
@@ -30,6 +41,71 @@ export interface ResolvedBots {
   invalid: string[];
   /** Warnings about ambiguous name → first match picked. */
   ambiguousWarnings: string[];
+}
+
+export interface CreateGroupCompletionStatus {
+  success: boolean;
+  chatCreated: true;
+  chatId: string;
+  collaborationReady: boolean;
+  kickoffAccepted: boolean;
+  kickoffRequested: boolean;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
+}
+
+/** Build the machine-readable terminal status for create-group. Success means
+ * an explicitly requested kickoff (if any) was sent. `collaborationReady` reports
+ * whether the best-effort bot-to-bot grants were written: a miss there is a
+ * warning, and must not make callers that retry on failure create a second
+ * group. */
+export function createGroupCompletionStatus(input: {
+  chatId: string;
+  collaborationReady: boolean;
+  kickoffRequested: boolean;
+  kickoffMessageId: string | null;
+  kickoffError: string | null;
+}): CreateGroupCompletionStatus {
+  const kickoffAccepted = !input.kickoffRequested
+    || (!!input.kickoffMessageId && !input.kickoffError);
+  return {
+    success: kickoffAccepted,
+    chatCreated: true,
+    chatId: input.chatId,
+    collaborationReady: input.collaborationReady,
+    kickoffAccepted,
+    kickoffRequested: input.kickoffRequested,
+    kickoffMessageId: input.kickoffMessageId,
+    kickoffError: input.kickoffError,
+  };
+}
+
+/** Preserve the long-standing stdout contract: create-group emits only the
+ * chatId by default, including partial/non-zero outcomes. Callers that can
+ * consume a second structured line must opt in explicitly. */
+export function shouldWriteCreateGroupCompletionStatus(
+  _status: CreateGroupCompletionStatus,
+  explicitJsonStatus: boolean,
+): boolean {
+  return explicitJsonStatus;
+}
+
+export type ResolvedChatMode =
+  | { ok: true; chatMode?: ChatMode }
+  | { ok: false; error: string };
+
+/**
+ * Parse the optional `--chat-mode` flag for `botmux create-group`.
+ *
+ * Absent/empty → `{ ok: true }` with no `chatMode`, so the request omits
+ * `chat_mode` and keeps Feishu's default (普通群). Only the two creation-time
+ * topologies are accepted; `p2p` is a direct message, not a creatable group.
+ */
+export function resolveChatMode(raw: string | undefined): ResolvedChatMode {
+  const value = raw?.trim().toLowerCase();
+  if (!value) return { ok: true };
+  if (value === 'group' || value === 'topic') return { ok: true, chatMode: value };
+  return { ok: false, error: `--chat-mode 只支持 group 或 topic，收到: "${raw}"。` };
 }
 
 export function resolveBotRefs(
@@ -95,4 +171,43 @@ export function resolveBotRefs(
   }
 
   return { larkAppIds: out, invalid, ambiguousWarnings };
+}
+
+/**
+ * Validate the optional kickoff pair and resolve the user-facing bot open_id
+ * back to a selected larkAppId. The service later obtains the target bot's
+ * observer-scoped open_id from the creator app before sending the @mention;
+ * a bot's self-reported open_id is not valid across Lark apps.
+ */
+export function resolveKickoff(
+  botOpenIdRaw: string | undefined,
+  promptRaw: string | undefined,
+  selectedLarkAppIds: string[],
+  botInfo: BotInfoForKickoff[],
+): ResolvedKickoff {
+  const botOpenId = botOpenIdRaw?.trim() || undefined;
+  const prompt = promptRaw?.trim() || undefined;
+
+  if (!botOpenId && !prompt) return { ok: true };
+  if (!botOpenId || !prompt) {
+    return { ok: false, error: '--kickoff-bot 与 --kickoff-prompt 必须同时提供且不能为空。' };
+  }
+
+  const matches = botInfo.filter(info => info.botOpenId?.trim() === botOpenId);
+  if (matches.length === 0) {
+    return { ok: false, error: `--kickoff-bot 未匹配到本机 bot: ${botOpenId}` };
+  }
+  if (matches.length > 1) {
+    return { ok: false, error: `--kickoff-bot 匹配到多个本机 bot，请检查 bots-info.json: ${botOpenId}` };
+  }
+
+  const targetLarkAppId = matches[0].larkAppId;
+  if (!selectedLarkAppIds.includes(targetLarkAppId)) {
+    return { ok: false, error: '--kickoff-bot 必须属于本次 --bot 列表。' };
+  }
+  if (targetLarkAppId === selectedLarkAppIds[0]) {
+    return { ok: false, error: '--kickoff-bot 不能是 creator（第一个 --bot）。' };
+  }
+
+  return { ok: true, targetLarkAppId, prompt };
 }

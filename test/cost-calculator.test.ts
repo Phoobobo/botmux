@@ -1,5 +1,5 @@
 /**
- * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost, formatNumber.
+ * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost.
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
@@ -9,15 +9,48 @@ import { join } from 'node:path';
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 // Mock os.homedir before importing the module under test
-vi.mock('node:os', () => ({ homedir: () => '/home/testuser' }));
+vi.mock('node:os', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:os')>()),
+  homedir: () => '/home/testuser',
+}));
 
 // Mock fs so we never touch real disk
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
+  const readFileSyncMock = vi.fn(() => '');
+  const fdContent = new Map<number, string>();
+  let nextFd = 10_000;
+  const statsForContent = (content: string) => ({
+    dev: 1,
+    ino: 1,
+    size: Buffer.byteLength(content, 'utf8'),
+    mtimeMs: 1,
+    ctimeMs: 1,
+    isFile: () => true,
+  });
   return {
     ...original,
+    closeSync: vi.fn((fd: number) => { fdContent.delete(fd); }),
     existsSync: vi.fn(() => false),
-    readFileSync: vi.fn(() => ''),
+    fstatSync: vi.fn((fd: number) => statsForContent(fdContent.get(fd) ?? '')),
+    lstatSync: vi.fn(() => ({
+      isFile: () => true,
+      mtimeMs: 0,
+    })),
+    openSync: vi.fn((path: string) => {
+      const fd = nextFd++;
+      fdContent.set(fd, String(readFileSyncMock(path, 'utf-8') ?? ''));
+      return fd;
+    }),
+    readFileSync: readFileSyncMock,
+    readSync: vi.fn((fd: number, buffer: Buffer, offset: number, length: number, position: number | null) => {
+      const content = Buffer.from(fdContent.get(fd) ?? '', 'utf8');
+      const start = Math.max(0, position ?? 0);
+      const slice = content.subarray(start, start + length);
+      slice.copy(buffer, offset);
+      return slice.length;
+    }),
+    statSync: vi.fn((path: string) => statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''))),
   };
 });
 
@@ -26,16 +59,73 @@ vi.mock('../src/utils/logger.js', () => ({
   logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 
-// expandHome is imported by cost-calculator from session-manager; provide a simple impl
-vi.mock('../src/core/session-manager.js', () => ({
+// expandHome is imported by cost-calculator from working-dir; provide a simple impl
+vi.mock('../src/core/working-dir.js', () => ({
   expandHome: (p: string) => (p.startsWith('~') ? `/home/testuser${p.slice(1)}` : p),
 }));
 
+vi.mock('../src/services/codex-transcript.js', () => ({
+  findCodexRolloutBySessionId: vi.fn(() => undefined),
+  findCodexSessionIdByBotmuxSessionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/traex-transcript.js', () => ({
+  findTraexRolloutBySessionId: vi.fn(() => undefined),
+  findTraexSessionIdByBotmuxSessionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/pi-transcript.js', () => ({
+  findPiTranscriptBySessionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/aiden-checkpoints.js', () => ({
+  findAidenLatestCheckpointBySessionId: vi.fn(() => undefined),
+  findAidenLatestCheckpointByBotmuxSessionId: vi.fn(() => undefined),
+}));
+
+vi.mock('../src/services/jsonl-cursor.js', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../src/services/jsonl-cursor.js')>();
+  return {
+    ...original,
+    scanJsonlFromOffset: vi.fn((path: string, fromOffset: number, opts?: { onLine?: (line: string, lineStart: number) => void }) => {
+      const text = String(vi.mocked(readFileSync)(path, 'utf-8')).slice(Math.max(0, fromOffset));
+      let cursor = Math.max(0, fromOffset);
+      const lines = text.split('\n');
+      const pendingTail = lines.pop() ?? '';
+      for (const line of lines) {
+        opts?.onLine?.(line, cursor);
+        cursor += Buffer.byteLength(line, 'utf8') + 1;
+      }
+      return { newOffset: cursor, pendingTail };
+    }),
+  };
+});
+
+// Seed/Relay data root resolution goes through the adapter (binary realpath →
+// <pkg>/.claude-runtime). Mock it to a deterministic package-local root so the
+// path assertion below proves we no longer read from ~/.claude-runtime.
+const FORK_DATA_DIR = '/fake/pkg/.claude-runtime';
+vi.mock('../src/adapters/cli/registry.js', () => ({
+  createCliAdapterSync: vi.fn(() => ({ claudeDataDir: FORK_DATA_DIR })),
+}));
+
+// resolveSessionTranscriptPath() 的 codex 分支会查会话库里的实例绑定。
+// 本套件整体 mock 了 node:fs，真实 store 会读到合成文件系统；stub 掉它需要的这一个入口。
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: vi.fn(() => undefined),
+}));
+
 import { existsSync, readFileSync } from 'node:fs';
+import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
+import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
+import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
+import { findPiTranscriptBySessionId } from '../src/services/pi-transcript.js';
 import {
   getSessionJsonlPath,
   getSessionCost,
-  formatNumber,
+  getSessionUsageSnapshot,
+  getSessionTokenUsage,
+  __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
 
@@ -71,8 +161,23 @@ function userLine(text = 'hello'): string {
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 beforeEach(() => {
+  __resetSessionUsageCachesForTest();
   vi.mocked(existsSync).mockReset();
   vi.mocked(readFileSync).mockReset();
+  vi.mocked(findCodexRolloutBySessionId).mockReset();
+  vi.mocked(findCodexRolloutBySessionId).mockReturnValue(undefined);
+  vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReset();
+  vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
+  vi.mocked(findTraexRolloutBySessionId).mockReset();
+  vi.mocked(findTraexRolloutBySessionId).mockReturnValue(undefined);
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReset();
+  vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
+  vi.mocked(findPiTranscriptBySessionId).mockReset();
+  vi.mocked(findPiTranscriptBySessionId).mockReturnValue(undefined);
+  vi.mocked(findAidenLatestCheckpointBySessionId).mockReset();
+  vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue(undefined);
+  vi.mocked(findAidenLatestCheckpointByBotmuxSessionId).mockReset();
+  vi.mocked(findAidenLatestCheckpointByBotmuxSessionId).mockReturnValue(undefined);
 });
 
 // ── getSessionJsonlPath ──────────────────────────────────────────────────
@@ -113,6 +218,20 @@ describe('getSessionJsonlPath', () => {
       'projects',
       '-home-testuser-code-repo',
       'sess-1.jsonl',
+    );
+    expect(result).toBe(expectedPath);
+  });
+
+  it('matches Claude project keys by replacing all non-alnum path chars', () => {
+    vi.mocked(existsSync).mockReturnValue(true);
+
+    const result = getSessionJsonlPath('sess-2', '/Users/test/.codex/work_trees/repo');
+    const expectedPath = join(
+      '/home/testuser',
+      '.claude',
+      'projects',
+      '-Users-test--codex-work-trees-repo',
+      'sess-2.jsonl',
     );
     expect(result).toBe(expectedPath);
   });
@@ -307,22 +426,1092 @@ describe('getSessionCost', () => {
   });
 });
 
-// ── formatNumber ────────────────────────────────────────────────────────
+// ── getSessionTokenUsage ─────────────────────────────────────────────────
 
-describe('formatNumber', () => {
-  it('formats small numbers without commas', () => {
-    expect(formatNumber(42)).toBe('42');
+describe('getSessionTokenUsage', () => {
+  function setupJsonl(content: string) {
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue(content);
+  }
+
+  it('reports dashboard token in/out from native Claude usage, including cache input tokens', () => {
+    setupJsonl([
+      assistantLine({ input: 100, output: 50, cacheRead: 10, cacheCreate: 5, model: 'claude-sonnet-4-20250514' }),
+      assistantLine({ input: 200, output: 80, cacheRead: 20, cacheCreate: 7 }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+    })).toEqual({
+      in: 342,
+      out: 130,
+      inputTokens: 300,
+      outputTokens: 130,
+      cacheReadTokens: 30,
+      cacheCreateTokens: 12,
+      turns: 2,
+      model: 'claude-sonnet-4-20250514',
+    });
   });
 
-  it('formats thousands with commas', () => {
-    expect(formatNumber(1_234)).toBe('1,234');
+  it('reports Claude latest prompt-side context without inventing a window', () => {
+    setupJsonl([
+      assistantLine({ input: 100, output: 50, cacheRead: 10, cacheCreate: 5 }),
+      assistantLine({ input: 200, output: 80, cacheRead: 20, cacheCreate: 7 }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 227 },
+      tokens: { in: 342, out: 130 },
+    });
   });
 
-  it('formats millions with commas', () => {
-    expect(formatNumber(1_234_567)).toBe('1,234,567');
+  it('keeps the last valid Claude context across an all-zero synthetic record', () => {
+    setupJsonl([
+      assistantLine({ input: 200, output: 80, cacheRead: 20, cacheCreate: 7 }),
+      assistantLine({ input: 0, output: 0, cacheRead: 0, cacheCreate: 0 }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).context).toEqual({ usedTokens: 227 });
   });
 
-  it('formats zero', () => {
-    expect(formatNumber(0)).toBe('0');
+  it('reports the latest user turn delta (turnTokens) separate from the cumulative total', () => {
+    // Turn 1: user + 1 assistant step. Turn 2: user + 2 assistant steps (a
+    // tool_use step then the final answer). turnTokens is turn 2's own delta
+    // (prompt-side input + cache_create + output, cache_read excluded); tokens
+    // is the whole-session cumulative.
+    const userLine = JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } });
+    setupJsonl([
+      userLine,
+      assistantLine({ input: 100, output: 40, cacheRead: 1_000, cacheCreate: 10 }),
+      userLine,
+      assistantLine({ input: 50, output: 30, cacheRead: 2_000, cacheCreate: 5 }),
+      assistantLine({ input: 20, output: 60, cacheRead: 2_100, cacheCreate: 0 }),
+    ].join('\n'));
+
+    const snap = getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    });
+    // Turn 2 delta: in = (50+5) + (20+0) = 75; out = 30 + 60 = 90.
+    expect(snap.turnTokens).toEqual({ in: 75, out: 90 });
+    // Cumulative in = all input+cacheRead+cacheCreate; out = all output = 130.
+    expect(snap.tokens?.out).toBe(130);
+    expect(snap.tokens?.in).toBe(100 + 1_000 + 10 + 50 + 2_000 + 5 + 20 + 2_100 + 0);
+  });
+
+  it('does not reset the turn delta on a tool_result user line (mid-turn continuation)', () => {
+    const userLine = JSON.stringify({ type: 'user', message: { role: 'user', content: 'go' } });
+    const toolResultLine = JSON.stringify({
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+    });
+    setupJsonl([
+      userLine,
+      assistantLine({ input: 40, output: 20, cacheCreate: 0 }),
+      toolResultLine, // must NOT reset the turn accumulator
+      assistantLine({ input: 15, output: 25, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Both assistant steps belong to the same user turn → delta spans both.
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 55, out: 45 });
+  });
+
+  it('does not reset the turn delta on meta / compact-summary / slash-wrapper / empty user lines', () => {
+    // These are Claude Code's internal machinery, NOT a new human prompt. They
+    // must not zero the per-turn delta (that would make "本轮" undercount after
+    // /clear, auto-compaction, a slash command, or a sidechain spawn). This
+    // reuses the same isMeaningfulUserEvent predicate the bridge turn queue uses.
+    const realPrompt = JSON.stringify({ type: 'user', message: { role: 'user', content: 'do it' } });
+    const metaLine = JSON.stringify({ type: 'user', isMeta: true, message: { role: 'user', content: 'meta' } });
+    const compactLine = JSON.stringify({ type: 'user', isCompactSummary: true, message: { role: 'user', content: 'summary' } });
+    const sidechainLine = JSON.stringify({ type: 'user', isSidechain: true, message: { role: 'user', content: 'sub-agent' } });
+    const slashLine = JSON.stringify({ type: 'user', message: { role: 'user', content: '<command-name>/clear</command-name>' } });
+    const emptyLine = JSON.stringify({ type: 'user', message: { role: 'user', content: '' } });
+    setupJsonl([
+      realPrompt,
+      assistantLine({ input: 30, output: 10, cacheCreate: 0 }),
+      metaLine, compactLine, sidechainLine, slashLine, emptyLine, // none reset
+      assistantLine({ input: 20, output: 40, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Delta spans BOTH assistant steps (in = 30+20 = 50, out = 10+40 = 50).
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 50, out: 50 });
+  });
+
+  it('resets the turn delta on a type-ahead queued_command attachment (real new prompt)', () => {
+    // Type-ahead submissions land as `type:'attachment'` queued_command lines,
+    // not `type:'user'`. They ARE genuine turn starts and must reset the delta.
+    const firstPrompt = JSON.stringify({ type: 'user', message: { role: 'user', content: 'first' } });
+    const queued = JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: 'second prompt' } });
+    setupJsonl([
+      firstPrompt,
+      assistantLine({ input: 999, output: 888, cacheCreate: 0 }), // turn 1 — must be excluded
+      queued, // ← new turn boundary
+      assistantLine({ input: 12, output: 34, cacheCreate: 0 }),
+    ].join('\n'));
+
+    // Only turn 2's assistant step counts.
+    expect(getSessionUsageSnapshot({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+      fresh: true,
+    }).turnTokens).toEqual({ in: 12, out: 34 });
+  });
+
+  it('returns null when an Agent CLI has no native token usage available', () => {
+    vi.mocked(existsSync).mockReturnValue(false);
+
+    expect(getSessionTokenUsage({
+      cliId: 'gemini',
+      sessionId: 's1',
+      cwd: '/tmp',
+    })).toBeNull();
+  });
+
+  it('resolves relay usage under the adapter\'s package-local .claude-runtime (not ~/.claude-runtime)', () => {
+    delete process.env.CLAUDE_CONFIG_DIR;
+    setupJsonl(assistantLine({ input: 100, output: 50, model: 'ark/relay-code' }));
+
+    const usage = getSessionTokenUsage({ cliId: 'relay', sessionId: 's1', cwd: '/tmp' });
+
+    expect(usage).toMatchObject({ inputTokens: 100, outputTokens: 50, turns: 1 });
+    // The jsonl path must sit under the adapter-derived package root, never the
+    // old ~/.claude-runtime fallback that the daemon's unset env produced.
+    const readPaths = vi.mocked(readFileSync).mock.calls.map((c) => String(c[0]));
+    expect(readPaths.some((p) => p.startsWith(`${FORK_DATA_DIR}/projects/`))).toBe(true);
+    expect(readPaths.every((p) => !p.startsWith('/home/testuser/.claude-runtime/'))).toBe(true);
+  });
+
+  it('ignores the daemon CLAUDE_CONFIG_DIR for seed/relay, matching the worker (adapter-forced dataDir)', () => {
+    // worker.ts spawns seed/relay with spawnEnv={CLAUDE_CONFIG_DIR: <adapter dataDir>},
+    // overriding any inherited env — so the transcript is ALWAYS under the package
+    // .claude-runtime. The calculator must read that same root, not the daemon's env,
+    // else usage reads diverge from where the CLI actually wrote.
+    process.env.CLAUDE_CONFIG_DIR = '/explicit/config-dir';
+    setupJsonl(assistantLine({ input: 10, output: 5 }));
+    try {
+      getSessionTokenUsage({ cliId: 'seed', sessionId: 's1', cwd: '/tmp', fresh: true });
+      const readPaths = vi.mocked(readFileSync).mock.calls.map((c) => String(c[0]));
+      expect(readPaths.some((p) => p.startsWith(`${FORK_DATA_DIR}/projects/`))).toBe(true);
+      expect(readPaths.every((p) => !p.startsWith('/explicit/config-dir/'))).toBe(true);
+    } finally {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    }
+  });
+
+  it('reports Codex token_count totals without double-counting cached input', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 100,
+              cached_input_tokens: 40,
+              output_tokens: 20,
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 150,
+              cached_input_tokens: 60,
+              output_tokens: 30,
+            },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+    })).toEqual({
+      in: 150,
+      out: 30,
+      inputTokens: 90,
+      outputTokens: 30,
+      cacheReadTokens: 60,
+      cacheCreateTokens: 0,
+      turns: 0,
+      model: '',
+    });
+    expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledWith(
+      'botmux-sid',
+      { codexHome: expect.any(String) },
+    );
+    expect(findCodexRolloutBySessionId).toHaveBeenCalledWith(
+      'codex-sid',
+      { codexHome: expect.any(String) },
+    );
+  });
+
+  it('keeps Codex latest context usage separate from cumulative Session tokens', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 3_579_709, cached_input_tokens: 3_404_544, output_tokens: 22_920 },
+            last_token_usage: {
+              input_tokens: 159_508,
+              cached_input_tokens: 158_464,
+              output_tokens: 308,
+              reasoning_output_tokens: 148,
+              total_tokens: 159_816,
+            },
+            model_context_window: 258_400,
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 3_739_570, cached_input_tokens: 3_563_008, output_tokens: 23_299 },
+            last_token_usage: {
+              input_tokens: 159_861,
+              cached_input_tokens: 158_464,
+              output_tokens: 379,
+              reasoning_output_tokens: 100,
+              total_tokens: 160_240,
+            },
+            model_context_window: 258_400,
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 160_240, windowTokens: 258_400, percentUsed: 62 },
+      tokens: {
+        in: 3_739_570,
+        out: 23_299,
+        inputTokens: 176_562,
+        outputTokens: 23_299,
+        cacheReadTokens: 3_563_008,
+        cacheCreateTokens: 0,
+        turns: 0,
+        model: '',
+      },
+      // Codex folds to a cumulative-only snapshot; no per-turn tracking.
+      turnTokens: null,
+    });
+  });
+
+  it('reports Codex context when token_count omits cumulative totals', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          last_token_usage: {
+            input_tokens: 49_978,
+            cached_input_tokens: 49_536,
+            output_tokens: 274,
+            reasoning_output_tokens: 38,
+            total_tokens: 50_252,
+          },
+          model_context_window: 258_400,
+        },
+      },
+    }));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toEqual({
+      context: { usedTokens: 50_252, windowTokens: 258_400, percentUsed: 19 },
+      tokens: null,
+      turnTokens: null,
+    });
+  });
+
+  it('keeps the last valid Codex context when a later cumulative snapshot omits last usage', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 100, output_tokens: 10 },
+            last_token_usage: { input_tokens: 80, output_tokens: 10, total_tokens: 90 },
+            model_context_window: 1_000,
+          },
+        },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: 120, output_tokens: 12 },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionUsageSnapshot({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      fresh: true,
+    })).toMatchObject({
+      context: { usedTokens: 90, windowTokens: 1_000, percentUsed: 9 },
+      tokens: { in: 120, out: 12 },
+    });
+  });
+
+  it('requires trusted native cliSessionId for Antigravity and refuses workspace fallback', () => {
+    expect(getSessionUsageSnapshot({
+      cliId: 'antigravity',
+      sessionId: 'botmux-sid',
+      cwd: '/workspace/unrelated',
+      fresh: true,
+    })).toEqual({
+      context: null,
+      tokens: null,
+      turnTokens: null,
+    });
+  });
+
+  it('maps Botmux session ids to TraeX native session ids for usage lookup', () => {
+    vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue('mapped-traex-sid');
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-mapped-traex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 55, output_tokens: 6 },
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'traex',
+      sessionId: 'botmux-sid',
+    })).toMatchObject({
+      in: 55,
+      out: 6,
+    });
+    expect(findTraexSessionIdByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid');
+    expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('mapped-traex-sid');
+  });
+
+  it('reports TraeX rollouts via the codex fold, capturing the turn_context model', () => {
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-traex-sid.jsonl');
+    // Real TRAE rollout shapes: codex-format turn_context carries the model;
+    // token_count carries cumulative totals. Under the old 'generic' fold the
+    // model was never read and records shipped with model "".
+    setupJsonl([
+      JSON.stringify({
+        type: 'turn_context',
+        payload: { turn_id: 't-1', model: 'openrouter-1', model_provider: 'trae' },
+      }),
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: {
+              input_tokens: 52634,
+              cached_input_tokens: 12000,
+              output_tokens: 307,
+            },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'traex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'traex-sid',
+    })).toEqual({
+      in: 52634,
+      out: 307,
+      inputTokens: 40634,
+      outputTokens: 307,
+      cacheReadTokens: 12000,
+      cacheCreateTokens: 0,
+      turns: 0,
+      model: 'openrouter-1',
+    });
+    expect(findTraexRolloutBySessionId).toHaveBeenCalledWith('traex-sid');
+  });
+
+  it('clamps Codex cache buckets to raw input before deriving uncached input', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 50,
+            cached_input_tokens: 45,
+            cache_creation_input_tokens: 20,
+            output_tokens: 7,
+          },
+        },
+      },
+    }));
+
+    const usage = getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' });
+    expect(usage).toMatchObject({
+      in: 50,
+      inputTokens: 0,
+      cacheReadTokens: 45,
+      cacheCreateTokens: 5,
+    });
+    expect(usage!.inputTokens + usage!.cacheReadTokens + usage!.cacheCreateTokens).toBe(usage!.in);
+  });
+
+  it('reports Pi transcript usage in uncached and cache buckets', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'claude-sonnet-4-20250514',
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 30,
+          cacheWrite: 10,
+          totalTokens: 160,
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    })).toEqual({
+      in: 140,
+      out: 20,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 30,
+      cacheCreateTokens: 10,
+      turns: 1,
+      model: 'claude-sonnet-4-20250514',
+    });
+    expect(findPiTranscriptBySessionId).toHaveBeenCalledWith('pi-sid', '/tmp');
+  });
+
+  it('reports Pi context usage without window when models.json is unavailable', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 100, output: 20, cacheRead: 30, cacheWrite: 10 },
+      },
+    }));
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 100 + output 20 + cacheRead 30 + cacheWrite 10 = 160 (includes output)
+    expect(snapshot.context).toEqual({ usedTokens: 160 });
+  });
+
+  it('reports Pi context usage with window and percent from models.json', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 400, output: 20, cacheRead: 100, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 400 + output 20 + cacheRead 100 = 520 used tokens over a 1000 window → 52%
+    expect(snapshot.context).toEqual({ usedTokens: 520, windowTokens: 1000, percentUsed: 52 });
+  });
+
+  it('resolves Pi models.json window for provider/variant model id shapes', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-1',
+        role: 'assistant',
+        model: 'team-gateway/deepseek-v4-flash:max',
+        usage: { input: 250, output: 20, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': {
+                models: [{ id: 'deepseek-v4-flash', contextWindow: 1000 }],
+              },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // input 250 + output 20 = 270 over a 1000 window → 27%
+    expect(snapshot.context).toEqual({ usedTokens: 270, windowTokens: 1000, percentUsed: 27 });
+  });
+
+  it('prefers usage.totalTokens for Pi native context accounting', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    // Mirrors a real Pi 0.84 transcript tail: totalTokens is the authoritative
+    // context value; the four-part sum must only be a fallback.
+    setupJsonl(JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-tt',
+        role: 'assistant',
+        model: 'deepseek-v4-flash',
+        usage: { input: 11684, output: 33, cacheRead: 0, cacheWrite: 0, totalTokens: 11717 },
+      },
+    }));
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 11717 });
+  });
+
+  it('resolves Pi context window by transcript provider when bare model id collides', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-collide',
+        role: 'assistant',
+        provider: 'team-gateway',
+        model: 'shared-model',
+        usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': { models: [{ id: 'shared-model', contextWindow: 1000 }] },
+              'other-provider': { models: [{ id: 'shared-model', contextWindow: 2000 }] },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    // provider-qualified hit wins: 100 over team-gateway's 1000 → 10% (not other-provider's 2000)
+    expect(snapshot.context).toEqual({ usedTokens: 100, windowTokens: 1000, percentUsed: 10 });
+  });
+
+  it('drops ambiguous bare Pi model ids instead of silently picking a provider', () => {
+    vi.mocked(findPiTranscriptBySessionId).mockReturnValue('/home/testuser/.pi/agent/sessions/--tmp/2026-08-03_pi-sid.jsonl');
+    // No provider recorded in transcript + same bare id with different windows
+    // under two providers → must degrade to used-tokens-only, not guess.
+    const transcript = JSON.stringify({
+      type: 'message',
+      message: {
+        id: 'pi-msg-ambiguous',
+        role: 'assistant',
+        model: 'shared-model',
+        usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockImplementation((path: unknown) => {
+      return String(path).endsWith('models.json')
+        ? JSON.stringify({
+            providers: {
+              'team-gateway': { models: [{ id: 'shared-model', contextWindow: 1000 }] },
+              'other-provider': { models: [{ id: 'shared-model', contextWindow: 2000 }] },
+            },
+          })
+        : transcript;
+    });
+
+    const snapshot = getSessionUsageSnapshot({
+      cliId: 'pi',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'pi-sid',
+      cwd: '/tmp',
+    });
+    expect(snapshot.context).toEqual({ usedTokens: 100 });
+  });
+
+  it('reports CoCo nested response_meta usage without counting agent_end duplicates', () => {
+    setupJsonl([
+      JSON.stringify({
+        message: {
+          message: {
+            role: 'assistant',
+            response_meta: {
+              finish_reason: 'tool_calls',
+              usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+            },
+            extra: { _source_model: 'openrouter-2o' },
+          },
+        },
+      }),
+      JSON.stringify({
+        agent_end: {
+          output: {
+            response_meta: {
+              usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+            },
+          },
+        },
+      }),
+      JSON.stringify({
+        message: {
+          message: {
+            role: 'assistant',
+            response_meta: {
+              finish_reason: 'stop',
+              usage: { prompt_tokens: 200, completion_tokens: 30, total_tokens: 230 },
+            },
+            extra: { _source_model: 'openrouter-2o' },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'coco',
+      sessionId: 'coco-sid',
+    })).toEqual({
+      in: 300,
+      out: 40,
+      inputTokens: 300,
+      outputTokens: 40,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'openrouter-2o',
+    });
+  });
+
+  it('partitions Aiden raw input into bounded uncached/cache buckets while preserving dashboard in', () => {
+    vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/latest-checkpoint.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: {
+        channel_values: {
+          messages: [
+            {
+              type: 'human',
+              content: 'hello',
+            },
+            {
+              type: 'ai',
+              response_metadata: { model_name: 'aiden-model' },
+              usage_metadata: {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+                input_token_details: { cache_read: 40, cache_creation: 70 },
+              },
+            },
+            {
+              type: 'ai',
+              usage_metadata: {
+                input_tokens: 150,
+                output_tokens: 30,
+                total_tokens: 180,
+                input_token_details: { cache_read: 60, cache_creation: 20 },
+              },
+            },
+          ],
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'aiden',
+      sessionId: 'aiden-sid',
+    })).toEqual({
+      in: 250,
+      out: 50,
+      inputTokens: 70,
+      outputTokens: 50,
+      cacheReadTokens: 100,
+      cacheCreateTokens: 80,
+      turns: 2,
+      model: 'aiden-model',
+    });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledWith('aiden-sid', undefined, undefined);
+  });
+
+  it('Aiden skips human/tool messages even when they carry usage metadata', () => {
+    vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/checkpoint.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: {
+        channel_values: {
+          messages: [
+            { type: 'human', content: 'hi', usage_metadata: { input_tokens: 999, output_tokens: 999 } },
+            { type: 'tool', content: 'result', usage_metadata: { input_tokens: 888, output_tokens: 888 } },
+            { type: 'ai', usage_metadata: { input_tokens: 100, output_tokens: 20 } },
+          ],
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' })).toEqual({
+      in: 100,
+      out: 20,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      turns: 1,
+      model: '',
+    });
+  });
+
+  it('falls back to locating Aiden checkpoint by botmux session id', () => {
+    vi.mocked(findAidenLatestCheckpointByBotmuxSessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/native-sid/checkpoint.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: {
+        channel_values: {
+          messages: [
+            { type: 'ai', usage_metadata: { input_tokens: 10, output_tokens: 5 } },
+          ],
+        },
+      },
+    }));
+
+    expect(getSessionTokenUsage({
+      cliId: 'aiden',
+      sessionId: 'botmux-sid',
+      cwd: '/workspace/current',
+    })?.in).toBe(10);
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledWith('botmux-sid', undefined, '/workspace/current');
+    expect(findAidenLatestCheckpointByBotmuxSessionId).toHaveBeenCalledWith('botmux-sid', undefined, '/workspace/current');
+  });
+
+  it('Codex only counts token_count snapshots and picks up the rollout model', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl([
+      // Should provide model: turn_context carries the active model.
+      JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-5.3-codex' } }),
+      // Should NOT count: a stray assistant-message-shaped line in the rollout.
+      JSON.stringify({ type: 'response_item', message: { usage: { input_tokens: 999, output_tokens: 999 } } }),
+      // Should count (latest snapshot wins): cumulative token_count events.
+      JSON.stringify({
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 150, cached_input_tokens: 60, output_tokens: 30 } } },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toEqual({
+      in: 150,
+      out: 30,
+      inputTokens: 90,
+      outputTokens: 30,
+      cacheReadTokens: 60,
+      cacheCreateTokens: 0,
+      turns: 0,
+      model: 'gpt-5.3-codex',
+    });
+  });
+
+  it('CoCo only counts assistant response_meta usage, not stray usage-shaped lines', () => {
+    setupJsonl([
+      // Should count: assistant message with response_meta.usage.
+      JSON.stringify({
+        message: {
+          message: {
+            role: 'assistant',
+            response_meta: { usage: { prompt_tokens: 100, completion_tokens: 10 } },
+            extra: { _source_model: 'openrouter-2o' },
+          },
+        },
+      }),
+      // Should NOT count: telemetry-style event with payload.usage.
+      JSON.stringify({ payload: { usage: { prompt_tokens: 999, completion_tokens: 999 } } }),
+      // Should NOT count: top-level usage on a non-message event.
+      JSON.stringify({ usage: { prompt_tokens: 888, completion_tokens: 888 } }),
+      // Should NOT count: tool-role message carrying usage.
+      JSON.stringify({
+        message: {
+          message: {
+            role: 'tool',
+            response_meta: { usage: { prompt_tokens: 777, completion_tokens: 777 } },
+          },
+        },
+      }),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({ cliId: 'coco', sessionId: 'coco-sid' })).toEqual({
+      in: 100,
+      out: 10,
+      inputTokens: 100,
+      outputTokens: 10,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      turns: 1,
+      model: 'openrouter-2o',
+    });
+  });
+
+  it('getSessionCost shares the message.id dedup with getSessionTokenUsage', () => {
+    const block = (id: string, input: number, output: number) =>
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          id,
+          model: 'claude-sonnet-4-20250514',
+          usage: { input_tokens: input, output_tokens: output },
+        },
+      });
+    setupJsonl([block('msg_a', 100, 50), block('msg_a', 100, 50), block('msg_b', 200, 80)].join('\n'));
+
+    expect(getSessionCost('s1', '/tmp')).toEqual({
+      inputTokens: 300,
+      outputTokens: 130,
+      cacheReadTokens: 0,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'claude-sonnet-4-20250514',
+    });
+  });
+
+  it('caches codex rollout path resolution across calls', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 1, output_tokens: 1 } } },
+    }));
+
+    getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' });
+    getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' });
+
+    expect(findCodexSessionIdByBotmuxSessionId).toHaveBeenCalledTimes(1);
+    expect(findCodexRolloutBySessionId).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not scan Codex history when cliSessionId is already authoritative', () => {
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(
+      '/home/testuser/.codex/sessions/rollout-codex-explicit.jsonl',
+    );
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: { input_tokens: 1, output_tokens: 1 } },
+      },
+    }));
+
+    getSessionTokenUsage({
+      cliId: 'codex',
+      sessionId: 'botmux-sid',
+      cliSessionId: 'codex-explicit',
+    });
+
+    expect(findCodexSessionIdByBotmuxSessionId).not.toHaveBeenCalled();
+  });
+
+  it('retries a missed codex path lookup only after the retry window', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(undefined);
+    const nowSpy = vi.spyOn(Date, 'now');
+    try {
+      nowSpy.mockReturnValue(1_000_000);
+      expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toBeNull();
+      expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toBeNull();
+      expect(findCodexRolloutBySessionId).toHaveBeenCalledTimes(1);
+
+      nowSpy.mockReturnValue(1_000_000 + 31_000);
+      expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toBeNull();
+      expect(findCodexRolloutBySessionId).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('fresh lookups bypass a cached codex path miss', () => {
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue(undefined);
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue(undefined);
+    expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toBeNull(); // miss now cached
+
+    // The rollout appears moments later (transcripts are created lazily).
+    vi.mocked(findCodexSessionIdByBotmuxSessionId).mockReturnValue('codex-sid');
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/home/testuser/.codex/sessions/rollout-codex-sid.jsonl');
+    setupJsonl(JSON.stringify({
+      type: 'event_msg',
+      payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 42, output_tokens: 7 } } },
+    }));
+
+    // The dashboard path keeps the negative cache…
+    expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid' })).toBeNull();
+    // …but a fresh (ledger) read must see the newly created transcript.
+    expect(getSessionTokenUsage({ cliId: 'codex', sessionId: 'botmux-sid', fresh: true })).toMatchObject({
+      in: 42,
+      out: 7,
+    });
+  });
+
+  it('caches the aiden checkpoint lookup briefly', () => {
+    vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/checkpoint.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: { channel_values: { messages: [{ type: 'ai', usage_metadata: { input_tokens: 1, output_tokens: 1 } }] } },
+    }));
+
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(1);
+  });
+
+  it('fresh aiden lookups bypass the positive hit TTL (checkpoints move per turn)', () => {
+    vi.mocked(findAidenLatestCheckpointBySessionId).mockReturnValue('/home/testuser/.aiden/checkpoints/ws/aiden-sid/cp-1.json');
+    setupJsonl(JSON.stringify({
+      checkpoint: { channel_values: { messages: [{ type: 'ai', usage_metadata: { input_tokens: 1, output_tokens: 1 } }] } },
+    }));
+
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(1);
+
+    // Ledger (fresh) reads must re-resolve: latest.json points at a NEW
+    // checkpoint file every turn, and a 15s-stale path misses the last turn.
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid', fresh: true });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(2);
+
+    // The dashboard (non-fresh) path keeps the TTL cache.
+    getSessionTokenUsage({ cliId: 'aiden', sessionId: 'aiden-sid' });
+    expect(findAidenLatestCheckpointBySessionId).toHaveBeenCalledTimes(2);
+  });
+
+  it('counts a multi-block Claude turn (same message.id) once', () => {
+    const block = (id: string, input: number, output: number, cacheRead = 0, cacheCreate = 0) =>
+      JSON.stringify({
+        type: 'assistant',
+        message: {
+          id,
+          model: 'claude-sonnet-4-20250514',
+          usage: {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cacheRead,
+            cache_creation_input_tokens: cacheCreate,
+          },
+        },
+      });
+    // A text block and a tool_use block of the same turn are written as two
+    // JSONL lines sharing one message.id and one usage snapshot — count once.
+    setupJsonl([
+      block('msg_a', 100, 50, 10, 5),
+      block('msg_a', 100, 50, 10, 5),
+      block('msg_b', 200, 80),
+    ].join('\n'));
+
+    expect(getSessionTokenUsage({
+      cliId: 'claude-code',
+      sessionId: 's1',
+      cwd: '/tmp',
+    })).toEqual({
+      in: 315,
+      out: 130,
+      inputTokens: 300,
+      outputTokens: 130,
+      cacheReadTokens: 10,
+      cacheCreateTokens: 5,
+      turns: 2,
+      model: 'claude-sonnet-4-20250514',
+    });
   });
 });

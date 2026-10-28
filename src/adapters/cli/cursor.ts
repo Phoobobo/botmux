@@ -1,10 +1,12 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+import { delay } from '../../utils/timing.js';
+import { drainCursorTranscript, findCursorTranscriptByChatId, findCursorTranscriptByPid } from '../../services/cursor-transcript.js';
 
 /** PTYs that have already received a writeInput. The first write lands while
  *  cursor-agent's TUI is still doing its startup render, so it needs a longer
@@ -12,27 +14,100 @@ function delay(ms: number): Promise<void> {
  *  is shared across adapter instances. Mirrors claude-code's first-write guard. */
 const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
 
+/** botmux ships its built-in skills as a plugin here and injects it per-session via
+ *  `--plugin-dir` (see buildArgs). Kept out of the global `~/.cursor/skills` so a
+ *  user's standalone `cursor-agent` does not see (and mis-fire) them. Single source
+ *  of truth for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
+
+/** Cursor agent-transcripts JSONL. Always-on structured fallback (adopt,
+ *  ordinary spawns and zero-prompt spawns share the same send-marker-gated
+ *  harvest — except under the scratch COW sandbox, where the host cannot read
+ *  the overlay mirror). The transcript carries no per-event timestamps, so
+ *  adopt baselines history by byte offset instead of the timestamp-cutoff
+ *  split-live. */
+export const cursorBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset) => drainCursorTranscript(path, offset),
+  locate: {
+    bySessionId: sessionId => findCursorTranscriptByChatId(sessionId),
+    byPid: pid => findCursorTranscriptByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware' },
+  adopt: { attach: 'baseline-skip-tail' },
+};
+
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'cursor-agent');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'cursor-agent';
+  let cachedBin: string | undefined;
   return {
     id: 'cursor',
-    resolvedBin: bin,
+    bridgeSpec: cursorBridgeSpec,
+    // Whole ~/.cursor (chats store.db + projects agent-transcripts + skills):
+    // a directory-level readWrite bind under the sandbox, so the host daemon
+    // reads the same transcript the CLI writes (zero-prompt final harvest) and
+    // store.db keeps working fcntl locks. The worker pre-creates the dir at
+    // spawn (bwrap cannot bind a missing source) — see pre-create block.
+    authPaths: ['~/.cursor'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, model, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass, skillPluginDir, promptInjection }) {
+      // --trust pre-answers the "Workspace Trust Required" startup dialog.
+      // Without it, the first spawn in a never-trusted directory (= every
+      // fresh-worktree topic) blocks on that dialog; the dialog sits silent,
+      // so quiescence-based idle fires and the worker types the first prompt
+      // INTO it — the first literal `a` in the text answers [a] Trust (a `q`
+      // would quit the CLI outright) and everything typed before the composer
+      // renders scatters into scrollback, truncating the prompt head.
+      // Deliberately NOT gated by disableCliBypass: this is a startup gate no
+      // headless spawn can answer, orthogonal to --force's approval bypass
+      // (--force alone does not suppress the dialog — verified empirically).
+      const base = ['--trust'];
       // --force skips approvals so the model can act inside the topic without
       // every shell/edit bouncing back to Lark for confirmation — same posture
       // as codex's --dangerously-bypass-approvals-and-sandbox and claude-code's
       // --dangerously-skip-permissions.
-      const base = disableCliBypass ? [] : ['--force'];
+      if (!disableCliBypass) base.push('--force');
       if (model && model.trim()) {
         base.push('--model', model.trim());
       }
-      if (!resume) return base;
-      if (resumeSessionId) return [...base, '--resume', resumeSessionId];
-      // No id on hand — fall back to "last chat" so we at least don't drop
-      // the user's context. --continue is cursor's shorthand for --resume=-1.
-      return [...base, '--continue'];
+      if (promptInjection !== 'none') {
+        base.push('--plugin-dir', CURSOR_PLUGIN_DIR);
+        if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
+      }
+      if (!resume) {
+        if (initialPrompt) base.push(initialPrompt);
+        return base;
+      }
+      if (resumeSessionId) {
+        base.push('--resume', resumeSessionId);
+        if (initialPrompt) base.push(initialPrompt);
+        return base;
+      }
+      // No persisted chat id: start FRESH, never `--continue`. Cursor's
+      // `--continue` (= `--resume=-1`) resumes the globally most recent chat,
+      // which is shared across every botmux session of this bot (same Cursor
+      // config home). A worker restart whose cliSessionId was never captured
+      // would then silently load a SIBLING session's conversation — e.g. a
+      // topic group's context leaking into a private chat. Losing this
+      // session's context is the lesser evil; matches reasonix/antigravity,
+      // which reject `--continue` for the same "most recent is racy" reason.
+      if (initialPrompt) base.push(initialPrompt);
+      return base;
     },
+
+    // Cursor accepts a positional prompt and does not hand it to the TUI until
+    // authentication and startup have completed. Keep short opening turns on
+    // that path: writing them to the PTY after the worker's bounded startup
+    // timeout can otherwise feed the prompt into a still-active browser-login
+    // flow. Over-limit prompts defer to the post-start queue, which waits for
+    // readyPattern (composer mounted) before typing.
+    passesInitialPromptViaArgs: true,
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
+
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
 
     buildResumeCommand({ cliSessionId }) {
       // Cursor's chat id is opaque and not derivable from botmux's sessionId;
@@ -41,6 +116,11 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       if (!cliSessionId) return null;
       return `cursor-agent --resume ${cliSessionId}`;
     },
+
+    // buildArgs can only resume a precise id (no --continue fallback — it
+    // would resume the globally most recent chat, a sibling-context leak).
+    // Tells the worker to demote resume-without-id to a fresh launch + notify.
+    resumeRequiresCliSessionId: true,
 
     async writeInput(pty: PtyHandle, content: string) {
       // Emit line-by-line instead of writing the whole message at once.
@@ -95,14 +175,51 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       }
       await delay(200);
       emitEnter();
+      // Exactly ONE Enter. Idle composer → submits. Busy turn → Cursor parks
+      // the text in its "follow-ups" panel as a QUEUED item, which it submits
+      // by itself as the next turn the moment the current turn ends (verified
+      // on cursor-agent 2026.09.18; the TUI's `chat.queued` processing does
+      // exactly that). That is the same serial queue semantics the worker
+      // already relies on for Claude Code type-ahead.
+      //
+      // Do NOT press Enter a second time (#996 did, #1504 is the fallout):
+      //   - on a queued item, Enter means "steer" — inject into the ACTIVE
+      //     turn. If a shell tool is running, Cursor detaches it into a
+      //     background task; when that task later completes Cursor injects a
+      //     synthetic user turn ("Briefly inform the user about the task
+      //     result…") with no Lark message behind it, and the model dutifully
+      //     `botmux send`s again → the "auto-continue after final" symptom.
+      //   - the second Enter races the follow-ups panel re-render (long
+      //     multi-line prompts, loaded hosts). When it is lost the item sits
+      //     at "enter steer" and the worker believes it was delivered.
+      // A single Enter has no half-state: either it submitted, or the item is
+      // queued and Cursor flushes it at the turn boundary.
     },
 
     completionPattern: undefined,
+    // The mounted composer's placeholder, matched to prove the real input box
+    // exists (unlike the browser-login and startup screens). Once it has
+    // appeared at least once the worker may safely type-ahead subsequent Lark
+    // messages.
+    //
+    // BOTH placeholder states must match. Cursor Agent 2026.08.11 picks the
+    // placeholder as `sessionEmpty ? "Plan, search, build anything" : "Add a
+    // follow-up"` and never switches back once the chat has any history. The
+    // worker resets the IdleDetector (clearing readySeen) before every write,
+    // and the IdleDetector suppresses quiescence-idle until readyPattern is seen
+    // again — so a first-turn-only pattern would match on turn 1 but never on
+    // turn 2+, leaving the CLI stuck reporting "working" forever (quiescence
+    // permanently suppressed, no idle edge). Matching the post-turn placeholder
+    // too keeps every turn's idle edge alive. Neither placeholder appears on the
+    // login/startup screens, so the boot-time guard is unchanged.
+    readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
+    deferFirstPromptTimeoutUntilReady: true,
+    supportsTypeAhead: true,
+    pluginDir: CURSOR_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
     skillsDir: '~/.cursor/skills',
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
-    modelChoices: ['auto', 'claude-4-sonnet', 'claude-4-opus', 'gpt-5'],
+    modelChoices: CLI_MODEL_CHOICES['cursor'],
   };
 }
-
-export const create = createCursorAdapter;

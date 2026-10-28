@@ -1,7 +1,7 @@
 /**
  * Headless terminal renderer: feeds PTY data into an xterm-headless instance
  * and exposes viewport snapshots for the Feishu streaming card (PNG render,
- * export-text action, ScreenAnalyzer).
+ * export-text action, usage-limit detection).
  *
  * Snapshot semantics match PNG: both read the current viewport
  * [baseY, baseY + rows). This keeps text export and screenshot consistent
@@ -44,7 +44,7 @@ const SNAPSHOT_COLS = 320;
  */
 export function readViewportText(
   terminal: InstanceType<typeof Terminal>,
-  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number },
+  opts: { filter: boolean; readCols?: number; startY?: number; rows?: number; preserveFormatting?: boolean },
 ): string {
   const buffer = terminal.buffer.active;
   const readCols = Math.min(opts.readCols ?? SNAPSHOT_COLS, terminal.cols);
@@ -56,7 +56,8 @@ export function readViewportText(
   for (let y = baseY; y < endY; y++) {
     const line = buffer.getLine(y);
     if (!line) continue;
-    const s = cleanBoxDrawing(line.translateToString(true, 0, readCols));
+    const text = line.translateToString(true, 0, readCols);
+    const s = opts.preserveFormatting ? text : cleanBoxDrawing(text);
     if (opts.filter && (BARE_PROMPT_RE.test(s) || INPUT_ECHO_RE.test(s))) continue;
     lines.push(s);
   }
@@ -82,6 +83,21 @@ export class TerminalRenderer {
     this.terminal.write(data);
   }
 
+  /**
+   * Feed raw PTY data and wait until xterm has parsed every queued byte through
+   * this write. Callers that inspect the buffer immediately afterwards must use
+   * this barrier: xterm's ordinary write() API is intentionally asynchronous.
+   */
+  writeAndFlush(data: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        this.terminal.write(data, resolve);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
   /** Reset the change-detection hash so the next snapshot registers as changed. */
   markNewTurn(): void {
     this.lastHash = '';
@@ -97,11 +113,13 @@ export class TerminalRenderer {
   }
 
   /**
-   * Raw viewport snapshot — no line filtering. Used by ScreenAnalyzer which
-   * needs the full screen including ❯ cursor lines.
+   * Raw viewport snapshot — no line filtering. Used by usage-limit detection
+   * and the CoCo picker, which need the full screen including ❯ cursor lines.
+   * preserveFormatting retains box borders and column spacing for structural
+   * recognizers; the default keeps the existing display-oriented cleanup.
    */
-  rawSnapshot(): string {
-    return this.readViewport(false);
+  rawSnapshot(opts: { preserveFormatting?: boolean } = {}): string {
+    return readViewportText(this.terminal, { filter: false, ...opts });
   }
 
   private readViewport(filter: boolean): string {

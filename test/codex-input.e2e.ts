@@ -3,13 +3,13 @@
  *
  * Root cause: Codex's trust dialog text is split across PTY chunks and
  * ANSI-stripped spaces collapse, so the worker's pattern never matched.
- * Fix: match "Yes, continue" (Codex's dialog option text) which appears
- * intact in a single chunk.
+ * Fix: match Codex's dialog option text, which appears intact in a single
+ * chunk even when surrounding prompt text is split by PTY framing.
  *
  * Run:  pnpm test:codex
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -17,12 +17,12 @@ import * as pty from 'node-pty';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
-// Codex 0.130 removed the "Yes, continue" trust dialog entirely (both with and
-// without --dangerously-bypass-approvals-and-sandbox). These tests spawn the
-// real codex binary to capture the dialog's PTY framing — meaningless on
-// versions that never emit it. The production TRUST_DIALOG_PATTERN in
-// worker.ts stays in place as a defensive layer for Claude Code (which still
-// prompts) and any older codex install.
+// Codex's workspace trust screen has changed shape over time: pre-0.130 builds
+// emitted "Yes, continue", 0.130-era builds removed that screen, and 0.155+
+// builds emit "Trust this folder?" with "Trust and continue". These tests spawn
+// the real codex binary to capture the dialog's PTY framing, so skip only the
+// known no-dialog version band instead of assuming all modern releases removed
+// the prompt.
 function codexEmitsTrustDialog(): boolean {
   try {
     const out = execFileSync('codex', ['--version'], { encoding: 'utf8' }).trim();
@@ -30,8 +30,8 @@ function codexEmitsTrustDialog(): boolean {
     const m = out.match(/(\d+)\.(\d+)\.(\d+)/);
     if (!m) return true; // unknown version → run the test, fail loudly if assumption wrong
     const [maj, min] = [parseInt(m[1], 10), parseInt(m[2], 10)];
-    // Codex 0.130+ no longer shows the trust dialog.
-    return maj === 0 ? min < 130 : maj < 1;
+    if (maj !== 0) return true;
+    return min < 130 || min >= 155;
   } catch {
     return false; // codex not installed → skip
   }
@@ -42,13 +42,28 @@ const CODEX_HAS_TRUST_DIALOG = codexEmitsTrustDialog();
 // ─── Constants (match production worker.ts) ─────────────────────────────────
 
 const CODEX_BIN = 'codex';
-const CODEX_ARGS = ['--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox'];
+// Mirror production codex.ts baseArgs for the DEFAULT launch (bypassCodexHookTrust
+// toggle ON, unrestricted bot): bypass both the approval/sandbox gate AND the 0.14x
+// interactive hook-trust gate ("Press t to trust"). Without the latter the
+// not-version-gated "control" test below wedges on codex ≥0.14x whenever the botmux
+// hooks in ~/.codex/hooks.json are modified-since-last-trusted.
+const CODEX_ARGS = ['--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox', '--dangerously-bypass-hook-trust'];
 const PTY_COLS = 300;
 const PTY_ROWS = 50;
 const TEST_PROMPT = 'just say the word PONG and nothing else';
 
-// Fixed trust pattern (matches both Claude Code and Codex)
-const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
+// Use the production matcher as the e2e source of truth; this test exists to
+// prove the current Codex TUI still emits one of those option labels in a
+// matchable PTY chunk.
+function loadProductionTrustDialogPattern(): RegExp {
+  const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+  const match = source.match(/const TRUST_DIALOG_PATTERN = (\/[^;]+\/);/);
+  if (!match) throw new Error('TRUST_DIALOG_PATTERN not found in worker.ts');
+  // eslint-disable-next-line no-new-func
+  return new Function(`return ${match[1]};`)() as RegExp;
+}
+
+const TRUST_DIALOG_PATTERN = loadProductionTrustDialogPattern();
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -90,11 +105,11 @@ describe('Codex first input submission', () => {
     if (tmpDir) { try { rmSync(tmpDir, { recursive: true, force: true }); } catch {} }
   });
 
-  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('chunk analysis: "Yes, continue" appears intact in a single PTY chunk', async () => {
+  it.skipIf(!CODEX_HAS_TRUST_DIALOG)('chunk analysis: trust option label appears intact in a single PTY chunk', async () => {
     /**
-     * Verifies that "Yes, continue" can be matched per-chunk (unlike
-     * "Do you trust the contents of this directory" which splits across chunks
-     * and loses spaces after ANSI stripping).
+     * Verifies that the selectable trust option can be matched per-chunk
+     * (unlike longer prompt text, which can split across chunks and lose spaces
+     * after ANSI stripping).
      */
     const chunks: Chunk[] = [];
     const spawnTime = Date.now();
@@ -136,14 +151,14 @@ describe('Codex first input submission', () => {
       console.log(`>>> Match at +${matchingChunk.offset}ms`);
     }
 
-    expect(matchingChunk, '"Yes, continue" should appear in a single chunk').toBeTruthy();
+    expect(matchingChunk, 'trust option label should appear in a single chunk').toBeTruthy();
   }, 30_000);
 
   it.skipIf(!CODEX_HAS_TRUST_DIALOG)('production flow: trust dialog detected and dismissed, prompt submitted', async () => {
     /**
      * Simulates the full production worker flow:
      * 1. Codex spawns → trust dialog appears
-     * 2. Worker detects "Yes, continue" per-chunk → sends \r
+     * 2. Worker detects the trust option label per-chunk → defers 400ms, then sends \r
      * 3. IdleDetector waits for codex to finish loading
      * 4. Idle fires → prompt is written to the actual input box
      * 5. Prompt is submitted successfully
@@ -181,13 +196,16 @@ describe('Codex first input submission', () => {
         stripped,
       });
 
-      // Production trust detection (per-chunk, with fixed pattern)
+      // Production trust detection (per-chunk, with fixed pattern). Codex
+      // 0.149 drops a synchronous Enter (upstream openai/codex#39487), so
+      // production defers the keystroke 400ms after detection — replicate
+      // that timing here.
       if (!trustHandled) {
         if (TRUST_DIALOG_PATTERN.test(stripped)) {
           trustHandled = true;
           trustDetectedAt = Date.now();
-          console.log(`>>> Trust detected at +${trustDetectedAt - spawnTime}ms, dismissing...`);
-          proc!.write('\r');
+          console.log(`>>> Trust detected at +${trustDetectedAt - spawnTime}ms, dismissing in 400ms...`);
+          setTimeout(() => { proc!.write('\r'); }, 400);
           return; // skip idle detector feed (same as production)
         }
       }

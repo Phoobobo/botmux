@@ -40,23 +40,27 @@ function makeDs(over: {
   chatId: string;
   lastMessageAt: number;
   title?: string;
-  ownerOpenId?: string;
+  ownerOpenId?: string | null;
   adoptedFrom?: any;
   cliId?: string | undefined;
   worker?: any;
+  scope?: 'thread' | 'chat';
+  rootMessageId?: string;
 }): DaemonSession {
+  const scope = over.scope ?? 'chat';
+  const rootMessageId = over.rootMessageId ?? `om_${over.sessionId}`;
   return {
     session: {
       sessionId: over.sessionId,
       chatId: over.chatId,
-      rootMessageId: `om_${over.sessionId}`,
+      rootMessageId,
       title: over.title ?? over.sessionId,
       status: 'active',
       createdAt: new Date(0).toISOString(),
-      scope: 'chat',
+      scope,
       chatType: 'group',
       larkAppId: APP,
-      ownerOpenId: over.ownerOpenId ?? OWNER,
+      ownerOpenId: 'ownerOpenId' in over ? (over.ownerOpenId ?? undefined) : OWNER,
       workingDir: '/tmp',
       cliId: 'cliId' in over ? over.cliId : ('claude-code' as any),
       adoptedFrom: over.adoptedFrom,
@@ -67,7 +71,7 @@ function makeDs(over: {
     larkAppId: APP,
     chatId: over.chatId,
     chatType: 'group',
-    scope: 'chat',
+    scope,
     spawnedAt: 0,
     cliVersion: '1.0.0',
     lastMessageAt: over.lastMessageAt,
@@ -120,5 +124,40 @@ describe('collectRelayPickerEntries', () => {
     // Only `keep` survives the filters — despite the others having a much
     // larger lastMessageAt, sort runs AFTER selection.
     expect(entries.map(e => e.sessionId)).toEqual(['keep']);
+  });
+
+  it('excludes by ANCHOR, not chatId — same-chat other-topic sessions stay in candidates', async () => {
+    // Two thread-scope sessions in the SAME chat, distinct 话题 roots. The relay
+    // target anchor is om_topicA; only that session is excluded (can't relay
+    // onto itself). topicB in the same chat must remain pullable.
+    const topicA = makeDs({ sessionId: 'topic-a', chatId: 'oc_same', lastMessageAt: 100, scope: 'thread', rootMessageId: 'om_topicA' });
+    const topicB = makeDs({ sessionId: 'topic-b', chatId: 'oc_same', lastMessageAt: 200, scope: 'thread', rootMessageId: 'om_topicB' });
+    const reg = registryOf(topicA, topicB);
+
+    const entries = await collectRelayPickerEntries(reg, APP, 'om_topicA', OWNER);
+
+    // topicB (same chat, different anchor) survives; topicA (the target) is gone.
+    expect(entries.map(e => e.sessionId)).toEqual(['topic-b']);
+  });
+
+  it('includes ownerless sessions (ownerOpenId unset) in every operator\'s picker', async () => {
+    // Alert-listener / daemon-spawned sessions have no ownerOpenId. The picker
+    // must surface them to any operator — same rule as relay_confirm and
+    // /relay --create, which only gate when an owner IS set.
+    const ownerless = makeDs({ sessionId: 'ownerless', chatId: 'oc_a', lastMessageAt: 100, ownerOpenId: null });
+    const reg = registryOf(ownerless);
+
+    const entries = await collectRelayPickerEntries(reg, APP, CURRENT_CHAT, 'ou_any_operator');
+
+    expect(entries.map(e => e.sessionId)).toEqual(['ownerless']);
+  });
+
+  it('still hides another operator\'s owned sessions (owner gate unchanged)', async () => {
+    const owned = makeDs({ sessionId: 'owned', chatId: 'oc_a', lastMessageAt: 100, ownerOpenId: 'ou_real_owner' });
+    const reg = registryOf(owned);
+
+    const entries = await collectRelayPickerEntries(reg, APP, CURRENT_CHAT, 'ou_intruder');
+
+    expect(entries.map(e => e.sessionId)).toEqual([]);
   });
 });

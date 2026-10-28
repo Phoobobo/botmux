@@ -1,0 +1,1188 @@
+/**
+ * Native CoT message (im.v1 message_cot) — unit tests.
+ *
+ * Covers the daemon-side bridge: create-on-first-update with AG-UI prologue,
+ * cumulative segment list → one reasoning message (node) per segment,
+ * latest-wins pumping, RUN_FINISHED terminal batch on finalize, per-turn
+ * disable on API failure (handleCotThinkingUpdate returns false; thinking is
+ * simply not displayed), and the error-path explicit complete when the
+ * terminal batch fails.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const request = vi.fn();
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({ config: { cotEnabled: true } })),
+  getBotClient: vi.fn(() => ({ request })),
+}));
+
+import { mkdtempSync, existsSync, readdirSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { handleCotThinkingUpdate, finalizeCotMessage, abortCotMessage, sweepOrphanCotMessages, settleCotMessageForShutdown } from '../src/im/lark/cot-message.js';
+import { getBot } from '../src/bot-registry.js';
+import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { t, localeForBot } from '../src/i18n/index.js';
+import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
+
+// Orphan markers land under config.session.dataDir — point it at a tmp dir so
+// tests never touch the packaged data directory.
+const dataDir = mkdtempSync(join(tmpdir(), 'cot-test-'));
+process.env.SESSION_DATA_DIR = dataDir;
+const orphanDir = join(dataDir, 'cot-orphans');
+
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+};
+
+/** Default: a thread-scope (topic) session — scope undefined ≠ 'chat', with
+ *  the topic root as rootMessageId, matching real topic sessions. */
+const makeDs = (over: any = {}): any => ({
+  larkAppId: 'app1',
+  chatId: 'oc_chat1',
+  ...over,
+  session: { sessionId: 's1', rootMessageId: 'om_root1', ...(over.session ?? {}) },
+});
+
+const think = (text: string): any => ({ kind: 'thinking', text });
+const say = (text: string): any => ({ kind: 'text', text });
+/** Same source as the renderer, so the assertion is locale-independent. */
+const placeholder = (): string => t('cot.thinking_placeholder', undefined, localeForBot('app1'));
+const upd = (entries: any[], turnId = 'om_turn1'): any => ({ type: 'thinking_update', entries, turnId });
+
+/** All PUT event batches flattened to [event_type, parsed content] pairs. */
+function pushedEvents(): Array<{ type: string; content: any }> {
+  return request.mock.calls
+    .filter(([req]) => req.method === 'PUT')
+    .flatMap(([req]) => req.data.events.map((e: any) => ({ type: e.event_type, content: JSON.parse(e.content) })));
+}
+
+beforeEach(() => {
+  request.mockReset().mockImplementation(async (req: any) => {
+    if (req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot') {
+      return { code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } };
+    }
+    return { code: 0, data: {} };
+  });
+  vi.mocked(getBot).mockClear().mockReturnValue({ config: { cotEnabled: true } } as any);
+  rmSync(orphanDir, { recursive: true, force: true });
+  rmSync(join(dataDir, 'roles'), { recursive: true, force: true });
+});
+
+describe('handleCotThinkingUpdate', () => {
+  it.each([false, true])('keeps hidden recovery turns quiet after restore with cotForced=%s', async cotForced => {
+    const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({ hiddenThinkingTurns: ['trg_recovery'] })) });
+    handleCotThinkingUpdate(ds, upd([say('User work')], 'om_user'));
+    await flush(); request.mockClear();
+    expect(handleCotThinkingUpdate(ds, upd([say('Internal recovery')], 'trg_recovery'))).toBe(false);
+    expect(finalizeCotMessage(ds, 'trg_recovery', 'completed')).toBe(false);
+    expect(handleCotThinkingUpdate(ds, upd([say('Late update')], 'trg_recovery'))).toBe(false);
+    await flush(); expect(request).not.toHaveBeenCalled();
+    expect(finalizeCotMessage(ds, 'om_user', 'completed')).toBe(true);
+    await flush(); expect(pushedEvents().some(e => e.type === 'RUN_FINISHED')).toBe(true);
+    expect(handleCotThinkingUpdate(ds, upd([say('Next user reply')], 'om_next'))).toBe(true);
+  });
+
+  it.each([false, true])('keeps silent scheduled thinking quiet with cotForced=%s', async (cotForced) => {
+    const ds = makeDs({ cotForced });
+    armSilentScheduledTurn(ds, 'schedule:quiet');
+
+    expect(handleCotThinkingUpdate(ds, upd([think('private check')], 'schedule:quiet'))).toBe(false);
+    expect(finalizeCotMessage(ds, 'schedule:quiet', 'completed')).toBe(false);
+    // Late thinking after terminal must remain silent as well.
+    expect(handleCotThinkingUpdate(ds, upd([think('late check')], 'schedule:quiet'))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(existsSync(orphanDir)).toBe(false);
+
+    // The same session can still answer an ordinary human turn.
+    expect(handleCotThinkingUpdate(ds, upd([think('human reply')], 'om_human'))).toBe(true);
+    await flush();
+    expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
+  });
+
+  it('does not supersede a normal bubble when a silent scheduled update overlaps', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('human work')], 'om_human'));
+    await flush();
+    request.mockClear();
+    armSilentScheduledTurn(ds, 'schedule:quiet');
+    expect(handleCotThinkingUpdate(ds, upd([think('quiet check')], 'schedule:quiet'))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(finalizeCotMessage(ds, 'om_human', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(true);
+  });
+
+  it('topic session: creates INSIDE the topic (root anchor + reply_in_thread), sends the AG-UI prologue', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('step 1')]))).toBe(true);
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.params).toEqual({ receive_id_type: 'chat_id' });
+    // origin_message_id alone parents the bubble but leaves it at chat level
+    // (outside the topic) — reply_in_thread is what actually threads it.
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_root1', reply_in_thread: true });
+    const events = pushedEvents();
+    expect(events.map(e => e.type)).toEqual([
+      'RUN_STARTED', 'REASONING_START',
+      'REASONING_MESSAGE_START', 'REASONING_MESSAGE_CONTENT', 'REASONING_MESSAGE_END',
+    ]);
+    expect(events[3].content.delta).toBe('step 1');
+  });
+
+  it('topic session with a synthetic (non om_) turn id still threads via the topic root', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('x')], 'sched-123'));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_root1', reply_in_thread: true });
+  });
+
+  it('chat-scope session: anchors to the triggering message WITHOUT reply_in_thread (a plain-group anchor must not spawn a topic)', async () => {
+    const ds = makeDs({ scope: 'chat' });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_turn1' });
+  });
+
+  it('chat-scope session skips origin_message_id for synthetic turn ids', async () => {
+    const ds = makeDs({ scope: 'chat' });
+    handleCotThinkingUpdate(ds, upd([think('x')], 'sched-123'));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1' });
+  });
+
+  it('chat-scope turn folded into a topic (per-turn thread reply target) threads into that topic', async () => {
+    const ds = makeDs({ scope: 'chat', session: { replyTargets: { om_turn1: { rootMessageId: 'om_fold_root' } } } });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_fold_root', reply_in_thread: true });
+  });
+
+  it('uses the FROZEN per-turn context, so a pruned live entry cannot flatten the bubble', async () => {
+    // replyTargets is capped at 32 (REPLY_TARGETS_MAX) while turnReplyContexts
+    // holds 256, and the live entry is written at message-arrival while the
+    // bubble is created on the turn's first thinking_update. On a busy session
+    // the live entry can be pruned in that window: the frozen context still
+    // says {thread, om_fold} where resolveSessionReplyTarget has degraded to
+    // {plain} — which would resurrect this very bug in the fold-back case.
+    const ds = makeDs({
+      scope: 'chat',
+      currentReplyTarget: { rootMessageId: 'om_other', turnId: 'om_other_turn', updatedAt: new Date().toISOString() },
+      session: {
+        // Live per-turn entry for om_turn1 is GONE (pruned); only the frozen one remains.
+        replyTargets: {},
+        turnReplyContexts: { om_turn1: { target: { mode: 'thread', rootMessageId: 'om_fold_root' } } },
+        currentReplyTarget: { rootMessageId: 'om_other', turnId: 'om_other_turn', updatedAt: new Date().toISOString() },
+      },
+    });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_fold_root', reply_in_thread: true });
+  });
+
+  it('degrades to a chat-level bubble when the thread anchor is not an om_ message id', async () => {
+    // session.rootMessageId is NOT always a message id on a thread-scope
+    // session: a silent new-topic schedule stores `schedule-run:<task>:<uuid>`,
+    // and `schedule add --topic --root-msg-id <any string>` is unvalidated (the
+    // cross-thread fire path anchors it verbatim without probing, so it does
+    // not self-heal). Feishu rejects a non-om_ origin and a failed create kills
+    // thinking for the WHOLE turn — a chat-level bubble is strictly better.
+    for (const bad of ['schedule-run:task1:uuid1', 'oc_chat1']) {
+      request.mockClear();
+      const ds = makeDs({ session: { rootMessageId: bad } });
+      handleCotThinkingUpdate(ds, upd([think('x')], 'schedule:task1:uuid1'));
+      await flush();
+      const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+      expect(create.data, `non-om_ anchor ${bad} must not reach Feishu`)
+        .toEqual({ receive_id: 'oc_chat1' });
+    }
+  });
+
+  it('chat-scope quote-only reply target anchors to the quote WITHOUT reply_in_thread', async () => {
+    const ds = makeDs({ scope: 'chat', session: { replyTargets: { om_turn1: { rootMessageId: 'om_quote_tgt', quoteOnly: true } } } });
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush();
+    const create = request.mock.calls.find(([req]) => req.method === 'POST')![0];
+    expect(create.data).toEqual({ receive_id: 'oc_chat1', origin_message_id: 'om_quote_tgt' });
+  });
+
+  it('pushes each new thinking entry as its own reasoning message (one node per entry)', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('seg A')]));
+    await flush();
+    handleCotThinkingUpdate(ds, upd([think('seg A'), think('seg B'), think('seg C')]));
+    await flush();
+    const contents = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT');
+    expect(contents.map(e => e.content.delta)).toEqual(['seg A', 'seg B', 'seg C']);
+    // Distinct messageIds → distinct nodes; already-sent segments never resent.
+    const ids = contents.map(e => e.content.messageId);
+    expect(new Set(ids).size).toBe(3);
+    // Each node is opened and closed around its content.
+    const types = pushedEvents().map(e => e.type).filter(t => t.startsWith('REASONING_MESSAGE'));
+    expect(types).toEqual([
+      'REASONING_MESSAGE_START', 'REASONING_MESSAGE_CONTENT', 'REASONING_MESSAGE_END',
+      'REASONING_MESSAGE_START', 'REASONING_MESSAGE_CONTENT', 'REASONING_MESSAGE_END',
+      'REASONING_MESSAGE_START', 'REASONING_MESSAGE_CONTENT', 'REASONING_MESSAGE_END',
+    ]);
+  });
+
+  it('maps tool entries to TOOL_CALL_* events with icon, args, and code-style result', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      think('let me check'),
+      { kind: 'tool_call', id: 'toolu_1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'toolu_1', result: 'file-a\nfile-b' },
+      { kind: 'tool_call', id: 'toolu_2', name: 'Grep', args: '' },
+    ]));
+    await flush();
+    const events = pushedEvents();
+    const start1 = events.find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === 'toolu_1')!;
+    expect(start1.content.icon).toBe('bash');
+    expect(start1.content.toolCallName).toBe('Bash');
+    // Category label PLUS the concrete command — the renderer ignores
+    // TOOL_CALL_ARGS, so the title is the only place the command shows up.
+    expect(start1.content.title).toContain('ls');
+    expect(start1.content.title).not.toContain('{'); // never the raw JSON blob
+    expect(start1.content.parentMessageId).toBeDefined(); // attached to the preceding thinking node
+    const args = events.find(e => e.type === 'TOOL_CALL_ARGS')!;
+    expect(args.content).toEqual({ toolCallId: 'toolu_1', delta: '{"command":"ls"}' });
+    const result = events.find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('toolu_1');
+    // Shell output is tagged `bash` so the block highlights instead of
+    // reading「plaintext」(the renderer never infers this on its own).
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'code', language: 'bash', code: 'file-a\nfile-b' });
+    // Empty args → no TOOL_CALL_ARGS event, but START/END still sent.
+    const start2 = events.find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === 'toolu_2')!;
+    expect(start2.content.icon).toBe('search');
+    expect(events.filter(e => e.type === 'TOOL_CALL_ARGS').length).toBe(1);
+    expect(events.filter(e => e.type === 'TOOL_CALL_END').map(e => e.content.toolCallId)).toEqual(['toolu_1', 'toolu_2']);
+  });
+
+  it('renders interim assistant narration (text entries) as reasoning nodes, in transcript order', async () => {
+    const ds = makeDs();
+    // Extended thinking OFF is Claude Code's default: the turn carries text
+    // blocks and tool calls, no thinking at all. Both kinds must reach the
+    // bubble, interleaved exactly as the transcript ordered them.
+    handleCotThinkingUpdate(ds, upd([
+      say('先看一眼配置'),
+      { kind: 'tool_call', id: 'x1', name: 'Read', args: '{"file_path":"/a/b.json"}' },
+      { kind: 'tool_result', id: 'x1', result: '{}' },
+      say('确认了，改这里'),
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual(['先看一眼配置', '确认了，改这里']);
+    // The narration node is a real reasoning node — the tool hangs under it,
+    // so no placeholder is needed.
+    const start = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!;
+    expect(start.content.parentMessageId).toBeDefined();
+    expect(deltas).not.toContain(placeholder());
+  });
+
+  it('opens with a placeholder reasoning node when the turn starts straight into tooling', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'p1', name: 'Bash', args: '{"command":"ls"}' },
+      { kind: 'tool_result', id: 'p1', result: 'a' },
+      { kind: 'tool_call', id: 'p2', name: 'Bash', args: '{"command":"pwd"}' },
+    ]));
+    await flush();
+    const events = pushedEvents();
+    // Placeholder is emitted BEFORE the first tool node, once only...
+    const deltas = events.filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual([placeholder()]);
+    expect(events.findIndex(e => e.type === 'REASONING_MESSAGE_START'))
+      .toBeLessThan(events.findIndex(e => e.type === 'TOOL_CALL_START'));
+    // ...and every tool node hangs under it, including the second one.
+    const parents = events.filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.parentMessageId);
+    expect(parents).toHaveLength(2);
+    expect(new Set(parents).size).toBe(1);
+    expect(parents[0]).toBeDefined();
+  });
+
+  it('never inserts the placeholder when real thinking leads the turn', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      think('先想清楚'),
+      { kind: 'tool_call', id: 'q1', name: 'Bash', args: '{"command":"ls"}' },
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual(['先想清楚']);
+  });
+
+  it('inserts the placeholder only once across incremental updates of the same turn', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([{ kind: 'tool_call', id: 'i1', name: 'Bash', args: '' }]));
+    await flush();
+    // Cumulative list grows; the already-sent entries are not re-pushed, and
+    // the placeholder must not reappear ahead of the newly arrived tool.
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'i1', name: 'Bash', args: '' },
+      { kind: 'tool_result', id: 'i1', result: 'ok' },
+      { kind: 'tool_call', id: 'i2', name: 'Bash', args: '' },
+    ]));
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual([placeholder()]);
+  });
+
+  /**
+   * The title is the ONLY carrier the Feishu CoT renderer draws for a tool
+   * call: a live A/B showed a node with full TOOL_CALL_ARGS and a control
+   * node with no args event at all rendering identically. Each case below is
+   * a real shape harvested from on-disk transcripts, not an invented one.
+   */
+  it('carries the tool subject in the title across both CLIs\' arg shapes', async () => {
+    const ds = makeDs();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+
+    handleCotThinkingUpdate(ds, upd([
+      // Claude Bash — by far the most common call (~1900 in local transcripts).
+      { kind: 'tool_call', id: 't1', name: 'Bash', args: '{"command":"git log --oneline -5","description":"recent commits"}' },
+      // Claude file ops key off file_path, not command.
+      { kind: 'tool_call', id: 't2', name: 'Read', args: '{"file_path":"/root/iserver/botmux/src/daemon.ts","limit":50}' },
+      // Codex local_shell_call: command is argv; the script is the last element.
+      { kind: 'tool_call', id: 't3', name: 'shell', args: '{"command":["bash","-lc","pnpm run build"]}' },
+      // Codex custom_tool_call ships a RAW non-JSON string — must not be dropped.
+      { kind: 'tool_call', id: 't4', name: 'exec', args: 'await tools.exec_command({ cmd: "free -h" })' },
+      // Multi-line script collapses to one line (the title never wraps).
+      { kind: 'tool_call', id: 't5', name: 'Bash', args: '{"command":"line one\\nline two\\n  line three"}' },
+    ]));
+    await flush();
+
+    expect(titleOf('t1')).toContain('git log --oneline -5');
+    expect(titleOf('t1')).not.toContain('recent commits'); // description is not the subject
+    expect(titleOf('t2')).toContain('/root/iserver/botmux/src/daemon.ts');
+    expect(titleOf('t3')).toContain('pnpm run build');
+    expect(titleOf('t3')).not.toContain('bash'); // argv boilerplate stripped
+    expect(titleOf('t4')).toContain('free -h');
+    expect(titleOf('t5')).toBe('执行命令 · line one line two line three');
+  });
+
+  it('falls back to the bare category label when no subject can be extracted', async () => {
+    const ds = makeDs();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'n1', name: 'TaskList', args: '' },            // no args at all
+      { kind: 'tool_call', id: 'n2', name: 'TaskUpdate', args: '{"taskId":"1","status":"done"}' }, // no known field
+      { kind: 'tool_call', id: 'n3', name: 'Bash', args: '{"command":"   "}' },  // whitespace-only
+      { kind: 'tool_call', id: 'n4', name: 'Bash', args: '{"command":' },        // truncated/invalid JSON
+    ]));
+    await flush();
+
+    // Degrades to exactly today's rendering — never '[object Object]' or a
+    // dangling separator.
+    expect(titleOf('n1')).toBe('任务管理');
+    expect(titleOf('n2')).toBe('任务管理');
+    expect(titleOf('n3')).toBe('执行命令');
+    expect(titleOf('n4')).toBe('执行命令'); // broken JSON fragment never shown
+    for (const id of ['n1', 'n2', 'n3', 'n4']) {
+      expect(titleOf(id)).not.toContain('·');
+      expect(titleOf(id)).not.toContain('object Object');
+    }
+  });
+
+  /**
+   * The renderer echoes `language` verbatim and never auto-detects (verified
+   * live: a bogus value prints as-is; Python content with no language set
+   * still reads "plaintext"). So the mapping must be a whitelist, and an
+   * unmapped tool must omit the field rather than pass an extension through.
+   */
+  it('tags result code blocks with a whitelisted language, omitting it when unknown', async () => {
+    const ds = makeDs();
+    const resultFor = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'g1', name: 'Bash', args: '{"command":"ls -la"}' },
+      { kind: 'tool_result', id: 'g1', result: 'total 0' },
+      { kind: 'tool_call', id: 'g2', name: 'Read', args: '{"file_path":"/a/b/daemon.ts"}' },
+      { kind: 'tool_result', id: 'g2', result: 'export const x = 1;' },
+      { kind: 'tool_call', id: 'g3', name: 'Read', args: '{"file_path":"/a/b/conf.yml"}' },
+      { kind: 'tool_result', id: 'g3', result: 'key: value' },
+      // Extension with no whitelist entry: must NOT leak "wat" as the label.
+      { kind: 'tool_call', id: 'g4', name: 'Read', args: '{"file_path":"/a/b/notes.wat"}' },
+      { kind: 'tool_result', id: 'g4', result: 'blah' },
+      // No file, no shell → no language at all (renders as plaintext).
+      { kind: 'tool_call', id: 'g5', name: 'TaskUpdate', args: '{"taskId":"1"}' },
+      { kind: 'tool_result', id: 'g5', result: 'Updated task #1' },
+    ]));
+    await flush();
+
+    expect(resultFor('g1')).toEqual({ type: 'code', language: 'bash', code: 'total 0' });
+    expect(resultFor('g2').language).toBe('typescript');
+    expect(resultFor('g3').language).toBe('yaml');
+    // Unmapped / inapplicable → field absent entirely, never a bogus label.
+    expect(resultFor('g4')).toEqual({ type: 'code', code: 'blah' });
+    expect(resultFor('g5')).toEqual({ type: 'code', code: 'Updated task #1' });
+    expect(resultFor('g4').language).toBeUndefined();
+    expect(resultFor('g5').language).toBeUndefined();
+  });
+
+  /**
+   * Regression: truncation is a rendering concern and must not feed logic.
+   * The first version resolved the language off the DISPLAY string, so any
+   * path longer than the 80-char title cap lost its extension to the ellipsis
+   * and silently fell back to plaintext.
+   */
+  it('detects the language from the untruncated path, not the shortened title', async () => {
+    const ds = makeDs();
+    const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
+    expect(longPath.length).toBeGreaterThan(80); // the case only bites past the cap
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'L', name: 'Read', args: JSON.stringify({ file_path: longPath }) },
+      { kind: 'tool_result', id: 'L', result: 'export const x = 1;' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(title.endsWith('…')).toBe(true);   // still bounded for layout
+    expect(title).not.toContain('.ts');        // extension really is cut from the title
+    expect(body.language).toBe('typescript');  // …yet detection still sees it
+  });
+
+  /**
+   * The transcript layer hard-cuts args at 600 chars, so a Write/Edit whose
+   * `content` dwarfs the path arrives as unparseable JSON. The leading
+   * `"file_path":"…"` survives that cut, so recover it rather than showing a
+   * bare label.
+   */
+  it('recovers a subject by regex when oversized args arrive truncated', async () => {
+    const ds = makeDs();
+    const path = '/root/iserver/botmux/src/core/worker-pool.ts';
+    const full = JSON.stringify({ file_path: path, content: 'x'.repeat(2000) });
+    const truncated = full.slice(0, 600); // exactly what truncateForCot does
+    expect(() => JSON.parse(truncated)).toThrow(); // precondition: really broken
+
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'W', name: 'Write', args: truncated },
+      { kind: 'tool_result', id: 'W', result: 'ok' },
+      // A value cut mid-string must NOT be shown half-rendered.
+      { kind: 'tool_call', id: 'W2', name: 'Write', args: '{"file_path":"/a/b/unterminat' },
+      { kind: 'tool_result', id: 'W2', result: 'ok' },
+    ]));
+    await flush();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    expect(titleOf('W')).toContain(path);
+    expect(titleOf('W')).not.toContain('{');       // never the JSON fragment
+    expect(bodyOf('W').language).toBe('typescript'); // recovery feeds detection too
+    // Incomplete pair → no match → bare label, exactly as before.
+    expect(titleOf('W2')).toBe('编辑文件');
+    expect(bodyOf('W2').language).toBeUndefined();
+  });
+
+  it('keeps sub-agent and fetch style calls honest', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // description/prompt are the only identifying fields a Task call has.
+      { kind: 'tool_call', id: 'T', name: 'TaskCreate', args: JSON.stringify({ subject: '跑一遍回归', activeForm: '跑回归' }) },
+      { kind: 'tool_result', id: 'T', result: 'created' },
+      { kind: 'tool_call', id: 'A', name: 'Agent', args: JSON.stringify({ description: 'Find the auth flow', subagent_type: 'Explore' }) },
+      { kind: 'tool_result', id: 'A', result: 'found' },
+      // A .json URL must not label fetched prose as json.
+      { kind: 'tool_call', id: 'F', name: 'WebFetch', args: JSON.stringify({ url: 'https://example.com/api/spec.json' }) },
+      { kind: 'tool_result', id: 'F', result: 'The page describes…' },
+      // execute_* is not a shell despite containing "exec".
+      { kind: 'tool_call', id: 'S', name: 'execute_sql', args: JSON.stringify({ query: 'select 1' }) },
+      { kind: 'tool_result', id: 'S', result: '1' },
+    ]));
+    await flush();
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+
+    expect(titleOf('T')).toContain('跑一遍回归');
+    expect(titleOf('A')).toContain('Find the auth flow');
+    expect(bodyOf('F').language).toBeUndefined(); // not "json"
+    expect(bodyOf('S').language).toBeUndefined(); // not "bash"
+  });
+
+  it('does not highlight search results by the pattern\'s extension', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // A pattern ending in an extension says what to FIND; the result is a
+      // match list, not a file of that type.
+      { kind: 'tool_call', id: 'G', name: 'Grep', args: JSON.stringify({ pattern: 'readme\\.md' }) },
+      { kind: 'tool_result', id: 'G', result: 'docs/readme.md:1:# Title' },
+      { kind: 'tool_call', id: 'B', name: 'Glob', args: JSON.stringify({ pattern: 'src/**/*.ts' }) },
+      { kind: 'tool_result', id: 'B', result: 'src/daemon.ts\nsrc/worker.ts' },
+    ]));
+    await flush();
+    const bodyOf = (id: string): any =>
+      JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
+    const titleOf = (id: string): string =>
+      pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
+    expect(bodyOf('G').language).toBeUndefined(); // not "markdown"
+    expect(bodyOf('B').language).toBeUndefined(); // not "typescript"
+    // The pattern still shows in the title — only the highlight is suppressed.
+    expect(titleOf('G')).toContain('readme');
+    expect(titleOf('B')).toContain('src/**/*.ts');
+  });
+
+  it('bounds an overlong command so the title stays one readable line', async () => {
+    const ds = makeDs();
+    const long = `echo ${'x'.repeat(500)}`;
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'L1', name: 'Bash', args: JSON.stringify({ command: long }) },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title.length).toBeLessThan(120);
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).toContain('echo xxx');
+    // The untruncated args still go out on the wire — cheap, and a future
+    // client may render them.
+    const args = pushedEvents().find(e => e.type === 'TOOL_CALL_ARGS')!;
+    expect(args.content.delta).toContain('x'.repeat(500));
+  });
+
+  /**
+   * 转写层在 args 截断前从完整 input 提取 `subject`，渲染层优先用它；解析
+   * args 只是给尚未升级、只发 args 的旧世代 worker 的回退。
+   */
+  it('prefers the transcript-provided subject over parsing args', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      // args 已被截成解析不出的残片，但 subject 完整。
+      { kind: 'tool_call', id: 'S1', name: 'Bash', args: '{"command":', subject: 'git log --oneline' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title).toContain('git log --oneline');
+    expect(title).not.toContain('{');
+  });
+
+  it('bounds a long subject for the title but resolves the language from its full form', async () => {
+    const ds = makeDs();
+    const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
+    expect(longPath.length).toBeGreaterThan(80);
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'S2', name: 'Read', args: '', subject: longPath },
+      { kind: 'tool_result', id: 'S2', result: 'export const x = 1;' },
+    ]));
+    await flush();
+    const title = pushedEvents().find(e => e.type === 'TOOL_CALL_START')!.content.title as string;
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).not.toContain('.ts');
+    const body = JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(body.language).toBe('typescript');
+  });
+
+  it('legacy tool-output opt-out still settles the tool without publishing its result', async () => {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, thinkingCardToolResult: false } } as any);
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'hidden-result', name: 'Bash', args: '{"command":"echo example"}' },
+      { kind: 'tool_result', id: 'hidden-result', result: 'private-result-body' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+    expect(JSON.stringify(pushedEvents())).not.toContain('private-result-body');
+  });
+
+  it('an empty tool result is also closed with the marker rather than left pending', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'E1', name: 'Bash', args: '{"command":"true"}' },
+      { kind: 'tool_result', id: 'E1', result: '' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(result.content.toolCallId).toBe('E1');
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+  });
+
+  it('coalesces bursts to the latest entry list (single in-flight pump)', async () => {
+    const ds = makeDs();
+    let release: () => void = () => {};
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'POST') return { code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } };
+      if (req.data.events.some((e: any) => e.event_type === 'RUN_STARTED')) {
+        // Block the prologue push; updates pile up meanwhile.
+        return new Promise((r) => { release = () => r({ code: 0, data: {} }); });
+      }
+      return { code: 0, data: {} };
+    });
+    handleCotThinkingUpdate(ds, upd([think('v1')]));
+    await flush();
+    handleCotThinkingUpdate(ds, upd([think('v1'), think('v2')]));
+    handleCotThinkingUpdate(ds, upd([think('v1'), think('v2'), think('v3')]));
+    release();
+    await flush();
+    const deltas = pushedEvents().filter(e => e.type === 'REASONING_MESSAGE_CONTENT').map(e => e.content.delta);
+    expect(deltas).toEqual(['v1', 'v2', 'v3']); // one batch, nothing pushed twice
+    expect(request.mock.calls.filter(([req]) => req.method === 'PUT').length).toBe(2); // prologue + one segment batch
+  });
+
+  it('disables the turn after a create failure (thinking not displayed)', async () => {
+    const ds = makeDs();
+    request.mockRejectedValueOnce(new Error('99991672 missing scope'));
+    expect(handleCotThinkingUpdate(ds, upd([think('step 1')]))).toBe(true); // creating (optimistic)
+    await flush();
+    expect(handleCotThinkingUpdate(ds, upd([think('step 1'), think('more')]))).toBe(false); // disabled
+    // A NEW turn retries from scratch.
+    expect(handleCotThinkingUpdate(ds, upd([think('fresh')], 'om_turn2'))).toBe(true);
+    await flush();
+    expect(request.mock.calls.filter(([req]) => req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot').length).toBe(2);
+  });
+
+  it('does nothing when explicitly disabled or apiOnly; absent config means ON (default)', () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, apiOnly: true } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+    // Default ON: a bot that never touched the field streams CoT.
+    vi.mocked(getBot).mockReturnValue({ config: {} } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
+  });
+
+  it('cotForced (/cot show) overrides both switches for the session, but never apiOnly', () => {
+    const ds = makeDs();
+    ds.cotForced = true;
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false, noCotChats: ['oc_chat1'] } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
+    vi.mocked(getBot).mockReturnValue({ config: { apiOnly: true } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+  });
+
+  it.each([false, true])('private replies suppress thinking and tool output even with cotForced=%s', async cotForced => {
+    const ds = makeDs({
+      cotForced,
+      session: { larkAppId: 'app1', chatId: 'oc_chat1', chatType: 'group', scope: 'thread' },
+    });
+    const update = upd([
+      think('private reasoning'),
+      { kind: 'tool_call', id: 'tool1', name: 'Bash', args: '{"command":"cat secret.txt"}' },
+      { kind: 'tool_result', id: 'tool1', result: 'private output' },
+    ]);
+    writeRoleReplyPrivately('app1', 'oc_chat1', true);
+    expect(handleCotThinkingUpdate(ds, update)).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+
+    writeRoleReplyPrivately('app1', 'oc_chat1', false);
+    expect(handleCotThinkingUpdate(ds, update)).toBe(true);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'TOOL_CALL_RESULT')).toBe(true);
+  });
+
+  it('does nothing when the chat is muted via noCotChats (/cot off)', () => {
+    const ds = makeDs();
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, noCotChats: ['oc_chat1'] } } as any);
+    expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
+    expect(request).not.toHaveBeenCalled();
+    // A different chat with the same bot config stays enabled.
+    const other = makeDs();
+    other.chatId = 'oc_other';
+    expect(handleCotThinkingUpdate(other, upd([think('x')]))).toBe(true);
+  });
+});
+
+describe('finalizeCotMessage', () => {
+  it('sends the terminal batch (RUN_FINISHED auto-completes) and swallows late updates', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(finalizeCotMessage(ds, 'om_turn1', 'completed')).toBe(true);
+    await flush();
+    const types = pushedEvents().map(e => e.type);
+    expect(types.slice(-2)).toEqual(['REASONING_END', 'RUN_FINISHED']);
+    expect(pushedEvents().at(-1)!.content.status).toBe('done');
+    // Late update for the settled turn: still owned (true), but no new pushes.
+    const putCount = request.mock.calls.length;
+    expect(handleCotThinkingUpdate(ds, upd([think('step 1'), think('late')]))).toBe(true);
+    await flush();
+    expect(request.mock.calls.length).toBe(putCount);
+    // Repeat finalize is a no-op.
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request.mock.calls.length).toBe(putCount);
+  });
+
+  it.each(['failed', 'cancelled', 'ambiguous'] as const)('closes %s terminals through the error endpoint', async status => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    finalizeCotMessage(ds, 'om_turn1', status);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    const complete = request.mock.calls.filter(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toHaveLength(1);
+    expect(complete[0][0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    const calls = request.mock.calls.length;
+    finalizeCotMessage(ds, 'om_turn1', status);
+    abortCotMessage(ds);
+    await settleCotMessageForShutdown(ds);
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('returns false for unknown turns and disabled states', async () => {
+    const ds = makeDs();
+    expect(finalizeCotMessage(ds, 'om_never_seen', 'completed')).toBe(false);
+    request.mockRejectedValueOnce(new Error('boom'));
+    handleCotThinkingUpdate(ds, upd([think('x')]));
+    await flush(); // create fails → disabled
+    expect(finalizeCotMessage(ds, 'om_turn1', 'completed')).toBe(false);
+  });
+
+  it('falls back to explicit complete when the terminal batch fails', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'PUT') throw new Error('COT already in terminal state');
+      return { code: 0, data: {} };
+    });
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toBeTruthy();
+    expect(complete![0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+  });
+
+  it('closes a bubble disabled mid-turn (push failure before terminal) at finalize', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush(); // created ok
+    request.mockRejectedValueOnce(new Error('network blip'));
+    handleCotThinkingUpdate(ds, upd([think('step 1'), think('step 2')]));
+    await flush(); // push fails → disabled, no finishStatus
+    expect(finalizeCotMessage(ds, 'om_turn1', 'completed')).toBe(false);
+    await flush();
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toBeTruthy();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+});
+
+describe('orphan markers & sweep (daemon restart mid-turn)', () => {
+  it('writes a marker on create and removes it when the turn settles normally', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('sweep completes leftover bubbles and consumes markers (even broken ones)', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
+    writeFileSync(join(orphanDir, 'broken.json'), 'not json');
+    await sweepOrphanCotMessages('app1');
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'));
+    expect(complete).toBeTruthy();
+    expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'error' });
+    expect(readdirSync(orphanDir)).toEqual([]);
+  });
+
+  it('sweep leaves sibling bots\' markers alone (shared dataDir, per-bot daemons)', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_mine.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_mine', messageId: 'om_mine' }));
+    writeFileSync(join(orphanDir, 'cot_theirs.json'), JSON.stringify({ larkAppId: 'app_other', cotId: 'cot_theirs', messageId: 'om_theirs' }));
+    await sweepOrphanCotMessages('app1');
+    // Own marker: closed and consumed. Sibling's: untouched on disk, no API
+    // call — its own daemon must close it (this one has no client for it).
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('cot_mine'))).toBe(true);
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('cot_theirs'))).toBe(false);
+    expect(readdirSync(orphanDir)).toEqual(['cot_theirs.json']);
+  });
+
+  it('sweep is a no-op without a marker directory', async () => {
+    await expect(sweepOrphanCotMessages('app1')).resolves.toBeUndefined();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('sweep annotates the bubble as interrupted BEFORE completing it', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
+    await sweepOrphanCotMessages('app1');
+    // Order is forced by the API, not cosmetic preference: appending after a
+    // complete is rejected with "COT already in terminal state", so a note
+    // pushed afterwards would silently never render.
+    const kinds = request.mock.calls.map(([req]) => req.method === 'PUT' ? 'note' : 'complete');
+    expect(kinds).toEqual(['note', 'complete']);
+    const note = pushedEvents();
+    expect(note.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
+    expect(note.some(e => e.type === 'RUN_FINISHED')).toBe(false);
+  });
+
+  it('sweep still completes the bubble when the interrupted note fails', async () => {
+    mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot_prev.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot_prev', messageId: 'om_prev' }));
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'PUT') throw new Error('append boom');
+      return { code: 0, data: {} };
+    });
+    await sweepOrphanCotMessages('app1');
+    // A failed note must never strand the bubble: an unannotated closed bubble
+    // beats one spinning on「执行中」forever.
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'))).toBe(true);
+    expect(readdirSync(orphanDir)).toEqual([]);
+  });
+});
+
+describe('settleCotMessageForShutdown (graceful daemon restart)', () => {
+  it('annotates the live bubble as interrupted and clears its marker', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    await settleCotMessageForShutdown(ds);
+    const evs = pushedEvents();
+    expect(evs.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
+    expect(evs.some(e => e.type === 'RUN_FINISHED')).toBe(false);
+    expect(request.mock.calls.some(([req]) => req.method === 'POST'
+      && String(req.url).includes('/message_cot/complete/') && req.params.reason === 'error')).toBe(true);
+    // Marker cleared → the next generation's sweep must not annotate it twice.
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('is idempotent and never double-settles against abort/finalize', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    await settleCotMessageForShutdown(ds);
+    const calls = request.mock.calls.length;
+    await settleCotMessageForShutdown(ds);
+    abortCotMessage(ds);
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('no-ops when the session never created a bubble', async () => {
+    const ds = makeDs();
+    await settleCotMessageForShutdown(ds);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('leaves an already-finishing turn to its own pump (no second RUN_FINISHED)', async () => {
+    // The pump may be parked on an await with its `!state.settled` check
+    // already passed. Claiming the turn here would put a SECOND terminal batch
+    // on the wire — the bubble would show two "finished" events.
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    finalizeCotMessage(ds, 'om_turn1', 'completed'); // sets finishStatus; pump in flight
+    await settleCotMessageForShutdown(ds);           // shutdown fires into that window
+    await flush();
+    const terminal = request.mock.calls.filter(([req]) =>
+      req.method === 'PUT' && req.data.events.some((e: any) => e.event_type === 'RUN_FINISHED'));
+    expect(terminal.length).toBe(1);
+    // The pump still owns cleanup, so nothing is left spinning.
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('terminates a disabled bubble instead of appending to it', async () => {
+    const ds = makeDs();
+    request.mockImplementationOnce(async () => ({ code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } }))
+      .mockImplementationOnce(async () => { throw new Error('prologue boom'); });
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    request.mockClear().mockImplementation(async () => ({ code: 0, data: {} }));
+    await settleCotMessageForShutdown(ds);
+    // Pushes are already failing for this turn — go straight to complete.
+    expect(request.mock.calls.every(([req]) => req.method === 'POST')).toBe(true);
+    expect(request.mock.calls.some(([req]) => String(req.url).includes('/message_cot/complete/'))).toBe(true);
+  });
+});
+
+describe('abortCotMessage (worker died without turn_terminal)', () => {
+  it('settles a live bubble as interrupted and clears its marker', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    abortCotMessage(ds);
+    await flush();
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    expect(pushedEvents().some(event => event.content.delta === t('cot.worker_disconnected', {}, localeForBot('app1')))).toBe(true);
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete?.[0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(request.mock.calls.at(-1)).toBe(complete);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    // Idempotent: a repeat abort (or a late finalize) pushes nothing new.
+    const calls = request.mock.calls.length;
+    abortCotMessage(ds);
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
+  });
+
+  it('closes a disabled-but-created bubble via explicit complete', async () => {
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('step 1')]));
+    await flush();
+    request.mockRejectedValueOnce(new Error('network blip'));
+    handleCotThinkingUpdate(ds, upd([think('step 1'), think('step 2')]));
+    await flush(); // push fails → disabled, bubble still open
+    abortCotMessage(ds);
+    await flush();
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toBeTruthy();
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+
+  it('is a no-op when the session has no live CoT state', () => {
+    abortCotMessage(makeDs());
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('superseded turn (type-ahead: next turn starts before the previous one is finalized)', () => {
+  it('finishes the previous live bubble as done when a newer turn\'s thinking arrives', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'))).toBe(true);
+    await flush();
+    const evs = pushedEvents();
+    const finished = evs.filter(e => e.type === 'RUN_FINISHED');
+    // 旧气泡先被按 done 收尾……
+    expect(finished.map(e => e.content)).toEqual([{ threadId: 's1', runId: 'om_t1', status: 'done' }]);
+    // ……且收尾批次在新 turn 的 RUN_STARTED 之前落地。
+    const idxFinishT1 = evs.findIndex(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1');
+    const idxStartT2 = evs.findIndex(e => e.type === 'RUN_STARTED' && e.content.runId === 'om_t2');
+    expect(idxFinishT1).toBeGreaterThan(-1);
+    expect(idxStartT2).toBeGreaterThan(idxFinishT1);
+    // 迟到的 t1 terminal：仍能按 turnId 找到它（返回 true），但不会再发第二个 RUN_FINISHED。
+    expect(finalizeCotMessage(ds, 'om_t1', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED' && e.content.runId === 'om_t1')).toHaveLength(1);
+    // 当前 turn 照常收尾。
+    expect(finalizeCotMessage(ds, 'om_t2', 'completed')).toBe(true);
+    await flush();
+    expect(pushedEvents().filter(e => e.type === 'RUN_FINISHED').map(e => e.content.runId)).toEqual(['om_t1', 'om_t2']);
+  });
+
+  it('a superseded bubble whose pushes had failed is closed via the explicit complete endpoint', async () => {
+    const ds = makeDs();
+    expect(handleCotThinkingUpdate(ds, upd([think('turn one')], 'om_t1'))).toBe(true);
+    await flush();
+    // 第二次推送失败 → 该轮 disabled，但气泡已存在。
+    request.mockImplementationOnce(async () => { throw new Error('boom'); });
+    handleCotThinkingUpdate(ds, upd([think('turn one'), think('more')], 'om_t1'));
+    await flush();
+    handleCotThinkingUpdate(ds, upd([think('turn two')], 'om_t2'));
+    await flush();
+    const complete = request.mock.calls.find(([req]) => typeof req.url === 'string' && req.url.includes('/message_cot/complete/'));
+    expect(complete).toBeDefined();
+    expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
+  });
+});
+
+describe('starting work card and thinking publication order', () => {
+  it('waits for a delayed work card before creating the bubble and preserves buffered output', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    handleCotThinkingUpdate(ds, upd([think('first'), say('second')]));
+    finalizeCotMessage(ds, 'om_turn1', 'completed');
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([req]) => req.url === '/open-apis/im/v1/message_cot' && req.method === 'POST')).toHaveLength(1);
+    const events = pushedEvents();
+    expect(events.some(e => e.content.delta === 'second')).toBe(true);
+    expect(events.some(e => e.type === 'RUN_FINISHED')).toBe(true);
+  });
+  it('does not let a failed card POST block thinking or another session', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(), other = makeDs({session:{sessionId:'other'}});
+    let reject!: (e: Error) => void;
+    const post = new Promise<void>((_, r) => { reject = r; });
+    trackStartingCardPublication(ds, post).catch(() => {});
+    handleCotThinkingUpdate(ds, upd([think('pending')]));
+    handleCotThinkingUpdate(other, upd([think('independent')], 'om_other'));
+    await flush(); expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+    reject(new Error('card failed')); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(2);
+  });
+  it('drops a superseded not-yet-visible bubble instead of placing it below the successor card', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(); let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('old')], 'om_old'));
+    handleCotThinkingUpdate(ds, upd([think('new')], 'om_new'));
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+    expect(pushedEvents().some(e => e.content.delta === 'old')).toBe(false);
+    expect(pushedEvents().some(e => e.content.delta === 'new')).toBe(true);
+  });
+  it('follows a pending successor card started while the predecessor POST settles', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs(); let first!: () => void, second!: () => void;
+    const a = new Promise<void>(resolve => { first = resolve; });
+    const b = new Promise<void>(resolve => { second = resolve; });
+    trackStartingCardPublication(ds, a.then(() => { trackStartingCardPublication(ds, b); }));
+    handleCotThinkingUpdate(ds, upd([think('new')]));
+    first(); await flush(); expect(request).not.toHaveBeenCalled();
+    second(); await flush(); await flush();
+    expect(request.mock.calls.filter(([r]) => r.method === 'POST')).toHaveLength(1);
+  });
+  it('keeps waiting for another card after one publication rejects', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let fail!: (error: Error) => void;
+    let finish!: () => void;
+    const first = trackStartingCardPublication(ds, new Promise<void>((_, reject) => { fail = reject; }));
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('buffered')]));
+    fail(new Error('first card failed'));
+    await expect(first).rejects.toThrow('first card failed');
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    finish(); await flush(); await flush();
+    expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
+    expect(pushedEvents().some(event => event.content.delta === 'buffered')).toBe(true);
+  });
+  it('does not publish a stopped turn after its pending card finishes', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs();
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('cancelled')]));
+    abortCotMessage(ds);
+    finish(); await flush(); await flush();
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('drops a predecessor when the current turn changes before its next thinking update', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    const ds = makeDs({ currentTurnId: 'om_turn1' });
+    let finish!: () => void;
+    trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+    handleCotThinkingUpdate(ds, upd([think('old')]));
+    ds.currentTurnId = 'om_turn2';
+    finish(); await flush(); await flush();
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('bounds a stuck card without blocking turn settlement or publishing a detached bubble', async () => {
+    const { trackStartingCardPublication } = await import('../src/core/starting-card-publication.js');
+    vi.useFakeTimers();
+    try {
+      const ds = makeDs(); let finish!: () => void;
+      trackStartingCardPublication(ds, new Promise<void>(resolve => { finish = resolve; }));
+      handleCotThinkingUpdate(ds, upd([think('buffered')]));
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(request).not.toHaveBeenCalled();
+      finish(); await flush();
+      expect(request).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+
+describe('CoT stop policy', () => {
+  function stopPolicy() {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, topicUnavailablePolicy: 'stop' } } as any);
+    let unavailable = false;
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'GET') {
+        const id = req.url.split('/').at(-1);
+        return { code: 0, data: { items: [{ message_id: id, deleted: id === 'om_root1' && unavailable,
+          ...(id === 'om_cot_msg1' ? { root_id: 'om_root1' } : {}) }] } };
+      }
+      if (req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot') {
+        return { code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } };
+      }
+      return { code: 0, data: {} };
+    });
+    return (value: boolean) => { unavailable = value; };
+  }
+  it.each(['legacy', 'stop'] as const)('limits strict business-response handling to the %s policy', async policy => {
+    stopPolicy();
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, topicUnavailablePolicy: policy } } as any);
+    const ds = makeDs(); handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    handleCotThinkingUpdate(ds, upd([think('first'), think('next')]));
+    if (policy === 'stop') {
+      await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('first'), think('next')]))).toBe(false));
+    } else {
+      await flush();
+      expect(handleCotThinkingUpdate(ds, upd([think('first'), think('next')]))).toBe(true);
+    }
+    await settleCotMessageForShutdown(ds);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(policy === 'stop');
+    if (policy === 'legacy') expect(request.mock.calls.some(([r]) => r.method === 'GET')).toBe(false);
+  });
+  it('does not create a thinking bubble for a withdrawn source topic', async () => {
+    const unavailable = stopPolicy(); unavailable(true);
+    const ds = makeDs(); handleCotThinkingUpdate(ds, upd([think('private')]));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('private')]))).toBe(false));
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    expect(existsSync(orphanDir)).toBe(false);
+  });
+  it('blocks append and completion and retains the marker until the original topic can be observed', async () => {
+    const unavailable = stopPolicy(); const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    unavailable(true); request.mockClear();
+    handleCotThinkingUpdate(ds, upd([think('first'), think('second')]));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('first'), think('second')]))).toBe(false));
+    await settleCotMessageForShutdown(ds);
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    await sweepOrphanCotMessages('app1');
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    unavailable(false); request.mockClear(); await sweepOrphanCotMessages('app1');
+    expect(request.mock.calls.filter(([req]) => req.method !== 'GET').map(([req]) => req.method)).toEqual(['PUT', 'POST']);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+  it('does not degrade an unproven thread anchor to a top-level bubble', async () => {
+    stopPolicy(); const ds = makeDs({ session: { rootMessageId: 'unproven-thread' } });
+    handleCotThinkingUpdate(ds, upd([think('private')], 'scheduled'));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('private')], 'scheduled'))).toBe(false));
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not consume the recovery marker when a write loses the race after a successful check', async () => {
+    stopPolicy(); const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    await settleCotMessageForShutdown(ds);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+  });
+
+  it('keeps an orphan marker when the provider reports withdrawal after the root lookup', async () => {
+    stopPolicy(); mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot1.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot1', messageId: 'om_cot_msg1' }));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    await sweepOrphanCotMessages('app1');
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    expect(request.mock.calls.filter(([req]) => req.method !== 'GET').map(([req]) => req.method)).toEqual(['PUT']);
+  });
+
+});

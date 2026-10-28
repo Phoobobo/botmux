@@ -9,8 +9,8 @@
  * bot to do the invite. This wrapper just exposes the underlying call —
  * proxy selection happens at the route layer.
  */
-import { getBotClient } from '../bot-registry.js';
-import { larkGet } from '../im/lark/client.js';
+import { getBot, getBotClient, getOwnerOpenId } from '../bot-registry.js';
+import { larkGet, listChatBotMembers, getLarkErrorCode } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
 export interface ChatBrief {
@@ -18,7 +18,10 @@ export interface ChatBrief {
   name?: string;
   description?: string;
   chatMode?: string;
+  chatStatus?: string;
   ownerId?: string;
+  /** 群头像 URL（/open-apis/im/v1/chats 的 avatar 字段）。 */
+  avatar?: string;
 }
 
 /**
@@ -39,12 +42,21 @@ export async function listChats(larkAppId: string): Promise<ChatBrief[]> {
       throw new Error(`Failed to list chats: ${res.msg} (code: ${res.code})`);
     }
     for (const c of res.data?.items ?? []) {
+      const chatStatus = typeof c.chat_status === 'string' ? c.chat_status : undefined;
+      // Feishu keeps dissolved_save chats in /im/v1/chats so users can retain
+      // their history. They are no longer manageable groups, though: member
+      // APIs reject them with 232009 even while is_in_chat may still say true.
+      // Fail closed for missing/future states as well: the groups board offers
+      // mutating controls, so only an explicit normal status is manageable.
+      if (chatStatus !== 'normal') continue;
       out.push({
         chatId: c.chat_id,
         name: c.name,
         description: c.description,
         chatMode: c.chat_mode,
+        chatStatus,
         ownerId: c.owner_id,
+        avatar: c.avatar,
       });
     }
     pageToken = res.data?.has_more ? res.data?.page_token : undefined;
@@ -71,11 +83,121 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
   }
 }
 
+export type RenameChatResult =
+  | { ok: true; oldName: string; newName: string; changed: boolean }
+  | {
+      ok: false;
+      /** `name_changed`: the live name no longer matched `expectedOldName`. */
+      error: 'bot_not_in_chat' | 'permission_denied' | 'lark_api_error' | 'rate_limited' | 'name_changed';
+      detail?: string;
+      oldName?: string;
+      newName?: string;
+      larkCode?: number;
+      retryAfterSeconds?: number;
+    };
+
+/**
+ * Rename one chat using exactly the supplied bot identity.
+ *
+ * Deliberately does not try another configured bot on failure: callers use
+ * this for session-scoped AI actions, where credential fallback would violate
+ * the "the acting bot must itself be in the chat" boundary.
+ */
+export async function renameChat(
+  larkAppId: string,
+  chatId: string,
+  newName: string,
+  opts: {
+    beforeUpdate?: () =>
+      | { ok: true }
+      | { ok: false; error: 'rate_limited'; retryAfterSeconds: number };
+    /** Compare-and-set: only rename while the freshly read name is still this
+     *  one (automatic renames must not overwrite a member's manual name). */
+    expectedOldName?: string;
+  } = {},
+): Promise<RenameChatResult> {
+  const client = getBotClient(larkAppId);
+  if (!await isInChat(larkAppId, chatId)) {
+    return { ok: false, error: 'bot_not_in_chat' };
+  }
+  let oldName: string | undefined;
+  try {
+    const current: any = await larkGet(
+      client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`,
+      { user_id_type: 'open_id' },
+    );
+    if (current.code !== 0 && current.code !== undefined) {
+      return {
+        ok: false,
+        error: classifyRenameChatError(current.code),
+        detail: `${current.msg ?? 'unknown'} (code: ${current.code})`,
+      };
+    }
+    const fetchedOldName = typeof current.data?.name === 'string' ? current.data.name.trim() : '';
+    oldName = fetchedOldName;
+    if (opts.expectedOldName !== undefined && fetchedOldName !== opts.expectedOldName.trim()) {
+      return { ok: false, error: 'name_changed', oldName: fetchedOldName, newName };
+    }
+    if (fetchedOldName === newName) return { ok: true, oldName: fetchedOldName, newName, changed: false };
+    const gate = opts.beforeUpdate?.();
+    if (gate && !gate.ok) return { ...gate, oldName: fetchedOldName, newName };
+
+    const updated: any = await (client as any).im.v1.chat.update({
+      path: { chat_id: chatId },
+      data: { name: newName },
+    });
+    if (updated.code !== 0 && updated.code !== undefined) {
+      return {
+        ok: false,
+        error: classifyRenameChatError(updated.code),
+        detail: `${updated.msg ?? 'unknown'} (code: ${updated.code})`,
+        oldName: fetchedOldName,
+        newName,
+        larkCode: Number.isFinite(Number(updated.code)) ? Number(updated.code) : undefined,
+      };
+    }
+    return { ok: true, oldName: fetchedOldName, newName, changed: true };
+  } catch (e: any) {
+    const detail = e?.message ?? String(e);
+    return {
+      ok: false,
+      error: /permission|forbidden|99991672|2300\d/i.test(detail)
+        ? 'permission_denied'
+        : 'lark_api_error',
+      detail,
+      oldName,
+      newName,
+      larkCode: Number.isFinite(Number(e?.code)) ? Number(e.code) : undefined,
+    };
+  }
+}
+
+function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api_error' {
+  const numeric = Number(code);
+  // Lark uses 99991672 for missing app scope; 230xxx errors cover common
+  // chat-role / operation-permission failures.
+  return numeric === 99991672 || (numeric >= 230000 && numeric < 231000)
+    ? 'permission_denied'
+    : 'lark_api_error';
+}
+
+/**
+ * Feishu chat topology chosen at CREATION time. It is fixed for the chat's
+ * lifetime through this API — it is NOT the same as `group_message_type`
+ * (a normal group can opt into threaded messages while staying `group`).
+ * `p2p` is not creatable here (it is a direct message, not a group).
+ */
+export type ChatMode = 'group' | 'topic';
+
 /**
  * Create a brand-new chat with `bot_id_list` as initial bot members.  The
  * `creatorLarkAppId` bot becomes the chat's owner and an implicit member; the
  * other bots in `botIds` are added in the same call.  Used by the dashboard's
  * "Create new group" flow.
+ *
+ * `chatMode: 'topic'` creates a 话题群 (every top-level message starts its own
+ * thread). Omit it to keep Feishu's default, a 普通群.
  *
  * Returns the new chatId on success.  Throws on any non-zero Lark response so
  * the route can surface a real error.  We deliberately don't soften failures
@@ -84,7 +206,7 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
  */
 export async function createChat(
   creatorLarkAppId: string,
-  opts: { name?: string; botIds: string[]; userIds?: string[] },
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
@@ -95,6 +217,10 @@ export async function createChat(
   if (opts.name) data.name = opts.name;
   if (otherBots.length > 0) data.bot_id_list = otherBots;
   if (userIds.length > 0) data.user_id_list = userIds;
+  // Only send chat_mode when the caller explicitly chose one: an omitted field
+  // keeps Feishu's default ('group') and avoids pinning behavior that a future
+  // API default might change.
+  if (opts.chatMode) data.chat_mode = opts.chatMode;
   const params: Record<string, unknown> = {};
   if (userIds.length > 0) params.user_id_type = 'open_id';
   const res: any = await (client as any).im.v1.chat.create({ data, params });
@@ -119,20 +245,22 @@ export async function createChat(
  * is the case right after createChat since the creator bot is the implicit
  * owner.
  *
- * `newOwnerOpenId` must be in the calling bot's app scope — Lark open_ids are
- * app-scoped, see operator-selector.ts for why.
+ * Defaults to open_id for existing callers. Deferred federation completion can
+ * pass union_id after another deployment has added the user, avoiding any
+ * cross-app open_id handoff.
  */
 export async function transferChatOwner(
   ownerLarkAppId: string,
   chatId: string,
-  newOwnerOpenId: string,
+  newOwnerId: string,
+  userIdType: 'open_id' | 'union_id' = 'open_id',
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const client = getBotClient(ownerLarkAppId);
   try {
     const res: any = await (client as any).im.v1.chat.update({
       path: { chat_id: chatId },
-      params: { user_id_type: 'open_id' },
-      data: { owner_id: newOwnerOpenId },
+      params: { user_id_type: userIdType },
+      data: { owner_id: newOwnerId },
     });
     if (res.code !== 0 && res.code !== undefined) {
       return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
@@ -144,7 +272,133 @@ export async function transferChatOwner(
 }
 
 /**
- * Fetch the current owner of a chat (as an open_id). Used by group-creator to
+ * 飞书群管 API 常见永久错误（权限未开通/缺失、非群主、群状态异常等），遇到后直接 fail-fast，不浪费重试预算。
+ */
+export function isPermanentChatManagerErrorCode(code: number | undefined): boolean {
+  return (
+    code === 99991672 || // 权限未配置 (缺失 im:chat.managers:write_only)
+    code === 99991663 || // 租户未开启此权限
+    code === 232001 ||   // 当前用户无操作权限
+    code === 232009 ||   // 群不存在或已解散或状态异常
+    code === 232014 ||   // 群管理员人数已达上限
+    code === 232018 ||   // 群类型不支持
+    code === 232025 ||   // 仅群主可以添加管理员
+    code === 40001       // token invalid
+  );
+}
+
+/**
+ * Add group managers to a chat owned by the bot.
+ *
+ * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers.
+ * Includes bounded exponential backoff retry for transient errors (e.g. 232011 user indexing lag).
+ * Permanent errors (such as missing scope or permission denied) fail-fast immediately without retry.
+ */
+export async function addChatManagers(
+  ownerLarkAppId: string,
+  chatId: string,
+  managerIds: string[],
+  memberIdType: 'open_id' | 'union_id' | 'user_id' = 'open_id',
+  opts?: { maxRetries?: number; retryDelayMs?: number },
+): Promise<{ ok: true; addedManagers: string[] } | { ok: false; error: string }> {
+  const filtered = managerIds.filter(Boolean);
+  if (filtered.length === 0) return { ok: true, addedManagers: [] };
+  const client = getBotClient(ownerLarkAppId);
+  const maxRetries = opts?.maxRetries ?? 2;
+  const retryDelayMs = opts?.retryDelayMs ?? (process.env.NODE_ENV === 'test' ? 1 : 200);
+  let lastError = 'unknown';
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const fn = (client as any).im?.v1?.chatManagers?.addManagers;
+      let res: any;
+      if (typeof fn === 'function') {
+        res = await (client as any).im.v1.chatManagers.addManagers({
+          path: { chat_id: chatId },
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      } else {
+        res = await (client as any).request({
+          method: 'POST',
+          url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/managers/add_managers`,
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      }
+      if (res.code === 0 || res.code === undefined) {
+        const added = Array.isArray(res.data?.chat_managers) ? res.data.chat_managers : filtered;
+        return { ok: true, addedManagers: added };
+      }
+      lastError = `${res.msg ?? 'unknown'} (code: ${res.code})`;
+      if (isPermanentChatManagerErrorCode(res.code)) {
+        logger.warn(
+          `[groups-store] addChatManagers permanent error code=${res.code} (${res.msg}) for chat=${chatId.substring(0, 12)}, skipping retry`,
+        );
+        return { ok: false, error: lastError };
+      }
+    } catch (e: any) {
+      lastError = e?.message ?? String(e);
+      const errCode = getLarkErrorCode(e);
+      if (isPermanentChatManagerErrorCode(errCode)) {
+        logger.warn(
+          `[groups-store] addChatManagers permanent thrown error code=${errCode} for chat=${chatId.substring(0, 12)}, skipping retry`,
+        );
+        return { ok: false, error: lastError };
+      }
+    }
+    if (attempt <= maxRetries) {
+      logger.info(
+        `[groups-store] addChatManagers attempt ${attempt} transient failure for chat=${chatId.substring(0, 12)} (${lastError}); retrying in ${retryDelayMs * attempt}ms...`,
+      );
+      await new Promise(r => setTimeout(r, retryDelayMs * attempt));
+    }
+  }
+
+  return { ok: false, error: lastError };
+}
+
+/**
+ * Disband a chat the calling bot OWNS. Used by the session-group birth flow
+ * to clean up an orphan group when the initiating user's invite was rejected
+ * — the group can never serve as a conversation home, so leaving it behind
+ * would strand an empty bot-owned chat in the tenant (PR review).
+ *
+ * Calls DELETE /open-apis/im/v1/chats/:chat_id (owner-only).
+ */
+export async function deleteChat(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await (client as any).im.v1.chat.delete({
+      path: { chat_id: chatId },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message ?? String(e) };
+  }
+}
+
+/** Fresh (uncached) chat name; undefined when the lookup fails. */
+export async function getChatName(larkAppId: string, chatId: string): Promise<string | undefined> {
+  const client = getBotClient(larkAppId);
+  try {
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+    if (res.code !== 0 && res.code !== undefined) return undefined;
+    return typeof res.data?.name === 'string' ? res.data.name.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fetch the current owner of a chat (open_id by default, optionally union_id).
+ * Used by group-creator to
  * verify the post-transfer state when transferChatOwner returns an error —
  * Lark sometimes ACKs a transfer slowly (e.g. 504 Gateway Timeout) even though
  * the server-side write succeeded, so a follow-up read disambiguates "really
@@ -154,12 +408,14 @@ export async function transferChatOwner(
  * callers treat undefined as "unknown" and keep the original error.
  */
 export async function getChatOwner(
-  larkAppId: string, chatId: string,
+  larkAppId: string,
+  chatId: string,
+  userIdType: 'open_id' | 'union_id' = 'open_id',
 ): Promise<string | undefined> {
   const client = getBotClient(larkAppId);
   try {
     const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
-      user_id_type: 'open_id',
+      user_id_type: userIdType,
     });
     if (res.code !== 0 && res.code !== undefined) return undefined;
     const owner = res.data?.owner_id;
@@ -220,8 +476,8 @@ export async function disbandChat(
   const client = getBotClient(larkAppId);
   try {
     const res: any = await (client as any).im.v1.chat.delete({ path: { chat_id: chatId } });
-    if (res.code !== 0 && res.code !== undefined) {
-      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    if (res?.code !== 0) {
+      return { ok: false, error: `${res?.msg ?? 'missing API success acknowledgement'} (code: ${res?.code})` };
     }
     return { ok: true };
   } catch (e: any) {
@@ -304,7 +560,15 @@ export async function addUsersToChatByUnionId(
   chatId: string,
   unionIds: string[],
 ): Promise<{ invalidUserIds: string[] }> {
-  const ids = Array.from(new Set(unionIds.filter(Boolean)));
+  return addUsersToChatById(proxyLarkAppId, chatId, unionIds, 'union_id');
+}
+
+export async function addUsersToChatByOpenId(proxyLarkAppId: string, chatId: string, ids: string[]): Promise<{ invalidUserIds: string[] }> {
+  return addUsersToChatById(proxyLarkAppId, chatId, ids, 'open_id');
+}
+
+async function addUsersToChatById(proxyLarkAppId: string, chatId: string, userIds: string[], memberIdType: 'open_id' | 'union_id'): Promise<{ invalidUserIds: string[] }> {
+  const ids = Array.from(new Set(userIds.filter(Boolean)));
   if (ids.length === 0) return { invalidUserIds: [] };
   const client = getBotClient(proxyLarkAppId);
   // Add ONE id per call: Lark fails the WHOLE batch (HTTP 400, code 232024) if any
@@ -315,7 +579,7 @@ export async function addUsersToChatByUnionId(
     try {
       const res: any = await (client as any).im.v1.chatMembers.create({
         path: { chat_id: chatId },
-        params: { member_id_type: 'union_id' },
+        params: { member_id_type: memberIdType },
         data: { id_list: [id] },
       });
       if (res.code !== 0 && res.code !== undefined) {
@@ -332,4 +596,131 @@ export async function addUsersToChatByUnionId(
     }
   }
   return { invalidUserIds };
+}
+
+/**
+ * 「进群自动拉 owner」：本 bot 被加进群（im.chat.member.bot.added_v1）时，把
+ * 自己的 owner 拉进群——bot 应始终处于 owner 可见的群里（不打黑工；与
+ * federated-group 的 owner-in-group 策略同源，这里是单点兜底，使任意来源的
+ * 拉群动作（/invite、手动添加、平台批量添加）都收敛到同一行为）。
+ *
+ * 与 handleBotAdded 的 autoStart 流程完全解耦：不受 autoStartOnGroupJoin 开关
+ * 影响、不 spawn 会话、失败只记日志不打扰群（飞书自身会展示「xx 邀请 xx 入群」
+ * 系统消息，无需我们再发一条）。
+ *
+ * 用 open_id + 自身 app scope 即可（owner 是本 bot 配置里的用户，open_id 天然
+ * 在本 app 域内；chatMembers.create 由本 bot 自己发起，已在群/无权限等一律容错）。
+ */
+export type OwnerGroupJoinResult = 'added' | 'already' | 'skipped' | 'failed';
+
+export async function autoInviteOwnerOnGroupJoin(
+  larkAppId: string,
+  chatId: string,
+  operatorOpenId?: string,
+): Promise<OwnerGroupJoinResult> {
+  let bot: ReturnType<typeof getBot>;
+  let ownerOpenId: string | undefined;
+  try {
+    bot = getBot(larkAppId);
+    ownerOpenId = getOwnerOpenId(larkAppId);
+  } catch (e: any) {
+    logger.warn(`[groups] autoInviteOwner: bot lookup failed for ${larkAppId}: ${e?.message ?? e}`);
+    return 'failed';
+  }
+  // 显式 false 关闭（告警/oncall 类 bot 被平台批量拉群、不想打扰 owner 的场景）。
+  if (bot.config.autoInviteOwnerOnGroupAdd === false) return 'skipped';
+  if (!ownerOpenId) return 'skipped';
+  // owner 自己把 bot 拉进来的 → 无需再拉。
+  if (operatorOpenId && operatorOpenId === ownerOpenId) return 'already';
+
+  const client = getBotClient(larkAppId);
+  try {
+    // 预查一次成员表避免对「owner 早已在群」的常态产生无意义写（也顺带发现
+    // 无权限拉人场景的提前失败；查不到就照样 try-add，API 自身容错）。
+    const params: Record<string, string> = { member_id_type: 'open_id', page_size: '100' };
+    const res = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+    if ((res.code === 0 || res.code === undefined) && Array.isArray(res.data?.items)) {
+      if (res.data.items.some((it: any) => it?.member_id === ownerOpenId)) return 'already';
+    }
+  } catch {
+    // 成员表拿不到不阻断（D7 同款思路：静默拿不到 ≠ 不在群），交给 add 的返回判定。
+  }
+
+  try {
+    const res: any = await (client as any).im.v1.chatMembers.create({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id' },
+      data: { id_list: [ownerOpenId] },
+    });
+    if (res.code !== 0 && res.code !== undefined) {
+      logger.warn(`[groups] autoInviteOwner rejected: code=${res.code} msg=${res.msg} (bot=${larkAppId} chat=${chatId})`);
+      return 'failed';
+    }
+    if (Array.isArray(res.data?.invalid_id_list) && res.data.invalid_id_list.includes(ownerOpenId)) {
+      logger.warn(`[groups] autoInviteOwner: owner open_id invalid (visibility scope?) (bot=${larkAppId} chat=${chatId})`);
+      return 'failed';
+    }
+    logger.info(`[groups] autoInviteOwner: pulled owner into chat=${chatId} (bot=${larkAppId})`);
+    return 'added';
+  } catch (e: any) {
+    const code = e?.response?.data?.code ?? e?.code;
+    logger.warn(`[groups] autoInviteOwner threw: code=${code} ${e?.message ?? e} (bot=${larkAppId} chat=${chatId})`);
+    return 'failed';
+  }
+}
+
+export interface ChatMemberDisplay {
+  openId: string;
+  name: string;
+  memberType: 'user' | 'bot' | 'unknown';
+}
+
+export async function listChatMemberDisplays(larkAppId: string, chatId: string): Promise<ChatMemberDisplay[]> {
+  const client = getBotClient(larkAppId);
+  const out: ChatMemberDisplay[] = [];
+  const seen = new Map<string, number>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const params: Record<string, string> = {
+      member_id_type: 'open_id',
+      page_size: '100',
+      with_member_name: 'true',
+    };
+    if (pageToken) params.page_token = pageToken;
+    const res: any = await larkGet(client, `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`, params);
+    if (res.code !== 0 && res.code !== undefined) {
+      throw new Error(`Failed to list chat members: ${res.msg} (code: ${res.code})`);
+    }
+    for (const item of res.data?.items ?? []) {
+      const openId = String(item?.member_id ?? '').trim();
+      if (!openId) continue;
+      const name = String(item?.name ?? item?.member_name ?? item?.display_name ?? openId).trim() || openId;
+      const typeRaw = String(item?.member_type ?? item?.type ?? '').trim();
+      const memberType: ChatMemberDisplay['memberType'] = typeRaw === 'bot' || typeRaw === 'app'
+        ? 'bot'
+        : typeRaw === 'user' ? 'user' : 'unknown';
+      seen.set(openId, out.length);
+      out.push({ openId, name, memberType });
+    }
+    if (!res.data?.has_more || !res.data?.page_token) break;
+    pageToken = res.data.page_token;
+  }
+  try {
+    const bots = await listChatBotMembers(larkAppId, chatId);
+    for (const bot of bots) {
+      const openId = String(bot.openId ?? '').trim();
+      if (!openId) continue;
+      const name = String(bot.displayName ?? bot.name ?? openId).trim() || openId;
+      const existing = seen.get(openId);
+      if (existing === undefined) {
+        seen.set(openId, out.length);
+        out.push({ openId, name, memberType: 'bot' });
+      } else {
+        out[existing] = { openId, name, memberType: 'bot' };
+      }
+    }
+  } catch (err) {
+    logger.debug(`Failed to merge chat bot displays for ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return out;
 }

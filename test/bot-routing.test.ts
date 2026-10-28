@@ -1,103 +1,12 @@
-/**
- * Unit tests for `botmux send` same-name bot disambiguation.
- *
- * Regression: bots-info.json can hold multiple entries with the same
- * `botName` (multi-tenant deployments running two apps under the same
- * display name). Cross-ref reverse lookup used `Array.find` on botName,
- * which silently routed to whichever entry sorted first — typically not
- * the one bound to the outbound chat. `pickBotEntryByName` now prefers
- * the entry whose `oncallChats` includes the outbound `chatId`.
- */
 import { describe, it, expect } from 'vitest';
 import {
   buildFooterAddressing,
   hasKnownBotMention,
+  mentionedBotAppIds,
   orderedFooterRecipients,
-  pickBotEntryByName,
+  stripCodeSpans,
+  codeSpanRanges,
 } from '../src/utils/bot-routing.js';
-
-type Entry = { larkAppId: string; botName: string | null };
-
-const ENTRY_COCO_UNBOUND: Entry = { larkAppId: 'cli_coco_unbound', botName: 'CoCo' };
-const ENTRY_COCO_BOUND: Entry = { larkAppId: 'cli_coco_bound', botName: 'CoCo' };
-const ENTRY_CLAUDE: Entry = { larkAppId: 'cli_claude', botName: 'Claude' };
-const TARGET_CHAT = 'oc_target_chat';
-
-describe('pickBotEntryByName', () => {
-  it('returns undefined when no entry matches the name', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_CLAUDE],
-      'CoCo',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toBeUndefined();
-  });
-
-  it('returns the sole match when only one entry has the name', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_CLAUDE, ENTRY_COCO_UNBOUND],
-      'CoCo',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('prefers the same-named bot bound to the outbound chat over the first match', () => {
-    // bots-info.json order: unbound CoCo first, bound CoCo second.
-    // Without oncall preference, Array.find would silently return unbound.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set([TARGET_CHAT])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      TARGET_CHAT,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_BOUND);
-  });
-
-  it('falls back to the first match when no candidate is bound to the chat', () => {
-    // None bound — preserve old behavior (route to whichever bots-info.json
-    // sorts first) so single-instance deployments keep working unchanged.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set(['oc_some_other_chat'])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      TARGET_CHAT,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('falls back to the first match when targetChatId is missing', () => {
-    // Top-level publish (no specific chat) — no preference to apply.
-    const oncallChatsByApp = new Map([
-      [ENTRY_COCO_BOUND.larkAppId, new Set([TARGET_CHAT])],
-    ]);
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND, ENTRY_COCO_BOUND],
-      'CoCo',
-      undefined,
-      oncallChatsByApp,
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-
-  it('matches case-insensitively', () => {
-    const result = pickBotEntryByName(
-      [ENTRY_COCO_UNBOUND],
-      'coco',
-      TARGET_CHAT,
-      new Map(),
-    );
-    expect(result).toEqual(ENTRY_COCO_UNBOUND);
-  });
-});
 
 describe('hasKnownBotMention', () => {
   const entries = [
@@ -143,6 +52,20 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
 
+  it('uses the current caller for a substitute-triggered reply outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_substitute_caller' },
+      { isOncall: false, isSubstitute: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_substitute_caller', cc: [] });
+  });
+
+  it('lets an explicit human recipient replace the default owner outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_caller' },
+      { isOncall: false, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
   it('uses the last caller in oncall chats when the caller is human', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },
@@ -150,18 +73,27 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_human_caller', cc: [] });
   });
 
-  it('falls back to the human owner when the body explicitly targets a bot', () => {
+  it('does not append the caller when an explicit human recipient was selected', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_triggering_bot' },
+      { isOncall: true, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
+  it('suppresses owner addressing in oncall when the body explicitly targets a bot', () => {
+    // Handoff to another bot: the default owner-courtesy ping is redundant noise
+    // and is dropped. A human is looped in only via explicit --mention-back.
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_claude_bot' },
       { isOncall: true, hasExplicitBotMention: true, knownBotOpenIds },
-    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
-  it('keeps human owner footer outside oncall when explicitly targeting a bot', () => {
+  it('suppresses owner addressing outside oncall when explicitly targeting a bot', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },
       { isOncall: false, hasExplicitBotMention: true, knownBotOpenIds },
-    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
   it('drops explicit-bot addressing when the owner is also a bot', () => {
@@ -174,6 +106,13 @@ describe('buildFooterAddressing', () => {
   it('falls back to the human owner when last caller is a bot', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_claude_bot' },
+      { isOncall: true, knownBotOpenIds },
+    )).toEqual({ sendTo: 'ou_owner', cc: [] });
+  });
+
+  it('honors a frozen bot-sender bit even before cross-ref learns that bot id', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_new_bot', lastCallerIsBot: true },
       { isOncall: true, knownBotOpenIds },
     )).toEqual({ sendTo: 'ou_owner', cc: [] });
   });
@@ -233,5 +172,103 @@ describe('orderedFooterRecipients', () => {
 
   it('returns empty when nothing to address', () => {
     expect(orderedFooterRecipients({})).toEqual([]);
+  });
+});
+
+describe('stripCodeSpans', () => {
+  // The prose `@Bot` auto-injection scans this stripped copy: a bot name inside
+  // code must NOT survive (else it wakes a bot the model only quoted), while a
+  // name in real prose must survive so a genuine handoff still fires.
+  const hasAt = (s: string, name: string) =>
+    new RegExp(`@${name}(?![\\p{L}\\p{N}_])`, 'u').test(stripCodeSpans(s));
+
+  it('blanks an inline single-backtick code span', () => {
+    expect(hasAt('示例：`botmux send --mention @Codex …`', 'Codex')).toBe(false);
+  });
+
+  it('blanks a double-backtick code span', () => {
+    expect(hasAt('写成 ``@Codex`` 只是举例', 'Codex')).toBe(false);
+  });
+
+  it('blanks a fenced code block', () => {
+    expect(hasAt('```\nbotmux send --mention @Codex\n```', 'Codex')).toBe(false);
+  });
+
+  it('blanks a tilde-fenced code block', () => {
+    expect(hasAt('~~~\nbotmux send --mention @Codex\n~~~', 'Codex')).toBe(false);
+  });
+
+  it('keeps @Bot inside ~~strikethrough~~ (not a fence)', () => {
+    expect(hasAt('~~@Codex~~ 还是要 @', 'Codex')).toBe(true);
+  });
+
+  it('keeps a real prose @Bot so genuine handoffs still match', () => {
+    expect(hasAt('@Codex 你接手一下', 'Codex')).toBe(true);
+  });
+
+  it('keeps prose @Bot even when the same name is also quoted in code', () => {
+    // real handoff in prose + an incidental code mention → still detected
+    expect(hasAt('@Codex 看这条 `--mention @Codex`', 'Codex')).toBe(true);
+  });
+
+  it('leaves an unbalanced stray backtick harmless (name still in prose)', () => {
+    expect(hasAt('这里有个 ` 未闭合，@Codex 仍要 @', 'Codex')).toBe(true);
+  });
+
+  // Previous two-regex form of stripCodeSpans; the range-based one must agree.
+  const legacyStrip = (text: string) => text
+    .replace(/(`{3,}|~{3,})[\s\S]*?\1/g, ' ')
+    .replace(/(`+)[\s\S]*?\1/g, ' ');
+
+  it('keeps stripCodeSpans identical to the previous two-pass regex form', () => {
+    for (const text of [
+      '',
+      'plain @Codex',
+      '`a` b ``c`` d',
+      '```\nx\n``` y `z`',
+      '~~~\n@C\n~~~ ~~strike~~',
+      'stray ` then ```\nfence\n``` and ` again',
+      '`` ` `` and ```js\n`inner`\n```',
+      'open ``` never closed `x`',
+      '```\nx\n```' + '`y`' + '`z`',
+    ]) {
+      expect(stripCodeSpans(text)).toBe(legacyStrip(text));
+    }
+  });
+});
+
+describe('codeSpanRanges', () => {
+  it('returns sorted [start, end) offsets for inline spans and fences', () => {
+    const text = 'a `x` b\n```\ny\n```\nc';
+    expect(codeSpanRanges(text)).toEqual([[2, 5], [8, 17]]);
+  });
+});
+
+describe('mentionedBotAppIds', () => {
+  const entries = [
+    { larkAppId: 'cli_self', botName: 'Ayla', botOpenId: 'ou_self_own' },
+    { larkAppId: 'cli_claude', botName: 'Claude', botOpenId: 'ou_claude_own' },
+    { larkAppId: 'cli_codex', botName: 'Codex' },
+  ];
+  const crossRef = { Claude: 'ou_claude_seen_by_self', Codex: 'ou_codex_seen_by_self', Ayla: 'ou_self_seen' };
+
+  it('resolves mentioned bots by the open_id this app sees them as', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_claude_own' }, { open_id: 'ou_codex_seen_by_self' },
+    ], entries, crossRef, 'cli_self')).toEqual(['cli_codex', 'cli_claude']);
+  });
+
+  it('does not guess between two bots that share a name', () => {
+    // Either listing order: neither bot may claim the name's open_id.
+    const twins = [{ larkAppId: 'cli_codex_2', botName: 'Codex', botOpenId: 'ou_codex2_own' }, ...entries];
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }], [...entries, twins[0]], crossRef, 'cli_self')).toEqual([]);
+    expect(mentionedBotAppIds([{ open_id: 'ou_codex_seen_by_self' }, { open_id: 'ou_codex2_own' }],
+      twins, crossRef, 'cli_self')).toEqual(['cli_codex_2']);
+  });
+
+  it('never trusts a display name, a human, or this bot itself', () => {
+    expect(mentionedBotAppIds([
+      { open_id: 'ou_human', name: 'Claude' }, { open_id: 'ou_self_seen' }, { open_id: 'ou_self_own' },
+    ], entries, crossRef, 'cli_self')).toEqual([]);
   });
 });

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/adapters/backend/pty-backend.js', () => ({
   PtyBackend: class MockPtyBackend {},
@@ -18,31 +18,83 @@ vi.mock('../src/adapters/backend/tmux-pipe-backend.js', () => ({
   },
 }));
 
+vi.mock('../src/adapters/backend/herdr-backend.js', () => ({
+  HerdrBackend: class MockHerdrBackend {
+    static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static managedSessionName = vi.fn(() => 'botmux');
+    static defaultAgentName = vi.fn(() => 'botmux');
+    static hasSession = vi.fn(() => false);
+    static probeSession = vi.fn(() => 'missing');
+    static hasAgent = vi.fn(() => false);
+    static probeAgent = vi.fn(() => 'missing');
+    static killAgent = vi.fn();
+    constructor(public sessionName: string, public opts?: unknown) {}
+  },
+}));
+
+vi.mock('../src/adapters/backend/zellij-backend.js', () => ({
+  ZellijBackend: class MockZellijBackend {
+    static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static hasSession = vi.fn(() => false);
+    constructor(public sessionName: string, public opts?: unknown) {}
+  },
+}));
+
+vi.mock('../src/adapters/backend/zmx-backend.js', () => ({
+  ZmxBackend: class MockZmxBackend {
+    static sessionName = vi.fn((id: string) => `bmx-${id.slice(0, 8)}`);
+    static hasSession = vi.fn(() => false);
+    constructor(public sessionName: string, public opts?: unknown) {}
+  },
+}));
+
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
-import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
+import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import { ZellijBackend } from '../src/adapters/backend/zellij-backend.js';
+import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import * as zmxSetup from '../src/setup/ensure-zmx.js';
+import {
+  backendSandboxCompatibilityError,
+  isStrongManagedHerdrAgentName,
+  managedHerdrAgentName,
+  retireSupersededRecordedHerdrTarget,
+  selectSessionBackend,
+} from '../src/adapters/backend/session-backend-selector.js';
 
 describe('selectSessionBackend', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(() => {
+    vi.clearAllMocks();
     vi.mocked(TmuxBackend.hasSession).mockReset();
     vi.mocked(TmuxBackend.sessionName).mockClear();
+    vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('missing');
+    vi.mocked(HerdrBackend.hasAgent).mockReturnValue(false);
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    vi.mocked(HerdrBackend.killAgent).mockReset();
   });
 
   it('uses owned pipe backend when reattaching to an existing tmux session', () => {
     vi.mocked(TmuxBackend.hasSession).mockReturnValue(true);
 
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: true });
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
     expect(selected.isTmuxMode).toBe(true);
     expect(selected.isPipeMode).toBe(true);
     expect(selected.backend.constructor.name).toBe('MockTmuxPipeBackend');
     expect((selected.backend as any).paneTarget).toBe('bmx-9cfa0024');
     expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'tmux',
+      sessionName: 'bmx-9cfa0024',
+    });
   });
 
   it('uses managed pipe backend for a new tmux session', () => {
     vi.mocked(TmuxBackend.hasSession).mockReturnValue(false);
 
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: true });
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'tmux' });
 
     expect(selected.isTmuxMode).toBe(true);
     expect(selected.isPipeMode).toBe(true);
@@ -51,11 +103,586 @@ describe('selectSessionBackend', () => {
     expect((selected.backend as any).opts).toEqual({ createSession: true, ownsSession: true });
   });
 
-  it('uses pty backend when tmux is disabled', () => {
-    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', useTmux: false });
+  it('uses pty backend when backend is pty', () => {
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'pty' });
 
     expect(selected.isTmuxMode).toBe(false);
     expect(selected.isPipeMode).toBe(false);
+    expect(selected.isZellijMode).toBe(false);
     expect('tmuxBackend' in selected).toBe(false);
+  });
+
+  it('creates the machine-wide botmux Herdr host and a topic-specific agent', () => {
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+    });
+
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts).toEqual({
+      createSession: true,
+      agentName: 'botmux-9ak8itbj1fuif1tinpg625vnk',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'botmux',
+      agentName: 'botmux-9ak8itbj1fuif1tinpg625vnk',
+    });
+    expect(selected.createdHerdrSessionName).toBe('botmux');
+  });
+
+  it('uses the full UUID identity within Herdr 0.7.5 naming limits', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux');
+    const first = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+    });
+    const second = selectSessionBackend({
+      sessionId: '9cfa0024-ffff-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+    });
+
+    const firstName = first.persistentBackendTarget?.backendType === 'herdr'
+      ? first.persistentBackendTarget.agentName
+      : undefined;
+    const secondName = second.persistentBackendTarget?.backendType === 'herdr'
+      ? second.persistentBackendTarget.agentName
+      : undefined;
+    expect(firstName).toMatch(/^botmux-[0-9a-z]{25}$/);
+    expect(secondName).toMatch(/^botmux-[0-9a-z]{25}$/);
+    expect(firstName).toHaveLength(32);
+    expect(secondName).not.toBe(firstName);
+    expect(HerdrBackend.hasAgent).toHaveBeenNthCalledWith(
+      1,
+      'botmux',
+      'botmux-9ak8itbj1fuif1tinpg625vnk',
+    );
+    expect(HerdrBackend.hasAgent).toHaveBeenNthCalledWith(
+      2,
+      'botmux',
+      'botmux-9ak8itig13ioazl4vy0ks7vy8',
+    );
+  });
+
+  it('puts another bot or topic agent in the same machine-wide botmux host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux');
+
+    const selected = selectSessionBackend({
+      sessionId: 'fedcba98-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+    });
+
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts).toEqual({
+      createSession: false,
+      agentName: 'botmux-f36n7gsju73m9n07tm5ajhdhc',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    expect(selected.createdHerdrSessionName).toBeUndefined();
+  });
+
+  it('reattaches a persisted legacy short Herdr target even when current/default changed', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('exists');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+    // A stray deterministic session must not outrank the durable shared target
+    // selected by the prior worker generation.
+    vi.mocked(HerdrBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'original-work',
+        agentName: 'botmux-9cfa0024',
+      },
+    });
+
+    expect((selected.backend as any).sessionName).toBe('original-work');
+    expect((selected.backend as any).opts).toEqual({
+      agentName: 'botmux-9cfa0024',
+      isReattach: true,
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'herdr',
+      sessionName: 'original-work',
+      agentName: 'botmux-9cfa0024',
+    });
+  });
+
+  it('fails closed when the recorded shared Herdr target cannot be probed', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('unknown');
+
+    expect(() => selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'original-work',
+        agentName: 'botmux-9cfa0024',
+      },
+    })).toThrow('recorded herdr session original-work probe inconclusive');
+  });
+
+  it('recreates a missing persisted legacy short agent in its recorded shared Herdr host', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('exists');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'original-work',
+        agentName: 'botmux-9cfa0024',
+      },
+    });
+
+    expect((selected.backend as any).sessionName).toBe('original-work');
+    expect((selected.backend as any).opts).toEqual({
+      agentName: 'botmux-9cfa0024',
+      isReattach: false,
+      ownsSession: false,
+      ownsAgent: true,
+    });
+  });
+
+  it('moves to the scoped shared target when reuse is disabled and the legacy host is absent', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('missing');
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux');
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      herdrOwnershipScope: '/tmp/botmux-root-a',
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'original-work',
+        agentName: 'botmux-9cfa0024',
+      },
+    });
+
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect((selected.backend as any).opts).toMatchObject({
+      agentName: managedHerdrAgentName(
+        '9cfa0024-197d-4781-845b-c541dceb8980',
+        '/tmp/botmux-root-a',
+      ),
+      ownsSession: false,
+      ownsAgent: true,
+    });
+    expect(HerdrBackend.probeSession).toHaveBeenCalledWith('bmx-9cfa0024');
+    expect(HerdrBackend.probeAgent).not.toHaveBeenCalled();
+  });
+
+  it('refuses isolation/MCP migration while a legacy exclusive Herdr host is live', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('exists');
+
+    expect(() => selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      herdrOwnershipScope: '/tmp/botmux-root-a',
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'bmx-9cfa0024',
+      },
+    })).toThrow('legacy herdr session bmx-9cfa0024 is still live');
+    expect(HerdrBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the legacy exclusive Herdr host cannot be probed during migration', () => {
+    vi.mocked(HerdrBackend.probeSession).mockReturnValue('unknown');
+
+    expect(() => selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'herdr',
+      herdrOwnershipScope: '/tmp/botmux-root-a',
+      reuseRecordedHerdrTarget: false,
+    })).toThrow('legacy herdr session bmx-9cfa0024 probe inconclusive');
+    expect(HerdrBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('uses zellij backend when backend is zellij', () => {
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(false);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect(selected.isZellijMode).toBe(true);
+    expect(selected.isTmuxMode).toBe(false);
+    expect(selected.isPipeMode).toBe(false);
+    expect(selected.backend.constructor.name).toBe('MockZellijBackend');
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'auto' });
+  });
+
+  it('marks an existing zellij session as reattach without making it pipe mode', () => {
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect(selected.isZellijMode).toBe(true);
+    expect(selected.isPipeMode).toBe(false);
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
+  });
+
+  // F1 regression: the worker resolves zellij existence through a tri-state
+  // probe ONCE and biases an indeterminate answer toward reattach, then threads
+  // that frozen decision in as `hasExistingSession`. The selector must honour
+  // it verbatim — a bare `hasSession()` re-probe here would re-run the same
+  // load-fragile `list-sessions` and, on a sustained-load `false`, do a FRESH
+  // spawn that collides with the still-live named session ("Session already
+  // exists"), which is exactly the crash-loop the gate exemption was meant to
+  // avoid.
+  it('reattaches zellij on a threaded-in existence decision even when a live re-probe would say false', () => {
+    // Simulate the sustained-load case: hasSession() (the re-probe) returns
+    // false, but the frozen decision from the gate is "treat as present".
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(false);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'zellij',
+      hasExistingSession: true,
+    });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'frozen' });
+    // The threaded decision must WIN — the live re-probe must not be consulted.
+    expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('cold-spawns zellij on a threaded-in absent decision even if a live re-probe would say true', () => {
+    // Post-kill gates reset the frozen probe to "gone"; a stale live re-probe
+    // saying true must NOT resurrect a reattach to the pane just torn down.
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'zellij',
+      hasExistingSession: false,
+    });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: false, reattachDecision: 'frozen' });
+    expect(ZellijBackend.hasSession).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a live zellij hasSession probe (auto mode) when no decision is threaded in', () => {
+    // Default callers / tests that do not thread a frozen decision keep the old
+    // behaviour: consult the live probe AND let spawn() self-heal (auto).
+    vi.mocked(ZellijBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zellij' });
+
+    expect((selected.backend as any).opts).toEqual({ ownsSession: true, isReattach: true, reattachDecision: 'auto' });
+    expect(ZellijBackend.hasSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses zmx tail signals, history snapshots, and send as a managed pipe backend', () => {
+    // Directory discovery belongs to ensure-zmx; backend selection must not
+    // depend on a locally installed zmx binary or the test runner's TMPDIR.
+    const socketDir = '/tmp/botmux-test-zmx';
+    const resolveSocketDir = vi.spyOn(zmxSetup, 'resolveZmxSocketDir').mockReturnValue(socketDir);
+    vi.mocked(ZmxBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zmx' });
+
+    expect(selected.isZellijMode).toBe(false);
+    expect(selected.isTmuxMode).toBe(false);
+    expect(selected.isPipeMode).toBe(true);
+    expect(selected.backend.constructor.name).toBe('MockZmxBackend');
+    expect((selected.backend as any).opts).toEqual({
+      ownsSession: true,
+      isReattach: true,
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      socketDir,
+    });
+    expect(resolveSocketDir).toHaveBeenCalledTimes(1);
+    expect(ZmxBackend.hasSession).toHaveBeenCalledWith(
+      'bmx-9cfa0024', expect.objectContaining({ ZMX_DIR: socketDir }),
+    );
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'zmx', sessionName: 'bmx-9cfa0024', socketDir,
+    });
+  });
+
+  // ── Owned isolation/MCP Herdr host: agent-precise reattach-vs-fresh (generational
+  //    race symmetric case). host = bmx-<sid8>. Must use TRI-STATE probes; NEVER
+  //    predict reattach from the session alone (a live host whose botmux agent
+  //    vanished would loop the backend's frozen reattach guard, and the worker
+  //    would have skipped the PENDING + credential wrapper cold-path). ──
+  const OWNED_SID = 'aabbccdd-197d-4781-845b-c541dceb8980';
+  const ownedHost = `bmx-${OWNED_SID.slice(0, 8)}`;
+
+  it('owned host + agent BOTH exist → warm reattach the same owned host', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    expect(selected.isReattach).toBe(true);
+    expect((selected.backend as any).opts.isReattach).toBe(true);
+  });
+
+  it('owned host EXISTS but agent MISSING → cold start IN the same host (isReattach:false), no teardown, no migrate to shared', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // SAME owned host retained (not migrated to the shared 'botmux' host)…
+    expect((selected.backend as any).sessionName).toBe(ownedHost);
+    // …but cold: worker will write PENDING + assemble the credential wrapper first.
+    expect(selected.isReattach).toBe(false);
+    expect((selected.backend as any).opts.isReattach).toBe(false);
+    // Never tore down the still-live host.
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host exists but agent probe UNKNOWN → refuse (no kill, no spawn)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === ownedHost);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'exists' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('unknown');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/agent .* probe inconclusive|reattach-vs-fresh/);
+    expect(vi.mocked(HerdrBackend.killAgent)).not.toHaveBeenCalled();
+  });
+
+  it('owned host probe UNKNOWN → refuse (never fail-open by collapsing unknown to a fresh migrate)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockReturnValue(false);
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'unknown' : 'missing');
+    expect(() => selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' }))
+      .toThrow(/owned herdr session .* probe inconclusive|reattach-vs-fresh/);
+  });
+
+  it('owned host MISSING → migrate to the shared machine-wide botmux host (fresh)', () => {
+    vi.mocked(HerdrBackend.hasSession).mockImplementation(name => name === 'botmux'); // shared exists, owned missing
+    vi.mocked(HerdrBackend.probeSession).mockImplementation(name => name === ownedHost ? 'missing' : 'missing');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('missing');
+    const selected = selectSessionBackend({ sessionId: OWNED_SID, backendType: 'herdr' });
+    // Falls through to the shared 'botmux' host cold path.
+    expect((selected.backend as any).sessionName).toBe('botmux');
+    expect(selected.isReattach).toBe(false);
+  });
+});
+
+describe('superseded Herdr target retirement', () => {
+  const sessionId = '9cfa0024-197d-4781-845b-c541dceb8980';
+  const ownershipScope = '/tmp/botmux-root-a';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(HerdrBackend.probeAgent).mockReset();
+    vi.mocked(HerdrBackend.killAgent).mockReset();
+  });
+
+  it('closes only the exact live strongly-owned agent and verifies it disappeared', () => {
+    const agentName = managedHerdrAgentName(sessionId, ownershipScope);
+    vi.mocked(HerdrBackend.probeAgent)
+      .mockReturnValueOnce('exists')
+      .mockReturnValueOnce('missing');
+
+    expect(() => retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'old-shared-host',
+        agentName,
+      },
+    })).not.toThrow();
+
+    expect(HerdrBackend.killAgent).toHaveBeenCalledOnce();
+    expect(HerdrBackend.killAgent).toHaveBeenCalledWith('old-shared-host', agentName);
+    expect(HerdrBackend.probeAgent).toHaveBeenNthCalledWith(
+      1,
+      'old-shared-host',
+      agentName,
+    );
+    expect(HerdrBackend.probeAgent).toHaveBeenNthCalledWith(
+      2,
+      'old-shared-host',
+      agentName,
+    );
+  });
+
+  it('fails closed when exact strong-agent teardown cannot be verified', () => {
+    const agentName = managedHerdrAgentName(sessionId, ownershipScope);
+    vi.mocked(HerdrBackend.probeAgent)
+      .mockReturnValueOnce('exists')
+      .mockReturnValueOnce('unknown');
+
+    expect(() => retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'old-shared-host',
+        agentName,
+      },
+    })).toThrow(/could not verify.*old-shared-host/);
+
+    expect(HerdrBackend.killAgent).toHaveBeenCalledWith('old-shared-host', agentName);
+  });
+
+  it('does not infer destructive authority over a live legacy short agent', () => {
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+
+    expect(() => retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'user-workspace',
+        agentName: 'botmux-9cfa0024',
+      },
+    })).toThrow(/legacy Herdr target.*user-workspace\/botmux-9cfa0024/);
+
+    expect(HerdrBackend.killAgent).not.toHaveBeenCalled();
+  });
+
+  it('does not kill a strong agent owned by another Botmux data root', () => {
+    const otherRootAgent = managedHerdrAgentName(sessionId, '/tmp/botmux-root-b');
+    vi.mocked(HerdrBackend.probeAgent).mockReturnValue('exists');
+
+    expect(() => retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: {
+        backendType: 'herdr',
+        sessionName: 'other-botmux-host',
+        agentName: otherRootAgent,
+      },
+    })).toThrow(/does not match this Botmux data root/);
+
+    expect(HerdrBackend.killAgent).not.toHaveBeenCalled();
+  });
+
+  it.each(['missing', 'unknown'] as const)(
+    'handles an untrusted legacy target probe of %s without destructive cleanup',
+    (probe) => {
+      vi.mocked(HerdrBackend.probeAgent).mockReturnValue(probe);
+      const run = () => retireSupersededRecordedHerdrTarget({
+        sessionId,
+        ownershipScope,
+        reuseRecordedHerdrTarget: false,
+        persistentBackendTarget: {
+          backendType: 'herdr' as const,
+          sessionName: 'user-workspace',
+          agentName: 'botmux-9cfa0024',
+        },
+      });
+
+      if (probe === 'missing') {
+        expect(run).not.toThrow();
+      } else {
+        expect(run).toThrow(/probe inconclusive.*user-workspace\/botmux-9cfa0024/);
+      }
+      expect(HerdrBackend.killAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('leaves the replacement target and ordinary reuse paths untouched', () => {
+    const agentName = managedHerdrAgentName(sessionId, ownershipScope);
+    const target = {
+      backendType: 'herdr' as const,
+      sessionName: 'botmux',
+      agentName,
+    };
+
+    retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: false,
+      persistentBackendTarget: target,
+    });
+    retireSupersededRecordedHerdrTarget({
+      sessionId,
+      ownershipScope,
+      reuseRecordedHerdrTarget: true,
+      persistentBackendTarget: {
+        ...target,
+        sessionName: 'old-shared-host',
+      },
+    });
+
+    expect(HerdrBackend.probeAgent).not.toHaveBeenCalled();
+    expect(HerdrBackend.killAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe('managed Herdr agent identity', () => {
+  it('uses a deterministic strong fallback for imported non-UUID session ids', () => {
+    const first = managedHerdrAgentName('imported-session-id');
+    const second = managedHerdrAgentName('imported-session-id');
+
+    expect(first).toBe(second);
+    expect(first).toMatch(/^botmux-[0-9a-z]{25}$/);
+    expect(isStrongManagedHerdrAgentName(first)).toBe(true);
+  });
+
+  it('separates the same complete session id across independent data roots', () => {
+    const sessionId = '9cfa0024-197d-4781-845b-c541dceb8980';
+    const first = managedHerdrAgentName(sessionId, '/tmp/botmux-root-a');
+    const second = managedHerdrAgentName(sessionId, '/tmp/botmux-root-b');
+
+    expect(first).toMatch(/^botmux-[0-9a-z]{25}$/);
+    expect(first).toHaveLength(32);
+    expect(second).not.toBe(first);
+  });
+
+  it('distinguishes strong identities from persisted legacy short names', () => {
+    expect(isStrongManagedHerdrAgentName('botmux-9ak8itbj1fuif1tinpg625vnk')).toBe(true);
+    expect(isStrongManagedHerdrAgentName('botmux-9cfa0024')).toBe(false);
+    expect(isStrongManagedHerdrAgentName('botmux-9ak8itbj1fuif1tinpg625vn')).toBe(false);
+    expect(isStrongManagedHerdrAgentName('botmux-9AK8ITBJ1FUIF1TINPG625VNK')).toBe(false);
+  });
+});
+
+describe('backendSandboxCompatibilityError', () => {
+  it('fails closed for local persistent backends outside the isolation wrapper', () => {
+    for (const backendType of ['herdr', 'zellij', 'zmx'] as const) {
+      expect(backendSandboxCompatibilityError({
+        backendType,
+        fileSandboxRequested: true,
+        effectiveReadIsolationRequested: false,
+      })).toContain(`backend "${backendType}"`);
+      expect(backendSandboxCompatibilityError({
+        backendType,
+        fileSandboxRequested: false,
+        effectiveReadIsolationRequested: true,
+      })).toContain(`backend "${backendType}"`);
+    }
+  });
+
+  it('allows unsandboxed persistent backends, wrapper-owned local backends, and remote Riff', () => {
+    expect(backendSandboxCompatibilityError({
+      backendType: 'zmx',
+      fileSandboxRequested: false,
+      effectiveReadIsolationRequested: false,
+    })).toBeUndefined();
+    expect(backendSandboxCompatibilityError({
+      backendType: 'tmux',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: true,
+    })).toBeUndefined();
+    expect(backendSandboxCompatibilityError({
+      backendType: 'pty',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: true,
+    })).toBeUndefined();
+    expect(backendSandboxCompatibilityError({
+      backendType: 'riff',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: true,
+    })).toBeUndefined();
   });
 });

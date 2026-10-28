@@ -14,11 +14,11 @@ vi.mock('../src/config.js', () => ({ config: {
   dashboard: { externalHost: 'localhost', port: 7891 },
 } }));
 
-import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers } from '../src/dashboard/federation-spoke-api.js';
+import { handleFederationSpokeApi, resolveOwnerCandidatesFromAllowedUsers, autoBindOwnerIfUnambiguous } from '../src/dashboard/federation-spoke-api.js';
 import { listMemberships, addMembership } from '../src/services/federation-membership-store.js';
 import { getDeploymentIdentity } from '../src/services/deployment-identity.js';
 import { consumeInvite } from '../src/services/invite-store.js';
-import { DEFAULT_TEAM_ID } from '../src/services/team-store.js';
+import { DEFAULT_TEAM_ID, getTeam } from '../src/services/team-store.js';
 import { registerDeployment, listFederatedDeployments } from '../src/services/federation-store.js';
 import { setBotOwner, getBotOwner } from '../src/services/bot-owner-store.js';
 import { claimPairing } from '../src/services/pairing-store.js';
@@ -45,6 +45,24 @@ const json = (res: any) => JSON.parse(res._body);
 const jsonResp = (status: number, body: any) => ({ ok: status >= 200 && status < 300, status, json: async () => body } as any);
 
 describe('handleFederationSpokeApi', () => {
+  it('hosted feedback: exposes and updates only local team policy without mutating on invalid input', async () => {
+    writeBots([]);
+    let res = makeRes();
+    await handleFederationSpokeApi(makeReq('GET', '/api/team/hosted'), res, url('/api/team/hosted'), { dataDir });
+    expect(json(res).teams[0].feedback).toBeNull();
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', `/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`, { feedback: { enabled: true } }), res, url(`/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`), { dataDir });
+    expect(res.statusCode).toBe(200);
+    expect(json(res).feedback).toMatchObject({ enabled: true });
+    const before = getTeam(dataDir, DEFAULT_TEAM_ID);
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', `/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`, { feedback: { enabled: 'yes' } }), res, url(`/api/team/hosted/${DEFAULT_TEAM_ID}/feedback`), { dataDir });
+    expect(res.statusCode).toBe(400);
+    expect(getTeam(dataDir, DEFAULT_TEAM_ID)).toEqual(before);
+    res = makeRes();
+    await handleFederationSpokeApi(makeReq('PUT', '/api/team/hosted/missing/feedback', { feedback: null }), res, url('/api/team/hosted/missing/feedback'), { dataDir });
+    expect(res.statusCode).toBe(404);
+  });
   it('local: GET /api/team/local returns this deployment + own roster + suggested hub url', async () => {
     writeBots([{ larkAppId: 'cli_me1', botOpenId: null, botName: '我的Bot', cliId: 'claude' }]);
     const res = makeRes();
@@ -101,11 +119,11 @@ describe('handleFederationSpokeApi', () => {
     let res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/start'), res, url('/api/team/identity/start'), { dataDir });
     const { pairingId, code, browserToken } = json(res);
-    claimPairing(dataDir, code, { openId: 'ou_me', unionId: 'on_me', name: '申晗', larkAppId: 'cli_mine' });
+    claimPairing(dataDir, code, { openId: 'ou_me', unionId: 'on_me', name: '示例用户', larkAppId: 'cli_mine' });
     res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/consume', { pairingId, browserToken }), res, url('/api/team/identity/consume'), { dataDir });
     expect(res.statusCode).toBe(200);
-    expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '申晗' });
+    expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '示例用户' });
     // deployment owner bound
     expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me');
     // unassigned bot now owned by me; pre-owned bot NOT stolen
@@ -125,7 +143,7 @@ describe('handleFederationSpokeApi', () => {
     let res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/start'), res, url('/api/team/identity/start'), { dataDir });
     const s = json(res);
-    claimPairing(dataDir, s.code, { openId: 'ou_me', unionId: 'on_me', name: '申晗', larkAppId: 'cli_mine' });
+    claimPairing(dataDir, s.code, { openId: 'ou_me', unionId: 'on_me', name: '示例用户', larkAppId: 'cli_mine' });
     res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/consume', { pairingId: s.pairingId, browserToken: s.browserToken }), res, url('/api/team/identity/consume'), { dataDir, fetcher: fetcher as any });
     expect(res.statusCode).toBe(200);
@@ -149,6 +167,25 @@ describe('handleFederationSpokeApi', () => {
     expect(cands).toEqual([{ unionId: 'on_1', name: '甲' }, { unionId: 'on_2', name: '乙' }]); // ou_1 deduped
   });
 
+  it('resolveOwnerCandidatesFromAllowedUsers skipNames uses direct union IDs without client lookup', async () => {
+    const ensured: string[] = [];
+    const cands = await resolveOwnerCandidatesFromAllowedUsers({
+      skipNames: true,
+      configs: () => ([
+        { larkAppId: 'cli_direct', larkAppSecret: 's', allowedUsers: ['on_direct'] },
+        { larkAppId: 'cli_mail', larkAppSecret: 's', allowedUsers: ['m@x.com'] },
+      ] as any),
+      ensureClient: (cfg) => { ensured.push(cfg.larkAppId); },
+      resolveAllowed: async () => ['ou_mail'],
+      resolveUnion: async () => ({ unionId: 'on_mail', name: 'Mail Owner' }),
+    });
+    expect(ensured).toEqual(['cli_mail']);
+    expect(cands).toEqual([
+      { unionId: 'on_direct', name: '' },
+      { unionId: 'on_mail', name: 'Mail Owner' },
+    ]);
+  });
+
   it('identity/auto-bind: single candidate binds owner + owns bots (no /pair) + pushes to hub', async () => {
     writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
     addMembership(dataDir, { hubUrl: 'http://hub:7891', teamId: 'default', teamName: 'T', syncToken: 'STOK', deploymentId: 'dep_me' });
@@ -156,9 +193,9 @@ describe('handleFederationSpokeApi', () => {
     const fetcher = vi.fn(async (u: any, init: any) => { if (String(u).endsWith('/api/federation/sync')) synced = JSON.parse(init.body); return jsonResp(200, { ok: true }); });
     const res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', {}), res, url('/api/team/identity/auto-bind'),
-      { dataDir, fetcher: fetcher as any, ownerCandidates: async () => [{ unionId: 'on_me', name: '申晗' }] });
+      { dataDir, fetcher: fetcher as any, ownerCandidates: async () => [{ unionId: 'on_me', name: '示例用户' }] });
     expect(res.statusCode).toBe(200);
-    expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '申晗' });
+    expect(json(res).owner).toMatchObject({ unionId: 'on_me', name: '示例用户' });
     expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me'); // bound, no /pair
     expect(getBotOwner(dataDir, 'cli_a')!.unionId).toBe('on_me');       // owns local bot
     expect(synced).toMatchObject({ ownerUnionId: 'on_me' });            // pushed to hub
@@ -183,6 +220,38 @@ describe('handleFederationSpokeApi', () => {
     await handleFederationSpokeApi(makeReq('POST', '/api/team/identity/auto-bind', {}), res, url('/api/team/identity/auto-bind'), { dataDir, ownerCandidates: async () => [] });
     expect(json(res).ok).toBe(false);
     expect(json(res).error).toBe('no_candidates');
+  });
+
+  // Headless startup auto-bind (dashboard boot path): same resolution, no HTTP.
+  it('autoBindOwnerIfUnambiguous: single candidate binds owner + claims bots (no click)', async () => {
+    writeBots([{ larkAppId: 'cli_a', botOpenId: null, botName: 'A', cliId: 'claude' }]);
+    const r = await autoBindOwnerIfUnambiguous(dataDir, { ownerCandidates: async () => [{ unionId: 'on_me', name: '示例用户' }] });
+    expect(r.status).toBe('bound');
+    expect(r.owner).toMatchObject({ unionId: 'on_me', name: '示例用户' });
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me');
+    expect(getBotOwner(dataDir, 'cli_a')!.unionId).toBe('on_me');
+  });
+
+  it('autoBindOwnerIfUnambiguous: already bound → no-op, does NOT re-resolve', async () => {
+    await autoBindOwnerIfUnambiguous(dataDir, { ownerCandidates: async () => [{ unionId: 'on_me', name: '示例用户' }] });
+    const spy = vi.fn(async () => [{ unionId: 'on_other', name: '别人' }]);
+    const r = await autoBindOwnerIfUnambiguous(dataDir, { ownerCandidates: spy });
+    expect(r.status).toBe('already_bound');
+    expect(spy).not.toHaveBeenCalled();                                 // no wasted Feishu call
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBe('on_me');  // unchanged
+  });
+
+  it('autoBindOwnerIfUnambiguous: multiple candidates → need_choice, stays unbound', async () => {
+    const r = await autoBindOwnerIfUnambiguous(dataDir, { ownerCandidates: async () => [{ unionId: 'on_1', name: '甲' }, { unionId: 'on_2', name: '乙' }] });
+    expect(r.status).toBe('need_choice');
+    expect(r.candidates?.length).toBe(2);
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBeUndefined();
+  });
+
+  it('autoBindOwnerIfUnambiguous: no candidates → no_candidates, stays unbound', async () => {
+    const r = await autoBindOwnerIfUnambiguous(dataDir, { ownerCandidates: async () => [] });
+    expect(r.status).toBe('no_candidates');
+    expect(getDeploymentIdentity(dataDir).ownerUnionId).toBeUndefined();
   });
 
   it('remote-group: pushes owner+bots to the hub BEFORE initiating the group (fresh operator)', async () => {
@@ -307,6 +376,7 @@ describe('handleFederationSpokeApi', () => {
     await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { name: 'g', larkAppIds: ['cli_local'] }), res, url('/api/team/federated-group'), { dataDir, createTeamGroup: createTeamGroup as any });
     expect(res.statusCode).toBe(200);
     expect(captured.ownerUnionIds).toContain('on_operator'); // operator pulled in
+    expect(captured.transferOwnerUnionId).toBe('on_operator'); // operator, not an arbitrary bot owner, receives ownership
     expect(json(res).missingOperatorIdentity).toBeFalsy();
   });
 
@@ -331,9 +401,9 @@ describe('handleFederationSpokeApi', () => {
     writeBots([]);
     const before = getDeploymentIdentity(dataDir);
     const res = makeRes();
-    await handleFederationSpokeApi(makeReq('POST', '/api/team/rename-deployment', { name: '申晗的部署' }), res, new URL('http://x/api/team/rename-deployment'), { dataDir });
+    await handleFederationSpokeApi(makeReq('POST', '/api/team/rename-deployment', { name: '示例用户的部署' }), res, new URL('http://x/api/team/rename-deployment'), { dataDir });
     expect(res.statusCode).toBe(200);
-    expect(json(res).deployment).toMatchObject({ deploymentId: before.deploymentId, name: '申晗的部署' });
+    expect(json(res).deployment).toMatchObject({ deploymentId: before.deploymentId, name: '示例用户的部署' });
   });
 
   it('federated-group: validates roster, delegates local+federated app_ids + pulls owners (union_id) into createTeamGroup', async () => {
@@ -351,6 +421,7 @@ describe('handleFederationSpokeApi', () => {
     expect(json(res).chatId).toBe('oc_x');
     expect(captured.larkAppIds.sort()).toEqual(['cli_local', 'cli_remote']);
     expect(captured.ownerUnionIds.sort()).toEqual(['on_local', 'on_remote']); // both bots' owners pulled in
+    expect(captured.transferOwnerUnionId).toBeUndefined(); // deployment operator is unbound; do not pick a bot owner
     // unknown bot (not on aggregated roster) → 400, never delegated
     res = makeRes();
     await handleFederationSpokeApi(makeReq('POST', '/api/team/federated-group', { larkAppIds: ['cli_ghost'] }), res, url, { dataDir, createTeamGroup: createTeamGroup as any });

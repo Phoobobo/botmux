@@ -1,6 +1,12 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule';
+export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
-export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored';
+export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
+export type TriggerAsyncStatus = 'pending' | 'completed';
+export type LegacyWorkflowRetirementReason =
+  | 'pending'
+  | 'migrated'
+  | 'changed_after_migration'
+  | 'identity_conflict';
 
 export interface TriggerRequest {
   source: {
@@ -14,6 +20,7 @@ export interface TriggerRequest {
     botId?: string;
     chatId?: string;
     sessionId?: string;
+    rootMessageId?: string;
     workflowId?: string;
   };
   envelope: {
@@ -24,10 +31,86 @@ export interface TriggerRequest {
     payload?: unknown;
     rawText?: string;
   };
+  // Trusted task set by the connector owner ("what to do with the event"). Kept
+  // OUTSIDE envelope so it is never serialized into the untrusted event JSON;
+  // the prompt builder renders it as a trusted directive above the event data.
+  instruction?: string;
+  /** Trusted presentation chosen by the connector owner. Undefined keeps the
+   * localized default topic seed; null suppresses the seed entirely. */
+  presentation?: {
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
+    topicMessage?: string | null;
+    title?: string;
+    /** Connector-owned handoff UI: replace the native live card only when this
+     * exact input is committed by the worker. Never driven by group messages. */
+    liveCard?: 'on-start';
+  };
   options?: {
     dryRun?: boolean;
     dedupKey?: string;
+    /** Caller-provided idempotency key (scoped per bot). A retried /api/trigger
+     *  with the same key returns the SAME session + triggerId instead of
+     *  creating a new one and re-dispatching — so a lost HTTP response can't make
+     *  the turn run twice. Distinct from `dedupKey` (webhook-lifecycle alert
+     *  grouping). Non-empty, ≤200 chars. FRESH async virtual only — mutually
+     *  exclusive with `turnIdempotencyKey` (which is for follow-up turns). */
+    idempotencyKey?: string;
+    /** Caller-provided idempotency key for a FOLLOW-UP turn on an existing
+     *  session (requires `target.sessionId`). Same at-most-once dispatch lease as
+     *  `idempotencyKey`, but scoped to (sessionId, turnIdempotencyKey): a retried
+     *  /api/trigger appending to the same session with the same key resolves to
+     *  the SAME turn instead of injecting a second time — so a lost HTTP response
+     *  on an existing-session append can't double-run. Mutually exclusive with
+     *  `idempotencyKey`; requires `target.sessionId` (no wait/dryRun).
+     *  Ordinary turns keep Lark delivery; async turns keep HTTP polling.
+     *  Non-empty, ≤200 chars. */
+    turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
+    waitForFinalOutput?: boolean;
+    asyncReturnSessionId?: boolean;
+    /** Permit explicit botmux send for messages authorized by this request in the
+     * existing real group. The caller determines message content and timing.
+     * Final output still returns to the caller. Defaults to false; turn-local.
+     * Cannot be combined with steer, which merges requests into one turn. */
+    allowChatMessages?: boolean;
+    timeoutMs?: number;
+    /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
+     * this loud trigger's turn. The streaming card / start notice still show;
+     * only the trailing transcript-driven summary is suppressed. */
+    suppressFinalOutput?: boolean;
+    /** Per-turn CLI model override (e.g. a codex model id). Applies only to a
+     *  freshly-spawned session; ignored when folding into an existing worker.
+     *  Empty/omitted → the bot's configured default. */
+    model?: string;
+    /** Per-turn reasoning effort. Same
+     *  fresh-spawn-only semantics as `model`. */
+    reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Authorize in-flight STEER for this turn (codex-app native `turn/steer`).
+     *
+     * Best-effort by construction — admission is decided inside the live runner
+     * (active turn present, steering window open, CLI supports it), so trigger
+     * ACCEPTANCE never fails for steer alone:
+     *  - On a FRESH turn it marks the opening root steerable; without a steerable
+     *    root a later follow-up can only queue serially (codex canSteer contract
+     *    requires BOTH the root and the follow-up head authorized).
+     *  - On an existing-session follow-up with a live active codex-app turn, the
+     *    runner injects the message INTO the active turn via turn/steer instead of
+     *    queueing it behind the turn.
+     *  - When no steerable turn is active (idle / already closing / dormant
+     *    worker / a non-codex CLI), it degrades to an ordinary queued follow-up.
+     *    Other CLIs keep their usual type-ahead queue behaviour.
+     *
+     * Result attribution for a merged steer group: codex emits ONE merged final
+     * for the group. The LAST accepted steer (the newest triggerId) owns that
+     * real final; every earlier member completes with the SAME content (no
+     * usage) once the group's real final lands, so polling any member's
+     * trigger-result resolves with the merged answer.
+     *
+     * Security posture is unchanged: POST /api/trigger is already the
+     * drive-my-own-turn surface (core-only loopback); steer authorizes mid-turn
+     * injection into the SAME tenant's turn, never a cross-session capability. */
+    steer?: boolean;
   };
 }
 
@@ -38,21 +121,41 @@ export type TriggerErrorCode =
   | 'bot_not_in_chat'
   | 'daemon_offline'
   | 'dry_run'
+  | 'idempotency_conflict'
   | 'invalid_signature'
   | 'chat_not_allowed'
+  | 'legacy_workflow_retired'
   | 'group_create_failed'
   | 'lifecycle_extract_failed'
   | 'rate_limited'
   | 'replay'
   | 'session_not_found'
+  | 'session_not_runnable'
   | 'target_required'
   | 'trigger_failed'
+  | 'wait_timeout'
+  | 'no_output'
   | 'workflow_trigger_not_implemented';
+
+/** Async lifecycle for `GET /api/sessions/:id/trigger-result`.
+ *  Programmatic callers (task runners) branch on this instead of ok/action:
+ *  - running:   turn still in flight — keep polling
+ *  - completed: final output captured (see output.content)
+ *  - failed:    session terminated without a captured output (soft terminal —
+ *               may be a genuine failure OR a caller-initiated close/cancel)
+ *  - interrupted: caller stopped this exact turn; its session remains usable
+ *  - not_found: no session record on disk (never existed / invalid id) */
+export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
 
 export interface TriggerResponse {
   ok: boolean;
   triggerId?: string;
   action?: TriggerAction;
+  /** Four-state async lifecycle. Present on trigger-result (async polling)
+   *  responses; absent on synchronous turn/workflow dispatch responses. */
+  state?: AsyncTriggerState;
+  /** ISO8601 completion/termination time. Present on completed/failed states. */
+  finishedAt?: string;
   target?: {
     kind: TriggerTargetKind;
     sessionId?: string;
@@ -61,8 +164,64 @@ export interface TriggerResponse {
   };
   message?: string;
   errorCode?: TriggerErrorCode;
+  terminalErrorCode?: string;
   error?: string;
+  /** Structured recovery metadata when a v2 definition is no longer runnable. */
+  reason?: LegacyWorkflowRetirementReason;
+  targetWorkflowId?: string;
+  targetRevisionId?: string;
   promptPreview?: string;
+  output?: {
+    content: string;
+  };
+  /** Per-turn token usage for a completed async turn (codex-app). Present on
+   *  `state:'completed'` when captured; omitted otherwise. Field names mirror the
+   *  caller's TaskTokenUsage. */
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreateTokens: number;
+  };
+  async?: {
+    status: TriggerAsyncStatus;
+    sessionId?: string;
+    completedAt?: string;
+  };
+  /** Echo of the caller's `options.idempotencyKey`, when one was supplied. */
+  idempotencyKey?: string;
+  /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
+   *  (follow-up async turn on an existing session). */
+  turnIdempotencyKey?: string;
+  /** Echo of `options.steer === true` on a request that was accepted for
+   *  dispatch. Actual native admission is best-effort inside the runner (see the
+   *  option's contract); this only confirms the daemon carried the
+   *  authorization, not that a turn/steer RPC has already been accepted. */
+  steer?: true;
+  /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
+   *  unrelated to the daemon-side `idempotencyKey` lease above).
+   *  - `accepted`  — first delivery under this key; it was dispatched.
+   *  - `duplicate` — same key + same body as an earlier delivery; NOT dispatched,
+   *                  `firstTriggerId` names the turn that actually ran. */
+  idempotency?: {
+    key: string;
+    action: 'accepted' | 'duplicate';
+    firstTriggerId?: string;
+  };
+  /** True when this response reused an EXISTING session for the idempotency key
+   *  (no new session created, no re-dispatch) instead of creating a fresh one.
+   *  Absent/false on the first (creating) call and on non-idempotent triggers. */
+  idempotent?: boolean;
+  /** Read-only web-terminal URL for the live session's CLI pane, present only
+   *  while a worker web server is up (typically `state:'running'` and at
+   *  `'completed'` before the session closes). Lets an async caller (e.g. riff's
+   *  in-sandbox task-runner) open a live view of the visible CLI TUI — form C.
+   *  Carries the `?viewToken=` read capability inline; knowing it grants read
+   *  only, never terminal input. Omitted when no live worker terminal exists. */
+  readOnlyUrl?: string;
+  /** The bare read capability behind `readOnlyUrl`'s `?viewToken=`, exposed
+   *  separately for callers that build their own URL. Omitted with readOnlyUrl. */
+  viewToken?: string;
 }
 
 export function isRecord(v: unknown): v is Record<string, unknown> {
@@ -82,14 +241,153 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (target.kind !== 'turn' && target.kind !== 'workflow') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
   }
-  if (target.kind === 'turn' && typeof target.chatId !== 'string' && typeof target.sessionId !== 'string') {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target requires chatId or sessionId' } };
+  const options = isRecord(raw.options) ? raw.options : {};
+  // Strict boolean typing for the mode/gate flags. The validator derives these
+  // with `=== true` but triggerSessionTurn consumes some with truthiness; a
+  // non-boolean (e.g. "false" / 1) would pass a scope gate here yet take a
+  // different runtime branch — which, for an idempotency turn, could skip the
+  // reserved→attempting barrier and break at-most-once. Reject non-booleans so
+  // the two layers can never diverge (codex #776 round-4).
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun', 'steer'] as const) {
+    if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
+    }
+  }
+  // Steer authorizes mid-turn injection into a real dispatch — a dry run never
+  // dispatches, so the combination is meaningless (and would make fixture
+  // responses advertise an authorization the daemon did not act on).
+  if (options.steer === true && options.dryRun === true) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
+  }
+  const waitForFinalOutput = options.waitForFinalOutput === true;
+  const asyncReturnSessionId = options.asyncReturnSessionId === true;
+  const hasChatId = typeof target.chatId === 'string' && target.chatId.trim().length > 0;
+  const hasSessionId = typeof target.sessionId === 'string' && target.sessionId.trim().length > 0;
+  const hasRootMessageId = typeof target.rootMessageId === 'string' && target.rootMessageId.trim().length > 0;
+  if (target.rootMessageId !== undefined && !hasRootMessageId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.rootMessageId must be a non-empty string' } };
+  }
+  if (hasRootMessageId && !hasChatId && !hasSessionId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target with rootMessageId requires chatId unless sessionId is specified' } };
+  }
+  if (target.kind === 'turn' && !waitForFinalOutput && !asyncReturnSessionId && !hasChatId && !hasSessionId && !hasRootMessageId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'turn target requires chatId, sessionId, or rootMessageId' } };
   }
   if (target.kind === 'workflow' && typeof target.workflowId !== 'string') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'workflow target requires workflowId' } };
   }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
+  }
+  if (raw.presentation !== undefined) {
+    if (!isRecord(raw.presentation)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
+    }
+    if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
+    }
+    if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
+    }
+    const topicMessage = raw.presentation.topicMessage;
+    if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must be a string or null' } };
+    }
+    if (typeof topicMessage === 'string' && (!topicMessage.trim() || Array.from(topicMessage.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
+    }
+    const title = raw.presentation.title;
+    if (title !== undefined && (typeof title !== 'string' || !title.trim() || Array.from(title.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.title must contain 1 to 200 characters' } };
+    }
+  }
+  if (waitForFinalOutput && target.kind !== 'turn') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput is only supported for turn targets' } };
+  }
+  if (waitForFinalOutput && asyncReturnSessionId) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };
+  }
+  if (options.allowChatMessages === true && (target.kind !== 'turn' || !hasSessionId || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless' || options.steer === true)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session without steer' } };
+  }
+  if (options.timeoutMs !== undefined) {
+    if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.timeoutMs must be between 1000 and 300000' } };
+    }
+  }
+  if (options.suppressFinalOutput !== undefined && typeof options.suppressFinalOutput !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.suppressFinalOutput must be a boolean' } };
+  }
+  if (options.model !== undefined && (typeof options.model !== 'string' || options.model.length > 200)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.model must be a string (<=200 chars)' } };
+  }
+  if (options.reasoningEffort !== undefined && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(options.reasoningEffort as string)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.reasoningEffort must be one of low|medium|high|xhigh|max|ultra' } };
+  }
+  // Mutual exclusion FIRST, before either key's scope-lock: the two keys have
+  // different scopes (fresh-session vs follow-up) with opposite target shapes, so
+  // whichever scope check ran first would otherwise mask the "both present" case
+  // with its own scope message (e.g. a request carrying BOTH + target.sessionId
+  // trips idempotencyKey's no-sessionId scope-lock before reaching this check).
+  // Hoisting it makes the precise mutual-exclusion 400 always reachable when both
+  // are supplied, regardless of target shape (riff #818 canary validation).
+  if (options.idempotencyKey !== undefined && options.turnIdempotencyKey !== undefined) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey and options.idempotencyKey are mutually exclusive' } };
+  }
+  if (options.idempotencyKey !== undefined) {
+    if (typeof options.idempotencyKey !== 'string' || options.idempotencyKey.trim().length === 0 || options.idempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.idempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // Scope lock (fresh async virtual only): the dispatch lease is implemented
+    // solely on the fresh-session async-return seam, so the public contract must
+    // not advertise it anywhere else — an existing-session / wait / plain / dryRun
+    // retry would silently bypass the lease and double-run. Require the exact
+    // intersection: turn + asyncReturnSessionId, no wait/dryRun, and NO target
+    // that could resolve to an existing/real session (sessionId/rootMessageId/
+    // chatId — including a caller-forged http_async_*). Widen only via a new PR
+    // that extends the lease to those seams.
+    if (
+      target.kind !== 'turn'
+      || !asyncReturnSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+      || hasSessionId
+      || hasRootMessageId
+      || hasChatId
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.idempotencyKey is only supported for a fresh async virtual trigger (target.kind=turn, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun, and no target.sessionId/rootMessageId/chatId)',
+        },
+      };
+    }
+  }
+  if (options.turnIdempotencyKey !== undefined) {
+    if (typeof options.turnIdempotencyKey !== 'string' || options.turnIdempotencyKey.trim().length === 0 || options.turnIdempotencyKey.length > 200) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
+    }
+    // (Mutual exclusion with idempotencyKey is checked up-front, above.)
+    // Existing-session follow-ups only. Loud Lark turns use an independent
+    // dispatch receipt; async turns retain the HTTP result-store lease.
+    if (
+      target.kind !== 'turn'
+      || !hasSessionId
+      || waitForFinalOutput
+      || options.dryRun === true
+    ) {
+      return {
+        ok: false, status: 400,
+        body: {
+          ok: false, errorCode: 'bad_request',
+          error: 'options.turnIdempotencyKey is only supported for a follow-up turn on an existing session (target.kind=turn, target.sessionId set, no waitForFinalOutput/dryRun)',
+        },
+      };
+    }
   }
   return { ok: true, request: raw as unknown as TriggerRequest };
 }

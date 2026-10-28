@@ -30,20 +30,20 @@ describe('deployment-identity', () => {
   it('binding an owner adopts the owner Feishu name as the deployment name', async () => {
     const { setDeploymentOwner } = await import('../src/services/deployment-identity.js');
     const a = getDeploymentIdentity(dataDir);
-    const r = setDeploymentOwner(dataDir, { unionId: 'on_x', name: '申晗' });
+    const r = setDeploymentOwner(dataDir, { unionId: 'on_x', name: '示例用户' });
     expect(r.ownerUnionId).toBe('on_x');
-    expect(r.ownerName).toBe('申晗');
-    expect(r.name).toBe('申晗');             // deployment label defaults to the Feishu name
+    expect(r.ownerName).toBe('示例用户');
+    expect(r.name).toBe('示例用户');             // deployment label defaults to the Feishu name
     expect(r.deploymentId).toBe(a.deploymentId);
-    expect(getDeploymentIdentity(dataDir).name).toBe('申晗');
+    expect(getDeploymentIdentity(dataDir).name).toBe('示例用户');
   });
 
   it('renames without changing the id', () => {
     const a = getDeploymentIdentity(dataDir);
-    const r = setDeploymentName(dataDir, '申晗的部署');
-    expect(r.name).toBe('申晗的部署');
+    const r = setDeploymentName(dataDir, '示例用户的部署');
+    expect(r.name).toBe('示例用户的部署');
     expect(r.deploymentId).toBe(a.deploymentId);
-    expect(getDeploymentIdentity(dataDir).name).toBe('申晗的部署');
+    expect(getDeploymentIdentity(dataDir).name).toBe('示例用户的部署');
   });
 });
 
@@ -94,14 +94,14 @@ describe('federation-store (hub)', () => {
 
   it('syncDeployment propagates a changed name + owner (binding adopts the Feishu name)', () => {
     const { syncToken } = registerDeployment(dataDir, 'default', { deploymentId: 'dep_x', name: 'n37-097-123', bots: [] }, 1000);
-    expect(syncDeployment(dataDir, syncToken, [bot('cli_a')], { ownerUnionId: 'on_x', ownerName: '申晗', name: '申晗' }, 5000)).toBe(true);
+    expect(syncDeployment(dataDir, syncToken, [bot('cli_a')], { ownerUnionId: 'on_x', ownerName: '示例用户', name: '示例用户' }, 5000)).toBe(true);
     const d = listFederatedDeployments(dataDir, 'default')[0];
-    expect(d.name).toBe('申晗');        // Hub-side grouping name follows the owner's Feishu name
+    expect(d.name).toBe('示例用户');        // Hub-side grouping name follows the owner's Feishu name
     expect(d.ownerUnionId).toBe('on_x');
-    expect(d.ownerName).toBe('申晗');
+    expect(d.ownerName).toBe('示例用户');
     // empty name on a later sync must NOT wipe it
     expect(syncDeployment(dataDir, syncToken, [bot('cli_a')], { name: '' }, 6000)).toBe(true);
-    expect(listFederatedDeployments(dataDir, 'default')[0].name).toBe('申晗');
+    expect(listFederatedDeployments(dataDir, 'default')[0].name).toBe('示例用户');
   });
 
   it('removeDeployment / removeTeamFederation drop records', () => {

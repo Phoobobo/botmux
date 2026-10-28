@@ -1,0 +1,572 @@
+import * as pty from '../../utils/pty.js';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { SessionBackend, SpawnOpts, SessionProbe } from './types.js';
+import { zellijEnv, probeZellijFunctional } from '../../setup/ensure-zellij.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneCommand } from './strict-env.js';
+import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellCommandArgv, shellKindForPath, isExecTimeoutError } from './tmux-backend.js';
+import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
+import { logger } from '../../utils/logger.js';
+import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
+
+/**
+ * ZellijBackend — session backend using zellij for process persistence.
+ *
+ * Architecture: pty-under-zellij (the "B route"), the zellij analogue of the
+ * legacy TmuxBackend (pty-under-tmux):
+ *   - A node-pty process runs `zellij --session … --layout-string …` (fresh)
+ *     or `zellij attach …` (reattach). The node-pty is the only zellij client.
+ *   - All output flows through the pty (onData/onExit work unchanged) — we get
+ *     the raw rendered byte stream for free, sidestepping zellij `subscribe`'s
+ *     "whole-viewport-snapshot" model that doesn't fit botmux's xterm pipeline.
+ *   - Input goes through pty.write(). We start zellij in **locked mode with
+ *     keybindings cleared** (generated config), so every byte we write —
+ *     including Ctrl-C, arrows, bracketed-paste markers — passes straight to
+ *     the focused CLI pane with zero keybinding interception (the moral
+ *     equivalent of tmux's single prefix key, but with nothing reserved).
+ *   - resize() is pty.resize(): the attached client's size drives the pane, so
+ *     the headless-default 25-column problem never bites (the pty is the size).
+ *   - kill() only detaches (kills the pty client); the zellij server keeps the
+ *     CLI running, so a daemon restart re-attaches with `zellij attach`.
+ *   - destroySession() runs `zellij delete-session -f` (kill + purge the
+ *     resurrectable corpse) on explicit /close.
+ *
+ * Naming: zellij sessions are named `bmx-<sessionId.slice(0,8)>`, same as tmux.
+ */
+export class ZellijBackend implements SessionBackend {
+  private process: pty.IPty | null = null;
+  private readonly sessionName: string;
+  private readonly ownsSession: boolean;
+  private reattaching = false;
+  /** When true, the caller has ALREADY resolved reattach-vs-fresh (the worker's
+   *  frozen tri-state probe, refreshed to 'missing' after any teardown). spawn()
+   *  must then honour `reattaching` verbatim and skip its `|| hasSession()`
+   *  self-heal — that live re-probe would re-run the same load-fragile
+   *  `list-sessions` and, on a post-kill session that has not fully died yet,
+   *  flip a frozen `false` back to attach, reattaching to the very pane the
+   *  teardown gate just removed. 'auto' (default) keeps the self-heal for
+   *  callers that did not freeze a decision. */
+  private readonly frozenReattach: boolean;
+  private tmpConfigDir: string | null = null;
+  /** Set by kill()/destroySession() so the pty-client exit they cause (an
+   *  intentional detach/teardown — the zellij session survives) is NOT
+   *  reported as a CLI exit. A real CLI exit leaves this false. */
+  private intentionalExit = false;
+  /** Cached CLI pid. The CLI subprocess starts asynchronously after spawn(),
+   *  so the first getChildPid() may be null; once resolved it's stable for the
+   *  session lifetime (single CLI pane → pane exit ends the session). */
+  private resolvedCliPid: number | null = null;
+
+  // PtyHandle fields the worker sets (parallel to TmuxBackend / PtyBackend) so
+  // the claude-code adapter can verify submits and follow the session id.
+  claudeJsonlPath?: string;
+  cliPid?: number;
+  cliCwd?: string;
+
+  constructor(sessionName: string, opts?: { ownsSession?: boolean; isReattach?: boolean; reattachDecision?: 'frozen' | 'auto' }) {
+    this.sessionName = sessionName;
+    this.ownsSession = opts?.ownsSession ?? true;
+    this.reattaching = opts?.isReattach ?? false;
+    this.frozenReattach = opts?.reattachDecision === 'frozen';
+  }
+
+  // ─── Static helpers (mirror TmuxBackend) ──────────────────────────────────
+
+  static isAvailable(): boolean {
+    return probeZellijFunctional().ok;
+  }
+
+  static sessionName(sessionId: string): string {
+    return `bmx-${sessionId.slice(0, 8)}`;
+  }
+
+  /** Names of LIVE (non-exited) zellij sessions. A killed-but-serialised
+   *  session lingers in `list-sessions` as "(EXITED - attach to resurrect)";
+   *  we must not treat those as reattachable, so filter them out. */
+  static liveSessions(): string[] {
+    const probe = ZellijBackend.probeLiveSessions();
+    return probe.ok ? probe.sessions : [];
+  }
+
+  /** Like liveSessions(), but distinguishes "command failed/timed out" ({ok:false})
+   *  from "command succeeded, zero live sessions" ({ok:true, sessions:[]}). The
+   *  tri-state probe builds on this so a transient `list-sessions` failure isn't
+   *  read as "session gone".
+   *
+   *  NOTE zellij exits **1** with stderr `No active zellij sessions found.` when
+   *  there are simply no sessions — an authoritative "zero", not a failure. A
+   *  bare catch would report that clean host as {ok:false} → `unknown`, and any
+   *  caller that biases `unknown` toward reattach would then `zellij attach` a
+   *  name that does not exist (exit 1) on every first start. So classify like
+   *  TmuxBackend.probeSession does: a numeric exit status with no signal is an
+   *  ANSWER from zellij; only a signal/timeout or a spawn failure (ENOENT/EACCES
+   *  — neither carries a numeric status) means we never got one.
+   *
+   *  The "answered" case is split by EXIT CODE, not by stderr wording alone:
+   *  zellij uses 1 for "listed fine, nothing live" and clap's 2 for usage errors
+   *  (verified against 0.44.1: a bogus flag/subcommand exits 2). But a numeric
+   *  status is only trusted AFTER ruling out a deadline — Node's timeout can
+   *  race the child's own exit and produce `ETIMEDOUT` alongside a clean status
+   *  (see isExecTimeoutError and the tmux-probe regression that pins it), which
+   *  is still "no answer". And a silent non-zero exit is not proof of emptiness:
+   *  we require zellij's explicit "no active sessions" line (or live rows) to
+   *  call it, so anything ambiguous degrades to `unknown` — the safe direction.
+   */
+  static probeLiveSessions(): { ok: true; sessions: string[] } | { ok: false } {
+    let out: string;
+    try {
+      out = execFileSync('zellij', ['list-sessions', '--no-formatting'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 3000,
+        env: zellijEnv(),
+      });
+    } catch (e: any) {
+      // Deadline FIRST, before any numeric-status reasoning: when Node's timeout
+      // races the child's own exit, the error carries `code='ETIMEDOUT'` AND a
+      // clean `status` with no signal (see isExecTimeoutError + the
+      // tmux-probe.test.ts regression pinning that exact shape). Reading that as
+      // an answer would turn the very high-load timeout this PR exists to
+      // tolerate back into an authoritative "gone" — and in the strict post-kill
+      // path it would report an unconfirmed termination as proven.
+      if (isExecTimeoutError(e)) return { ok: false };
+      // Not answered at all (killed by a signal, or a spawn failure like
+      // ENOENT/EACCES which carries no numeric status): stay indeterminate.
+      if (!e || typeof e.status !== 'number' || e.signal) return { ok: false };
+      // Answered non-zero. Only exit 1 can mean "listed fine, nothing live";
+      // clap usage/startup errors are 2+ and prove nothing about liveness.
+      if (e.status !== 1) return { ok: false };
+      // If it printed live rows anyway, those win (never report a live pane gone).
+      const rows = ZellijBackend.parseLiveSessionRows(e.stdout?.toString?.() ?? '');
+      if (rows.length > 0) return { ok: true, sessions: rows };
+      // Require zellij's explicit "no active sessions" answer to call it empty.
+      // A SILENT non-zero exit proves nothing — treating it as zero is how an
+      // unconfirmed kill or a half-broken host would read as "session gone".
+      // (The message is hardcoded in zellij since our 0.44.0 floor; a future
+      // rewording degrades to `unknown`, which is the safe direction here.)
+      if (/no active zellij sessions/i.test((e.stderr?.toString?.() ?? '').trim())) {
+        return { ok: true, sessions: [] };
+      }
+      return { ok: false };
+    }
+    return { ok: true, sessions: ZellijBackend.parseLiveSessionRows(out) };
+  }
+
+  /** Live (non-EXITED) session names from `list-sessions --no-formatting` output. */
+  private static parseLiveSessionRows(raw: string): string[] {
+    return raw
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !/EXITED/i.test(l))
+      .map(l => l.split(/\s+/)[0]!)
+      .filter(Boolean);
+  }
+
+  static hasSession(name: string): boolean {
+    return ZellijBackend.probeSession(name) === 'exists';
+  }
+
+  static probeSession(name: string): SessionProbe {
+    const probe = ZellijBackend.probeLiveSessions();
+    if (!probe.ok) return 'unknown';
+    return probe.sessions.includes(name) ? 'exists' : 'missing';
+  }
+
+  /** Kill + purge a session (so no resurrectable corpse accumulates). */
+  static killSession(name: string): void {
+    try {
+      spawnSync('zellij', ['delete-session', name, '-f'], { stdio: 'ignore', timeout: 4000, env: zellijEnv() });
+    } catch { /* doesn't exist */ }
+  }
+
+  static listBotmuxSessions(): string[] {
+    return ZellijBackend.liveSessions().filter(s => s.startsWith('bmx-'));
+  }
+
+  // ─── SessionBackend implementation ────────────────────────────────────────
+
+  spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Reattach if the session is already live (daemon restarted, CLI survived).
+    // Skip this self-heal when the caller froze the decision: a teardown gate
+    // may have just killed the pane and set reattaching=false, and a live
+    // re-probe here (same load-fragile `list-sessions`) could still see the
+    // not-yet-reaped session and wrongly flip us back to attach.
+    if (!this.frozenReattach) {
+      this.reattaching = this.reattaching || ZellijBackend.hasSession(this.sessionName);
+    }
+    if (this.frozenReattach && this.reattaching) {
+      // A frozen `attach` can still be objectively WRONG: the worker biases an
+      // indeterminate existence probe toward reattach (a live pane is likelier
+      // than a gone one under load), and not every path re-probes before we get
+      // here. `attach` on a session that does not exist exits 1 ("No session
+      // with the name … found!"), which reads as a CLI crash and burns a
+      // restart. So downgrade to a fresh spawn ONLY on an authoritative
+      // 'missing' — an indeterminate answer keeps the reattach bias, and a
+      // frozen `false` is never flipped the other way (that direction is the
+      // teardown guarantee this whole flag exists to protect).
+      if (ZellijBackend.probeSession(this.sessionName) === 'missing') {
+        logger.debug(
+          `[zellij:${this.sessionName}] frozen reattach downgraded to fresh spawn: session is provably absent`,
+        );
+        this.reattaching = false;
+      }
+    }
+    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict zellij reattach');
+    logger.debug(
+      `[zellij:${this.sessionName}] spawn ${this.reattaching ? 'reattach' : 'new'} ` +
+      `bin=${bin} args=${JSON.stringify(args)} cwd=${opts.cwd} ${opts.cols}x${opts.rows}`,
+    );
+
+    const { configPath, layoutPath } = this.writeRuntimeFiles(bin, args, opts);
+    const childEnv = zellijEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
+
+    // Fresh: `--new-session-with-layout <file>` FORCES a new named session with
+    // our layout (plain `--session … --layout-string` instead ATTACHES to the
+    // name and errors "no active session"). Reattach: `attach <name>` rejoins
+    // the surviving session (daemon restarted, CLI still running inside).
+    const zellijArgs = this.reattaching
+      ? ['--config', configPath, 'attach', this.sessionName]
+      : ['--config', configPath, '--session', this.sessionName,
+         '--new-session-with-layout', layoutPath];
+
+    this.process = pty.spawn('zellij', zellijArgs, {
+      name: 'xterm-256color',
+      cols: opts.cols,
+      rows: opts.rows,
+      cwd: opts.cwd,
+      env: childEnv,
+    });
+  }
+
+  /** Write the per-session config (locked mode + cleared keybinds so pty.write
+   *  passes through untouched, no startup tips / pane frames) and, for a fresh
+   *  spawn, the single-pane layout file. Both live in one temp dir cleaned on
+   *  kill(). On reattach the layout file is unused but harmless. */
+  private writeRuntimeFiles(bin: string, args: string[], opts: SpawnOpts): { configPath: string; layoutPath: string } {
+    this.tmpConfigDir = mkdtempSync(join(tmpdir(), 'bmx-zellij-'));
+    const configPath = join(this.tmpConfigDir, 'config.kdl');
+    const layoutPath = join(this.tmpConfigDir, 'layout.kdl');
+    writeFileSync(configPath, ZELLIJ_CONFIG_KDL);
+    if (!this.reattaching) writeFileSync(layoutPath, buildLayoutString(bin, args, opts));
+    return { configPath, layoutPath };
+  }
+
+  get isReattach(): boolean {
+    return this.reattaching;
+  }
+
+  // ── Input ──
+  // In locked mode with cleared keybinds, raw bytes written to the client pty
+  // are forwarded verbatim to the focused pane — so every input path collapses
+  // to pty.write(), exactly like TmuxBackend.write().
+
+  write(data: string): boolean {
+    if (!this.process) return false;
+    this.process.write(data);
+    return true;
+  }
+
+  /** Literal text, no Enter. */
+  sendText(text: string): boolean {
+    return this.write(text);
+  }
+
+  /** Special keys by tmux-style name (Enter, Escape, C-c, M-Enter, …). */
+  sendSpecialKeys(...keys: string[]): boolean {
+    if (!this.process) return false;
+    for (const key of keys) {
+      this.process.write(tmuxKeyToBytes(key));
+    }
+    return true;
+  }
+
+  /** Bracketed paste: wrap with \e[200~ … \e[201~ so TUIs (CoCo/Ink/Codex)
+   *  detect the paste boundary and don't treat embedded \n as Enter. Mirrors
+   *  `tmux paste-buffer -p`. */
+  pasteText(text: string): void {
+    this.process?.write(`\x1b[200~${text}\x1b[201~`);
+  }
+
+  resize(cols: number, rows: number): void {
+    this.process?.resize(cols, rows);
+  }
+
+  /** Must be called AFTER spawn(). */
+  onData(cb: (data: string) => void): void {
+    this.process?.onData(cb);
+  }
+
+  /** Must be called AFTER spawn(). */
+  onExit(cb: (code: number | null, signal: string | null) => void): void {
+    this.process?.onExit(({ exitCode, signal }) => {
+      // Suppress the pty-client exit caused by our own kill()/destroySession()
+      // (intentional detach/teardown — the zellij session survives, so a
+      // claude_exit here would falsely tear the worker down on restart). A real
+      // CLI exit (pane closes → single-pane session ends) leaves intentionalExit
+      // false and is forwarded. Mirrors TmuxPipeBackend's intentional-detach
+      // semantics (pty-under TmuxBackend lacked this — the gap Codex flagged).
+      if (this.intentionalExit) return;
+      cb(exitCode, signal !== undefined ? String(signal) : null);
+    });
+  }
+
+  /** CLI pid. May be null immediately after spawn() (the CLI subprocess starts
+   *  asynchronously); the worker retries. Cached once resolved. */
+  getChildPid(): number | null {
+    if (this.resolvedCliPid !== null) return this.resolvedCliPid;
+    this.resolvedCliPid = findPaneCliPid(this.sessionName, '');
+    return this.resolvedCliPid;
+  }
+
+  /** Detach only — kills the pty client, leaves the zellij session running. */
+  kill(): void {
+    this.intentionalExit = true;
+    if (this.process) {
+      try { this.process.kill(); } catch { /* already dead */ }
+      this.process = null;
+    }
+    this.cleanupConfig();
+  }
+
+  /** Kill the zellij session permanently (explicit /close). */
+  destroySession(): void {
+    this.kill();
+    if (this.ownsSession) {
+      ZellijBackend.killSession(this.sessionName);
+    }
+  }
+
+  private cleanupConfig(): void {
+    if (this.tmpConfigDir) {
+      try { rmSync(this.tmpConfigDir, { recursive: true, force: true }); } catch { /* benign */ }
+      this.tmpConfigDir = null;
+    }
+  }
+}
+
+// ─── Pure helpers (unit-testable) ───────────────────────────────────────────
+
+/**
+ * Locked mode + cleared keybinds => the client pty forwards every byte to the
+ * focused pane with no zellij interception. No startup tips / pane frames so
+ * the captured stream is just the CLI (we don't need to hide chrome, but a
+ * clean single pane keeps screenshots faithful and the renderer simple).
+ */
+export const ZELLIJ_CONFIG_KDL = `// botmux-generated — do not edit
+show_startup_tips false
+pane_frames false
+default_mode "locked"
+keybinds clear-defaults=true {
+}
+`;
+
+/** Escape a string for a KDL double-quoted value. */
+export function kdlString(s: string): string {
+  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')}"`;
+}
+
+/**
+ * Build the `--layout-string` KDL: a single full-screen pane that execs the CLI
+ * through the user's shell (same wrapper TmuxBackend uses, so PATH / NVM / pnpm
+ * / mise shims load from rcfiles). Command + args go in via execvp semantics —
+ * no shell-quoting needed (KDL strings carry spaces/quotes), only KDL escaping.
+ *
+ * POSIX shell layouts keep the `-c <script> _ <cwd>...` contract; fish
+ * layouts omit the `_` sentinel because fish exposes post-script args as $argv.
+ */
+export function buildLayoutString(bin: string, args: string[], opts: SpawnOpts): string {
+  const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
+  const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv, opts.gitConfigPairs);
+  const kind = shellKindForPath(shellSpec.shell);
+  const [cmd, ...paneArgs] = opts.strictEnv ? strictPaneCommand(bin, args, opts) : shellCommandArgv(shellSpec, shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), kind), [
+    opts.cwd,
+    ...envAssignments,
+    bin, ...args,
+  ]);
+  const argsKdl = paneArgs.map(kdlString).join(' ');
+  return [
+    'layout {',
+    `    pane command=${kdlString(cmd)} close_on_exit=true {`,
+    `        args ${argsKdl}`,
+    '    }',
+    '}',
+  ].join('\n');
+}
+
+/**
+ * Map a tmux-style key name to the raw bytes a terminal emits for it. Covers
+ * the names botmux's adapters / worker actually send (Enter, Escape, C-<x>,
+ * M-<x>, arrows, Tab, BSpace, …). Unknown names fall back to the literal string
+ * so a missing mapping degrades to "typed as-is" rather than dropping input.
+ */
+export function tmuxKeyToBytes(key: string): string {
+  const named: Record<string, string> = {
+    Enter: '\r',
+    Tab: '\t',
+    Escape: '\x1b',
+    Esc: '\x1b',
+    Space: ' ',
+    BSpace: '\x7f',
+    Backspace: '\x7f',
+    Up: '\x1b[A',
+    Down: '\x1b[B',
+    Right: '\x1b[C',
+    Left: '\x1b[D',
+    Home: '\x1b[H',
+    End: '\x1b[F',
+    PageUp: '\x1b[5~',
+    PageDown: '\x1b[6~',
+    'M-Enter': '\x1b\r',
+  };
+  if (key in named) return named[key]!;
+
+  // C-<x>: control byte. C-a..C-z → 0x01..0x1a; C-c → ETX (0x03), etc.
+  const ctrl = key.match(/^C-([A-Za-z])$/);
+  if (ctrl) {
+    const c = ctrl[1]!.toLowerCase().charCodeAt(0) - 96; // 'a' -> 1
+    return String.fromCharCode(c);
+  }
+  // M-<x>: ESC prefix (Alt).
+  const meta = key.match(/^M-(.)$/);
+  if (meta) return `\x1b${meta[1]}`;
+
+  // Unknown: best-effort literal.
+  return key;
+}
+
+/**
+ * Find the zellij `--server …/<sessionName>` process pid. The session name is
+ * the trailing path component of the server's socket argument, so we match the
+ * cmdline ending in `/<sessionName>`.
+ */
+/** A running `zellij --server <socketPath>` process. */
+export interface ZellijServerProc {
+  pid: number;
+  /** The socket path from argv — the session name AT SPAWN TIME. */
+  socketPath: string;
+}
+
+/** Parse `ps -eo pid=,args=` output into the zellij server processes. Pure. */
+export function parseZellijServerProcs(psOut: string): ZellijServerProc[] {
+  const servers: ZellijServerProc[] = [];
+  for (const line of psOut.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!m) continue;
+    const argv = m[2]!.trim();
+    const s = argv.match(/zellij\b.*--server\s+(\S+)$/);
+    if (s) servers.push({ pid: Number(m[1]), socketPath: s[1]! });
+  }
+  return servers;
+}
+
+/**
+ * Session-name → server-pid lookup, rename-proof and reuse-proof.
+ *
+ * Why there is NO argv "fast path" on Linux (Codex review, PR #468):
+ * `zellij action rename-session` (what the session-manager plugin drives)
+ * renames the session's SOCKET FILE, but the server's argv and the kernel's
+ * bound-address string (/proc/net/unix) keep the spawn-time path forever, and
+ * a freed name is REUSABLE by new spawns or other renames (verified live on
+ * 0.44.1). So ANY lookup keyed on names — argv tail, bound path, even
+ * "unique candidate + file exists" — can bind a session's name to a DIFFERENT
+ * session's server (spawn old → rename → spawn old again; or rename another
+ * session TO the freed name). Misbinding crosses sessions in adopt discovery
+ * / validation / backend pane-pid lookup, so correctness demands per-lookup
+ * causal attribution: the zellij-socket-probe child connects to the socket
+ * FILE and identifies which candidate server pid accept()ed that specific
+ * connection (see its header for the protocol). No file → session gone →
+ * null. Ambiguity → one retry → null (宁缺勿错).
+ *
+ * Non-Linux keeps the legacy argv-tail match (no /proc to attribute with);
+ * the daemon runs on Linux, and renamed/reused names were never supported
+ * there.
+ */
+export function findServerPid(sessionName: string): number | null {
+  let servers: ZellijServerProc[];
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid=,args='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+      env: zellijEnv(),
+    });
+    servers = parseZellijServerProcs(out);
+  } catch { return null; /* ps unavailable */ }
+  if (servers.length === 0) return null;
+
+  if (process.platform !== 'linux') {
+    const suffix = new RegExp(`/${escapeRe(sessionName)}$`);
+    return servers.find(s => suffix.test(s.socketPath))?.pid ?? null;
+  }
+
+  const probeScript = fileURLToPath(new URL('./zellij-socket-probe.js', import.meta.url));
+  for (const dir of [...new Set(servers.map(s => dirname(s.socketPath)))]) {
+    const sock = join(dir, sessionName);
+    if (!existsSync(sock)) continue;
+    const candidates = servers.filter(s => dirname(s.socketPath) === dir);
+    // A single probe run can in principle still be spoofed by a pathological
+    // coincidence (target's accepts invisible in the window while ≥2 short
+    // sibling connections straddle it — Codex delta finding), so a success is
+    // only trusted once an INDEPENDENT second run attributes the same pid.
+    // Ambiguity (exit 3) is retryable — a concurrent zellij client can race
+    // one window, but the same pattern across disjoint windows is not a
+    // plausible accident. Hard failures (connect refused etc.) abort.
+    const agreed: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const r = spawnSync(process.execPath, [probeScript, sock, ...candidates.map(c => String(c.pid))], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000,
+      });
+      if (r.status === 0) {
+        const pid = Number((r.stdout ?? '').trim());
+        if (!candidates.some(c => c.pid === pid)) break;
+        agreed.push(pid);
+        if (agreed.length === 2) {
+          if (agreed[0] === agreed[1]) return pid;
+          break; // two successes disagree → something is racing us → null
+        }
+        continue; // first success — run the confirmation probe
+      }
+      if (r.status !== 3) break;
+    }
+  }
+  return null;
+}
+
+/**
+ * Best-effort CLI pid for the managed pane. With the SHELL_WRAPPER_SCRIPT's
+ * `exec /usr/bin/env "$@"`, the CLI replaces the shell and becomes a direct
+ * child of the zellij server, so the server's lone non-zellij child is the CLI.
+ */
+export function findPaneCliPid(sessionName: string, _binBasename: string): number | null {
+  const server = findServerPid(sessionName);
+  if (!server) return null;
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid=,ppid=,comm='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+      env: zellijEnv(),
+    });
+    const children: number[] = [];
+    for (const line of out.split('\n')) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const [pid, ppid, comm] = [Number(m[1]), Number(m[2]), m[3]!];
+      if (ppid === server && comm !== 'zellij') children.push(pid);
+    }
+    // Single CLI pane → exactly one such child.
+    return children.length > 0 ? children[0]! : null;
+  } catch {
+    return null;
+  }
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

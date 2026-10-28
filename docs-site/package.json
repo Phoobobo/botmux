@@ -1,0 +1,16 @@
+{
+  "name": "botmux-docs",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "predev": "node scripts/prepare-assets.mjs",
+    "dev": "rspress dev",
+    "prebuild": "node scripts/prepare-assets.mjs",
+    "build": "rspress build",
+    "preview": "rspress preview"
+  },
+  "devDependencies": {
+    "@rspress/core": "^2.0.13",
+    "@rspress/plugin-llms": "2.0.13"
+  }
+}

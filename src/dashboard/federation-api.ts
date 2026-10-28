@@ -11,7 +11,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { config } from '../config.js';
-import { jsonRes } from './workflow-api.js';
+import { jsonRes } from './http.js';
 import { consumeInvite } from '../services/invite-store.js';
 import { getTeam } from '../services/team-store.js';
 import {
@@ -19,10 +19,23 @@ import {
   type FederatedBot,
 } from '../services/federation-store.js';
 import { buildFederatedRoster } from '../services/federation-roster.js';
+import { listTeamGroups } from '../services/team-groups-store.js';
+import {
+  listTeamReports,
+  readTeamBoard,
+  recordTeamSessions,
+  sanitizeReportedSessions,
+  setTeamBoardEntry,
+} from '../services/team-board-store.js';
 import { findMembershipByDelegationToken } from '../services/federation-membership-store.js';
 import { buildTeamRoster, type LiveBot } from '../services/team-roster.js';
 import { getDeploymentIdentity } from '../services/deployment-identity.js';
-import { orchestrateFederatedGroup, type Fetcher } from './federated-group-core.js';
+import {
+  orchestrateFederatedGroup,
+  type Fetcher,
+  type TeamGroupCreateResult,
+  type TeamGroupOwnerTransferResult,
+} from './federated-group-core.js';
 import { addUsersToChatByUnionId } from '../services/groups-store.js';
 import { loadBotConfigs, registerBot, getBot } from '../bot-registry.js';
 
@@ -106,6 +119,10 @@ function sanitizeBots(input: unknown): FederatedBot[] {
       botUnionId: typeof r.botUnionId === 'string' ? r.botUnionId : undefined,
       capability: typeof r.capability === 'string' ? r.capability : null,
       hasTeamRole: !!r.hasTeamRole,
+      // Preserve the remote's transport capability. ABSENT (pre-capability spoke)
+      // stays undefined → consumers treat undefined as legacy normal (true).
+      // Only an explicit boolean is propagated, so a false (apiOnly) survives.
+      larkTransportEnabled: typeof r.larkTransportEnabled === 'boolean' ? r.larkTransportEnabled : undefined,
       ownerUnionId: typeof r.ownerUnionId === 'string' ? r.ownerUnionId : undefined,
       ownerName: typeof r.ownerName === 'string' ? r.ownerName : undefined,
     });
@@ -121,9 +138,14 @@ export interface FederationApiDeps {
   liveBots?: () => LiveBot[];
   /** Injected by dashboard.ts — used when a HUB delegates 拉群 to THIS spoke
    *  (we create the chat with one of OUR local online bots as creator). */
-  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[] }) => Promise<{
-    ok: boolean; chatId?: string; shareLink?: string; invalidBotIds?: string[]; invalidOwnerUnionIds?: string[]; error?: string;
-  }>;
+  createTeamGroup?: (args: { name: string; larkAppIds: string[]; ownerUnionIds?: string[]; transferOwnerUnionId?: string }) => Promise<TeamGroupCreateResult>;
+  /** Complete a pending transfer through the daemon that originally created
+   *  the chat. Used locally and by delegate-transfer-owner. */
+  transferTeamGroupOwner?: (args: {
+    creatorLarkAppId: string;
+    chatId: string;
+    transferOwnerUnionId: string;
+  }) => Promise<TeamGroupOwnerTransferResult>;
   /** Add owners to an existing chat via one of OUR local bots (defaults to
    *  ensure-client + addUsersToChatByUnionId). Test seam. Returns the rejected ids. */
   addOwners?: (viaLarkAppId: string, chatId: string, ownerUnionIds: string[]) => Promise<{ invalidUserIds: string[] }>;
@@ -200,7 +222,53 @@ export async function handleFederationApi(
       name: typeof body?.name === 'string' ? body.name : undefined,
     });
     if (!ok) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
-    jsonRes(res, 200, { ok: true });
+    // 顺带下发该团队的协作群清单——spoke 据此筛出要上报给团队看板的会话。
+    const synced = getDeploymentByToken(dataDir, syncToken);
+    jsonRes(res, 200, {
+      ok: true,
+      groupChatIds: synced ? listTeamGroups(dataDir, synced.teamId).map(b => b.chatId) : [],
+    });
+    return true;
+  }
+
+  // ── 团队看板（既定架构：编排存 host，会话源数据各部署自持）────────────────
+  // 成员上报会话裁剪行：白名单清洗后按 deploymentId 覆盖式落盘。
+  if (path === '/api/federation/team-sessions' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const sessions = sanitizeReportedSessions(body?.sessions);
+    recordTeamSessions(dataDir, found.teamId, found.deployment.deploymentId, found.deployment.name, sessions);
+    jsonRes(res, 200, { ok: true, accepted: sessions.length });
+    return true;
+  }
+
+  // 成员拉取团队看板：共享编排 + 各部署最近一次上报（含调用方自己的，
+  // 前端按 deploymentId 去掉自己那份，本地数据走实时 store）。
+  if (path === '/api/federation/team-board' && method === 'GET') {
+    const found = getDeploymentByToken(dataDir, federationToken(req, url));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    jsonRes(res, 200, {
+      ok: true,
+      teamId: found.teamId,
+      deploymentId: found.deployment.deploymentId,
+      board: readTeamBoard(dataDir, found.teamId),
+      reports: listTeamReports(dataDir, found.teamId),
+      groupChatIds: listTeamGroups(dataDir, found.teamId).map(b => b.chatId),
+    });
+    return true;
+  }
+
+  // 成员拖拽团队看板卡片：编排是全团队共享的一份，谁拖都写 host 这里。
+  if (path === '/api/federation/team-board-move' && method === 'POST') {
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const found = getDeploymentByToken(dataDir, bearerOnly(req));
+    if (!found) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const entry = setTeamBoardEntry(dataDir, found.teamId, String(body?.sessionId ?? ''), body?.column, body?.position);
+    if (!entry) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
+    jsonRes(res, 200, { ok: true, entry });
     return true;
   }
 
@@ -237,7 +305,12 @@ export async function handleFederationApi(
     if (cached) { jsonRes(res, cached.status, cached.body); return true; }
     const out = await orchestrateFederatedGroup(dataDir,
       { name, larkAppIds, operatorUnionId: found.deployment.ownerUnionId, requestId, teamId: found.teamId },
-      { createTeamGroup: deps.createTeamGroup, fetcher: deps.fetcher ?? fetch, live: deps.liveBots?.() });
+      {
+        createTeamGroup: deps.createTeamGroup,
+        transferTeamGroupOwner: deps.transferTeamGroupOwner,
+        fetcher: deps.fetcher ?? fetch,
+        live: deps.liveBots?.(),
+      });
     idemSet(idemKey, { status: out.status, body: out.body });
     jsonRes(res, out.status, out.body);
     return true;
@@ -264,16 +337,73 @@ export async function handleFederationApi(
     // Dedup + cap inputs (pre-auth command endpoint — keep blast radius small).
     const larkAppIds: string[] = Array.from(new Set((Array.isArray(body?.larkAppIds) ? body.larkAppIds : []).filter((x: any) => typeof x === 'string')));
     const ownerUnionIds: string[] = Array.from(new Set((Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : []).filter((x: any) => typeof x === 'string')));
+    const transferOwnerUnionId = typeof body?.transferOwnerUnionId === 'string'
+      ? body.transferOwnerUnionId.trim()
+      : '';
     const name = (String(body?.name ?? '').trim()) || '协作群';
     if (larkAppIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'no_bots_selected' }); return true; }
     if (larkAppIds.length > MAX_BOTS || ownerUnionIds.length > MAX_OWNERS) { jsonRes(res, 400, { ok: false, error: 'too_many' }); return true; }
+    if (body?.transferOwnerUnionId !== undefined
+      && (!transferOwnerUnionId.startsWith('on_') || !ownerUnionIds.includes(transferOwnerUnionId))) {
+      jsonRes(res, 400, { ok: false, error: 'invalid_transfer_owner_union_id' }); return true;
+    }
     // Guardrail: the delegation must involve at least one of OUR local bots
     // (otherwise it's unrelated to this deployment — refuse to act as creator).
     const localIds = new Set(buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.()).bots.map(b => b.larkAppId));
     if (!larkAppIds.some(id => localIds.has(id))) { jsonRes(res, 400, { ok: false, error: 'no_local_bot' }); return true; }
-    const r = await deps.createTeamGroup({ name, larkAppIds, ownerUnionIds });
+    const r = await deps.createTeamGroup({
+      name,
+      larkAppIds,
+      ownerUnionIds,
+      transferOwnerUnionId: transferOwnerUnionId || undefined,
+    });
+    if (r.ok
+      && r.chatId
+      && r.creator
+      && transferOwnerUnionId
+      && r.invalidOwnerUnionIds?.includes(transferOwnerUnionId)) {
+      // Mint a short-lived capability bound to THIS authenticated delegate
+      // request. The hub can trigger it only after the owner's deployment has
+      // successfully added the operator; it cannot substitute chat/creator/id.
+      idemSet(`delegate-transfer-pending:${token}:${requestId}`, {
+        creatorLarkAppId: r.creator,
+        chatId: r.chatId,
+        transferOwnerUnionId,
+      });
+    }
     const result = { status: r.ok ? 200 : 502, body: r };
     idemSet(idemKey, result); // cache terminal result (success AND failure)
+    jsonRes(res, result.status, result.body);
+    return true;
+  }
+
+  // Hub finishes a deferred transfer on THIS creator deployment after the
+  // target's own deployment has successfully added them to the chat. The only
+  // client input is requestId; target/chat/creator come from the authenticated
+  // delegate-group result cached above, closing the confused-deputy gap.
+  if (path === '/api/federation/delegate-transfer-owner' && method === 'POST') {
+    if (!deps.transferTeamGroupOwner) { jsonRes(res, 501, { ok: false, error: 'owner_transfer_unavailable' }); return true; }
+    let body: any;
+    try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+    const token = bearerOnly(req);
+    if (!findMembershipByDelegationToken(dataDir, token)) { jsonRes(res, 403, { ok: false, error: 'unknown_token' }); return true; }
+    const requestId = String(body?.requestId ?? '').trim();
+    if (!requestId) { jsonRes(res, 400, { ok: false, error: 'request_id_required' }); return true; }
+    const resultKey = `delegate-transfer-result:${token}:${requestId}`;
+    const cached = idemGet(resultKey) as { status: number; body: any } | undefined;
+    if (cached) { jsonRes(res, cached.status, cached.body); return true; }
+    const pending = idemGet(`delegate-transfer-pending:${token}:${requestId}`) as {
+      creatorLarkAppId: string;
+      chatId: string;
+      transferOwnerUnionId: string;
+    } | undefined;
+    if (!pending) { jsonRes(res, 409, { ok: false, error: 'owner_transfer_not_pending' }); return true; }
+
+    const transferred = await deps.transferTeamGroupOwner(pending);
+    const result = { status: 200, body: { ok: true, ...transferred } };
+    // Successful transfer is idempotent and may have sent an @ notification;
+    // cache it to suppress duplicate notifications. Failures remain retryable.
+    if (transferred.ownerTransferredTo && !transferred.transferError) idemSet(resultKey, result);
     jsonRes(res, result.status, result.body);
     return true;
   }
@@ -295,6 +425,15 @@ export async function handleFederationApi(
     if (cached) { jsonRes(res, cached.status, cached.body); return true; }
     const chatId = String(body?.chatId ?? '').trim();
     const viaLarkAppId = String(body?.viaLarkAppId ?? '').trim();
+    // Via-bot candidates to try IN ORDER. The hub sends every bot of THIS
+    // deployment that's already a member of the chat; we fall through them so a
+    // bot lacking im:chat.members:write_only (99991672) or owner visibility
+    // (232024) doesn't strand the owner — another of our bots can still add them.
+    // Back-compat: older hubs send only viaLarkAppId.
+    const rawCandidates: unknown[] = Array.isArray(body?.viaCandidates) ? body.viaCandidates : [];
+    const viaCandidates: string[] = Array.from(new Set(
+      [viaLarkAppId, ...rawCandidates.filter((x): x is string => typeof x === 'string')].map(s => s.trim()).filter(Boolean),
+    ));
     const rawOwners: unknown[] = Array.isArray(body?.ownerUnionIds) ? body.ownerUnionIds : [];
     const ownerUnionIds: string[] = Array.from(new Set(rawOwners.filter((x): x is string => typeof x === 'string')));
     if (!chatId || ownerUnionIds.length === 0) { jsonRes(res, 400, { ok: false, error: 'bad_request' }); return true; }
@@ -302,6 +441,9 @@ export async function handleFederationApi(
     const roster = buildTeamRoster(dataDir, undefined, undefined, deps.liveBots?.());
     // Guardrail: viaLarkAppId must be one of OUR local bots.
     if (!roster.bots.some(b => b.larkAppId === viaLarkAppId)) { jsonRes(res, 400, { ok: false, error: 'not_a_local_bot' }); return true; }
+    // Drop any candidate that isn't one of OUR local bots (the hub may list bots
+    // we no longer host); viaLarkAppId itself is guaranteed present by the check above.
+    const localCandidates = viaCandidates.filter(via => roster.bots.some(b => b.larkAppId === via));
     // Capability limit: only add people who are OUR owners (this deployment's owner
     // or a local bot's owner). A delegationToken holder must NOT use our bot to pull
     // arbitrary in-scope users into arbitrary chats. Non-owners → invalid, no Lark call.
@@ -313,8 +455,17 @@ export async function handleFederationApi(
       if (!ensureLocalClient(via)) return { invalidUserIds: ids };
       return addUsersToChatByUnionId(via, chat, ids);
     });
-    const ar = toAdd.length > 0 ? await addOwners(viaLarkAppId, chatId, toAdd) : { invalidUserIds: [] };
-    const result = { status: 200, body: { ok: true, invalidUserIds: [...notOurs, ...ar.invalidUserIds] } };
+    // Try each local candidate in turn, narrowing to the owners still not added.
+    // Stop as soon as everyone landed; a bot that can't add them (no write scope
+    // / no visibility) just leaves them in `remaining` for the next candidate.
+    let remaining = [...toAdd];
+    for (const via of localCandidates) {
+      if (remaining.length === 0) break;
+      const ar = await addOwners(via, chatId, remaining);
+      const invalid = new Set(ar.invalidUserIds);
+      remaining = remaining.filter(u => invalid.has(u));
+    }
+    const result = { status: 200, body: { ok: true, invalidUserIds: [...notOurs, ...remaining] } };
     idemSet(idemKey, result);
     jsonRes(res, result.status, result.body);
     return true;

@@ -17,9 +17,13 @@
  *
  * Storage: `{dataDir}/teams.json`, atomic writes (unique tmp + rename).
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readJsonFileSoft } from '../utils/json-file.js';
+import type { FeedbackPolicyLayer } from './feedback-policy-resolver.js';
+import { normalizeFeedbackPolicyLayer } from './feedback-policy-resolver.js';
 
 export const DEFAULT_TEAM_ID = 'default';
 
@@ -38,6 +42,7 @@ export interface Team {
   members: TeamMember[];
   createdAt: number;
   updatedAt: number;
+  feedback?: FeedbackPolicyLayer;
 }
 
 interface FileShape {
@@ -57,21 +62,18 @@ function filePath(dataDir: string): string {
 }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return { version: 1, teams: [] };
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && Array.isArray(parsed.teams)) return { version: 1, teams: parsed.teams };
-  } catch { /* corrupt — fall through */ }
-  return { version: 1, teams: [] };
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({ version: 1, teams: [] }),
+    validate: (v): v is FileShape => !!v && Array.isArray((v as { teams?: unknown }).teams),
+    label: 'team-store',
+  });
+  return { version: 1, teams: parsed.teams };
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 /** All teams (empty array if none materialized yet). */
@@ -82,12 +84,6 @@ export function listTeams(dataDir: string): Team[] {
 /** A team by id, or null. */
 export function getTeam(dataDir: string, teamId: string): Team | null {
   return readFile(dataDir).teams.find(t => t.id === teamId) ?? null;
-}
-
-/** All teams the given identity belongs to (matches any identifier). */
-export function listTeamsForMember(dataDir: string, id: MemberIdentity): Team[] {
-  if (!id.unionId && !id.openId && !id.email) return [];
-  return readFile(dataDir).teams.filter(t => t.members.some(m => sameMember(m, id)));
 }
 
 /**
@@ -123,6 +119,24 @@ export function deleteTeam(dataDir: string, teamId: string): boolean {
   if (data.teams.length === before) return false;
   writeFileAtomic(dataDir, data);
   return true;
+}
+
+/** Invalid policy layers are rejected before the local hosted-team file changes. */
+export function setTeamFeedbackPolicy(
+  dataDir: string,
+  teamId: string,
+  policy: FeedbackPolicyLayer | null,
+  now: number = Date.now(),
+): Team | null {
+  const normalized = policy === null ? undefined : normalizeFeedbackPolicyLayer(policy);
+  const data = readFile(dataDir);
+  const team = data.teams.find(t => t.id === teamId);
+  if (!team) return null;
+  if (normalized === undefined) delete team.feedback;
+  else team.feedback = normalized;
+  team.updatedAt = now;
+  writeFileAtomic(dataDir, data);
+  return team;
 }
 
 /** Create a new explicit team. */

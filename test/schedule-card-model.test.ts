@@ -1,0 +1,294 @@
+import { describe, expect, it } from 'vitest';
+
+import type { ParsedSchedule } from '../src/types.js';
+import {
+  computeButtonAvailability,
+  computeDeliveryButtonAvailability,
+  computeNextNRuns,
+  filterSchedules,
+  nextScheduleExecutionPosition,
+  paginateSchedules,
+  resolveScheduleExecutionPlacement,
+  toScheduleDetailDto,
+  toScheduleRowDto,
+  type ScheduleCardTaskInput,
+} from '../src/dashboard/schedule-card-model.js';
+
+const FIXED_NOW = Date.parse('2025-04-15T08:00:00Z');
+const TZ = 'Asia/Shanghai';
+
+function once(runAt: string): ParsedSchedule {
+  return { kind: 'once', runAt, display: `once @ ${runAt}` };
+}
+function interval(minutes: number): ParsedSchedule {
+  return { kind: 'interval', minutes, display: `every ${minutes}m` };
+}
+function cron(expr: string): ParsedSchedule {
+  return { kind: 'cron', expr, display: `cron ${expr}` };
+}
+
+function makeTask(overrides: Partial<ScheduleCardTaskInput> = {}): ScheduleCardTaskInput {
+  return {
+    id: 'task-1',
+    name: 'demo task',
+    prompt: 'do something',
+    parsed: interval(30),
+    enabled: true,
+    larkAppId: 'cli_demo',
+    chatId: 'oc_demo',
+    ...overrides,
+  };
+}
+
+describe('schedule-card-model · filterSchedules', () => {
+  it('enabledOnly removes tasks with enabled=false', () => {
+    const tasks = [
+      makeTask({ id: 'a', enabled: true }),
+      makeTask({ id: 'b', enabled: false }),
+    ];
+    expect(filterSchedules(tasks, { enabledOnly: true }).map(t => t.id)).toEqual(['a']);
+    expect(filterSchedules(tasks, { enabledOnly: false }).map(t => t.id)).toEqual(['a', 'b']);
+  });
+
+  it('search is case-insensitive and matches both name and prompt', () => {
+    const tasks = [
+      makeTask({ id: 'a', name: 'Daily Report', prompt: 'do summary' }),
+      makeTask({ id: 'b', name: 'mute', prompt: 'CRON the SUMMARY' }),
+      makeTask({ id: 'c', name: 'other', prompt: 'nothing' }),
+    ];
+    const out = filterSchedules(tasks, { search: 'SUMMARY' });
+    expect(out.map(t => t.id)).toEqual(['a', 'b']);
+  });
+
+  it('kind=cron keeps only tasks whose parsed.kind is cron', () => {
+    const tasks = [
+      makeTask({ id: 'i', parsed: interval(15) }),
+      makeTask({ id: 'c', parsed: cron('0 * * * *') }),
+      makeTask({ id: 'o', parsed: once('2025-04-15T12:00:00Z') }),
+    ];
+    expect(filterSchedules(tasks, { kind: 'cron' }).map(t => t.id)).toEqual(['c']);
+    expect(filterSchedules(tasks, { kind: 'all' }).map(t => t.id)).toEqual(['i', 'c', 'o']);
+  });
+});
+
+describe('schedule-card-model · paginateSchedules clamp (M4)', () => {
+  const items = Array.from({ length: 45 }, (_, i) => i + 1);
+
+  it('page < 1 clamps to 1', () => {
+    const p = paginateSchedules(items, 0, 10);
+    expect(p.page).toBe(1);
+    expect(p.items[0]).toBe(1);
+
+    const neg = paginateSchedules(items, -3, 10);
+    expect(neg.page).toBe(1);
+  });
+
+  it('page > totalPages clamps to totalPages', () => {
+    const p = paginateSchedules(items, 99, 10);
+    expect(p.totalPages).toBe(5);
+    expect(p.page).toBe(5);
+    expect(p.items[0]).toBe(41);
+  });
+
+  it('pageSize < 1 falls back to default 20', () => {
+    expect(paginateSchedules(items, 1, 0).pageSize).toBe(20);
+    expect(paginateSchedules(items, 1, -5).pageSize).toBe(20);
+    expect(paginateSchedules(items, 1, undefined).pageSize).toBe(20);
+  });
+
+  it('pageSize > 100 clamps to 100', () => {
+    expect(paginateSchedules(items, 1, 999).pageSize).toBe(100);
+  });
+});
+
+describe('schedule-card-model · toScheduleRowDto', () => {
+  it("nextRunAt in the future renders 'in Xm'; missing renders '—'", () => {
+    const future = makeTask({ nextRunAt: new Date(FIXED_NOW + 5 * 60_000).toISOString() });
+    const row = toScheduleRowDto(future, { nowMs: FIXED_NOW });
+    expect(row.nextRunRelative).toBe('in 5m');
+
+    const missing = makeTask({ nextRunAt: undefined });
+    expect(toScheduleRowDto(missing, { nowMs: FIXED_NOW }).nextRunRelative).toBe('—');
+  });
+
+  it('lastStatus=error sets errorIndicator=true; enabled=false maps to {runNow:on, resume:on, pause:off} (no glyph in DTO)', () => {
+    const errored = makeTask({ lastStatus: 'error', enabled: false });
+    const row = toScheduleRowDto(errored, { nowMs: FIXED_NOW });
+    expect(row.errorIndicator).toBe(true);
+    expect(row.actions.runNow.enabled).toBe(true);
+    expect(row.actions.resume.enabled).toBe(true);
+    expect(row.actions.pause.enabled).toBe(false);
+    // Critically: ButtonState only carries semantic flags. Renderer adds glyph.
+    expect(JSON.stringify(row.actions)).not.toContain('▶');
+    expect(JSON.stringify(row.actions)).not.toContain('⏸');
+
+    const enabledTask = makeTask({ enabled: true });
+    const enabledRow = toScheduleRowDto(enabledTask, { nowMs: FIXED_NOW });
+    expect(enabledRow.actions.pause.enabled).toBe(true);
+    expect(enabledRow.actions.resume.enabled).toBe(false);
+  });
+
+  it('disables run-now while the task has a durable running claim', () => {
+    const row = toScheduleRowDto(
+      makeTask({ lastStatus: 'running' }),
+      { nowMs: FIXED_NOW },
+    );
+    expect(row.actions.runNow).toEqual({
+      enabled: false,
+      reasonKey: 'schedules.action.run.alreadyRunning',
+    });
+  });
+});
+
+describe('schedule-card-model · toScheduleDetailDto', () => {
+  it('truncates a prompt longer than promptTruncateAt and sets promptTruncated=true', () => {
+    const longPrompt = 'x'.repeat(250);
+    const task = makeTask({ prompt: longPrompt });
+    const detail = toScheduleDetailDto(task, { nowMs: FIXED_NOW, promptTruncateAt: 100 });
+    expect(detail.promptTruncated).toBe(true);
+    expect(detail.prompt?.length).toBe(101); // 100 chars + '…'
+    expect(detail.prompt?.endsWith('…')).toBe(true);
+
+    const short = makeTask({ prompt: 'short' });
+    const sd = toScheduleDetailDto(short, { nowMs: FIXED_NOW, promptTruncateAt: 100 });
+    expect(sd.promptTruncated).toBe(false);
+    expect(sd.prompt).toBe('short');
+  });
+});
+
+describe('schedule-card-model · computeNextNRuns', () => {
+  it('returns strictly increasing ISO timestamps for a cron task (fixed nowMs + Asia/Shanghai)', () => {
+    const task = makeTask({ parsed: cron('0 9 * * *') }); // 09:00 daily, Shanghai
+    const runs = computeNextNRuns(task, 3, { nowMs: FIXED_NOW, timezone: TZ });
+    expect(runs).toHaveLength(3);
+    const ms = runs.map(r => Date.parse(r));
+    expect(ms[0]).toBeLessThan(ms[1]);
+    expect(ms[1]).toBeLessThan(ms[2]);
+    // All Future runs must be after nowMs.
+    expect(ms.every(t => t > FIXED_NOW)).toBe(true);
+  });
+
+  it('returns [] when once.lastRunAt is set', () => {
+    const t = makeTask({
+      parsed: once(new Date(FIXED_NOW + 3600_000).toISOString()),
+      lastRunAt: new Date(FIXED_NOW - 60_000).toISOString(),
+    });
+    expect(computeNextNRuns(t, 5, { nowMs: FIXED_NOW })).toEqual([]);
+  });
+
+  it('returns [] for interval=0 (degenerate)', () => {
+    const t = makeTask({ parsed: interval(0) });
+    expect(computeNextNRuns(t, 5, { nowMs: FIXED_NOW })).toEqual([]);
+  });
+
+  it('skips long-overdue interval runs arithmetically and returns future timestamps', () => {
+    const t = makeTask({
+      parsed: interval(1),
+      lastRunAt: new Date(FIXED_NOW - 400_000 * 60_000).toISOString(),
+    });
+    const runs = computeNextNRuns(t, 3, { nowMs: FIXED_NOW });
+    expect(runs.map(r => Date.parse(r))).toEqual([
+      FIXED_NOW + 60_000,
+      FIXED_NOW + 120_000,
+      FIXED_NOW + 180_000,
+    ]);
+  });
+});
+
+describe('schedule-card-model · invariants', () => {
+  it('derives all three execution placements, including legacy fresh-topic rows', () => {
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'chat', rootMessageId: 'om_old' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ scope: 'thread', rootMessageId: 'om_root' }))).toBe('thread');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'top-level', rootMessageId: 'om_root' }))).toBe('chat');
+    expect(resolveScheduleExecutionPlacement(makeTask({ executionPosition: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'new-topic', rootMessageId: 'om_root' }))).toBe('new-topic');
+    expect(resolveScheduleExecutionPlacement(makeTask({ deliver: 'local' }))).toBe('local');
+  });
+
+  it('allows silent execution at every position, including lazy fresh topics', () => {
+    const topLevel = makeTask({ scope: 'chat', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topLevel, 'topic')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability({ ...topLevel, rootMessageId: undefined }, 'topic'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' });
+    const topic = makeTask({ scope: 'thread', rootMessageId: 'om_root', silent: true });
+    expect(computeDeliveryButtonAvailability(topic, 'top-level')).toEqual({ enabled: true });
+    expect(computeDeliveryButtonAvailability(topic, 'new-topic'))
+      .toEqual({ enabled: true });
+  });
+
+  it('derives the dedicated-task placement and its cycle button states', () => {
+    // Rootless task: dedicated placement, next step parks at top level.
+    const task = makeTask({ executionPosition: 'task', scope: 'thread' });
+    expect(resolveScheduleExecutionPlacement(task)).toBe('task');
+    expect(nextScheduleExecutionPosition(task)).toBe('top-level');
+    // A materialized task (first-fire root written back) presents as an
+    // ordinary thread placement.
+    const materialized = makeTask({ executionPosition: 'task', scope: 'thread', rootMessageId: 'om_task' });
+    expect(resolveScheduleExecutionPlacement(materialized)).toBe('thread');
+    // Re-entering the same dedicated position is disabled with its own reason.
+    expect(computeDeliveryButtonAvailability(task, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.alreadyTask' });
+    // A single-chat fresh-topic task offers the dedicated-task step.
+    const fresh = makeTask({ executionPosition: 'new-topic', scope: 'chat' });
+    expect(computeDeliveryButtonAvailability(fresh, 'task')).toEqual({ enabled: true });
+    // The dedicated position is impossible for a multi-chat task.
+    const multi = makeTask({ executionPosition: 'new-topic', scope: 'chat', chatIds: ['oc_a', 'oc_b'] });
+    expect(computeDeliveryButtonAvailability(multi, 'task'))
+      .toEqual({ enabled: false, reasonKey: 'schedules.action.delivery.taskMultiChat' });
+  });
+
+  it('filter / paginate / toRow do not mutate the input list', () => {
+    const tasks = [
+      makeTask({ id: 'a', enabled: true, parsed: interval(15) }),
+      makeTask({ id: 'b', enabled: false, parsed: cron('* * * * *') }),
+    ];
+    const frozen = Object.freeze(tasks.slice());
+    const snapshot = frozen.map(t => t.id);
+    filterSchedules(frozen, { search: 'foo', kind: 'cron', enabledOnly: true });
+    paginateSchedules(frozen, 1, 10);
+    frozen.forEach(t => toScheduleRowDto(t, { nowMs: FIXED_NOW }));
+    expect(frozen.map(t => t.id)).toEqual(snapshot);
+  });
+
+  it('computeButtonAvailability is consistent with toScheduleRowDto.actions', () => {
+    const t = makeTask({ enabled: false });
+    expect(toScheduleRowDto(t, { nowMs: FIXED_NOW }).actions).toEqual(computeButtonAvailability(t));
+  });
+
+  it('row and detail DTOs pass `repeat` through unchanged (object shape matches ScheduledTask.repeat)', () => {
+    const finite = makeTask({ repeat: { times: 5, completed: 2 } });
+    const forever = makeTask({ repeat: { times: null, completed: 17 } });
+    const absent = makeTask({ repeat: undefined });
+
+    const ctx = { nowMs: FIXED_NOW };
+    expect(toScheduleRowDto(finite, ctx).repeat).toEqual({ times: 5, completed: 2 });
+    expect(toScheduleRowDto(forever, ctx).repeat).toEqual({ times: null, completed: 17 });
+    expect(toScheduleRowDto(absent, ctx).repeat).toBeUndefined();
+
+    expect(toScheduleDetailDto(finite, ctx).repeat).toEqual({ times: 5, completed: 2 });
+    expect(toScheduleDetailDto(forever, ctx).repeat).toEqual({ times: null, completed: 17 });
+    expect(toScheduleDetailDto(absent, ctx).repeat).toBeUndefined();
+  });
+});
+
+describe('schedule-card-model · computeNextNRuns 时区 = 显式 host-zone override', () => {
+  it('注入 host 时区后,cron next-run 的墙钟落在该时区整点(消费端行为;真正的 host fallback 由 timezone.test.ts 覆盖)', () => {
+    // computeNextNRuns 不传 timezone 时取 scheduleTimeZone()(env → 全局 config → host)。
+    // 本用例把 BOTMUX_SCHEDULE_TIMEZONE 显式钉到 JS 运行时的 host 时区,测的是「消费端在
+    // 显式 host-zone override 下的墙钟」,而非「无配置时的 host fallback」——后者已由
+    // timezone.test.ts 单测。这样断言 getHours 与被钉时区同源,不受机器 config.json 干扰。
+    const prev = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    process.env.BOTMUX_SCHEDULE_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    try {
+      const task = makeTask({ parsed: cron('0 9 * * *') });
+      const runs = computeNextNRuns(task, 1, { nowMs: FIXED_NOW });
+      expect(runs).toHaveLength(1);
+      const d = new Date(runs[0]);
+      expect(d.getHours()).toBe(9);
+      expect(d.getMinutes()).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = prev;
+    }
+  });
+});

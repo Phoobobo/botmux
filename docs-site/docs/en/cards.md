@@ -1,0 +1,156 @@
+# Streaming Cards
+
+Every conversation turn produces a live-updating Lark card, your primary window for **perceiving and controlling the CLI** on your phone or in Lark.
+
+![Streaming card](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419090587_img_v3_0212a_553ca347-4a93-491f-a2ef-30d00a374cdg.jpg)
+
+- **Live screenshots of the terminal refreshed onto the card**: xterm renders headlessly into an image that **faithfully reproduces the CLI's TUI** (borders and colors are all there), instead of converting output to Markdown. One click to "Show / Hide output," "Export text," and "Half-page up / down."
+- **Live status indicator**: the card's header color *is* the status (a Lark card template, not an emoji dot in the body) — **Starting…** (yellow) → **Working** (blue) → **Waiting for input** (green); when the quota is used up it shows **Limit reached** (red), turning to **Retryable** (green) when it can retry. When the main turn has ended but background work it started (a background agent, a `run_in_background` Bash, a Monitor; Grok background tasks) is still running, the header reads **⏳ Main turn ended · background tasks running (N)** (light blue), with N matching the background tasks shown in the web terminal; it returns to Working when a finished task wakes the main agent, and only shows the turn as done once everything has finished.
+- **Operate directly from the card**: open the Web terminal, 🔑 grab an operation link, close the session, and — when the quota is retryable — "🔁 Resend last task."
+- **A fresh card per turn**: the previous card freezes as an archive, keeping conversation history clear and traceable; after a session is moved to another group with [`/relay`](/en/relay), the original card also automatically freezes as an archive (buttons removed).
+- **A "recoverable" card on close**: it carries a "▶️ Resume session" button to click back in anytime; **if the CLI supports native resume** (the adapter implements `buildResumeCommand` and a native session id exists), it also includes the native command (e.g. `claude --resume <id>`) for manual recovery; when unsupported, only botmux's resume button plus a short note is shown.
+
+## The four display layers of a turn
+
+botmux's "presence" in Lark has four independently switched layers:
+
+| Layer | What it is | How to turn it off |
+|-------|------------|--------------------|
+| **Streaming status card** | The per-turn live-screenshot card (the main subject of this page) | Bot-level `disableStreamingCard`, or `/card off` for this chat |
+| **Thinking bubble (CoT)** | Intermediate narration / thinking messages while the CLI works | Bot-level `cotEnabled: false`, or `/cot off` for this chat; `/cot show` reveals one round on demand |
+| **✋ → ✅ reactions** | Progress reactions on **your triggering message**: ✋ when accepted, flipped to ✅ when the worker goes idle | Bot-level `silentTurnReactions: true` |
+| **Proactive CLI messages** | Rich-text / image messages the agent sends via `botmux send` | No switch — sent on demand (see below) |
+
+Reactions and streaming cards are **mutually exclusive per turn**: the ✋→✅ reactions appear only when "streaming cards are off for this chat" — with no live status window, the reaction is the only lightweight progress signal; a card-enabled chat gets no reactions.
+
+## Card / thinking switches: bot-level vs per-chat
+
+| Display layer | Bot-level default (Bot config / Dashboard **Bot Defaults**) | Per-chat override (in-group slash command) | Default |
+|---------------|-------------------------------------------------------------|--------------------------------------------|---------|
+| Streaming status card | `disableStreamingCard` | `/card off` / `/card on` (writes `noCardChats`); bare `/card` summons one immediately; `/card pin …` controls pinning | On |
+| Thinking bubble | `cotEnabled` | `/cot off` / `/cot on` (writes `noCotChats`); `/cot show` reveals one round; bare `/cot` shows status | On |
+| ✋ → ✅ reactions | `silentTurnReactions` | No per-chat command | Card-off chats get reactions automatically; `silentTurnReactions: true` silences even those |
+| Card controls | `hiddenStreamingCardButtons` (choose which buttons to hide) | — | All shown |
+| Card pinning | `pinStreamingCard` (default off) | `/card pin off｜on｜status` | Off |
+
+A per-chat override wins over the bot-level default and affects only that chat.
+
+**`/card` and `/cot` are admin-only (`allowedUsers`, canOperate)**, status subcommands included. The reason: Lark cards have no "show different views per person" capability — these switches are bot-level / chat-wide, so one change alters what **everyone in the group** sees; guests (talk access, no operate rights) get an "authorized users only" notice.
+
+**Quiet preset** (Dashboard **Bot Defaults** page, new in this batch): one click performs a **one-time linked write** — `cotEnabled:false` + `silentTurnReactions:true` + `disableStreamingCard:true` — for groups that only want the conclusion, quietly. It is **not a persistent binding**: it simply writes those three existing switches to the values above once and shows a toast; turning the preset off later does **not** revert the three values, so re-enable each switch manually if you want it back.
+
+## Pinning The Current Live Card
+
+When a bot enables `pinStreamingCard`, Botmux tries to pin the **current public live-status card** to the top of the chat so the close-session and terminal entry points stay easy to reach.
+
+- This is a **per-bot, opt-in, default-off** setting.
+- Pinning is still **chat-wide** at the Feishu layer, while each active session keeps its own current/frozen streaming-card lifecycle. If the same chat has multiple active topics or multiple bots, you may therefore see multiple independently managed group-level Pin entries.
+- Only the current public live-status real `streamCardId` participates.
+- Repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay **out of scope**.
+- After the switch changes through the dashboard or `/botconfig set pinStreamingCard on/off`, Botmux immediately runs a best-effort hot reconciliation across that bot's **existing active sessions**; the configuration response itself does not wait for Feishu Pin/Unpin completion.
+- `/card pin off` is the **per-chat escape hatch**: it stops Botmux from pinning streaming cards in the current chat while keeping live cards themselves enabled. `/card pin on` restores Pin for that chat, and `/card pin status` reports whether Pin is off at the bot level, opted out for this chat, or effectively on.
+- Failures are **fail-open**: they never interrupt card publication, transfer, resume, close, or the configuration write. During exceptional periods you may temporarily see zero Pins or multiple Pins.
+- The feature keeps no durable retry journal, and startup recovery remains deliberately narrow. On restart, Botmux lists the chat's current Pins as the single ownership authority for persisted cards: a remote Pin counts only when Feishu reports `operator_id_type: "app_id"` for the same `larkAppId`, and cleanup is further restricted to the strict intersection with the enqueue-time local candidate IDs already known to this process. An already-Pinned current card with human, other-app, mixed, or malformed provenance is left untouched and is not re-pinned. If the current card is absent, Botmux accepts a create only when the returned `data.pin` repeats both the exact message ID and same-app provenance. Botmux never broad-cleans arbitrary remote Pins, and any lookup or Pin API failure stays fail-open. Explicit bot-wide/per-chat off cleans process-owned IDs plus locally known IDs freshly proven same-app; ordinary disable, close, and transfer clean process-owned IDs only.
+
+> **Open terminal = read-only**: the card's main "🖥️ Open Web Terminal" button is read-only viewing; for **writable** control, tap "🔑 Get operation link" — delivered **privately**: a flat group prefers an in-chat "visible-to-you" ephemeral card (so you never leave the conversation), falling back to a DM only for topic/thread or p2p chats, or when the ephemeral card fails. Management buttons like "🔄 Restart" and "apply profile" live on the **session card**, not on each turn's streaming card.
+
+## Interrupting / correcting a running turn
+
+To stop or correct it mid-turn, **don't wait for it to finish**: in screenshot mode the card carries a row of quick keys at the bottom — **Esc, ^C, Tab, Space, Enter, arrow keys, ⇞ Half-page up / ⇟ Half-page down**. Tapping `Esc` writes the ESC byte straight into the live terminal (exactly like pressing Esc locally); `^C` likewise. After interrupting, just add a new instruction.
+
+> This quick-key row only appears when **output is shown (screenshot mode)** and the backend isn't `riff` — "Show output" first, then Esc is available. The default behavior is not to interrupt the current turn; new messages queue (type-ahead) and are fed in after the turn ends. To correct immediately, use Esc to break first.
+
+## Messages the CLI proactively sends
+
+The card body is a **live screenshot (image)** of the terminal, not text rendering. Messages the CLI proactively sends (via `botmux send`) are separate rich-text / image-and-text messages that can carry images, files, and @mentions; for fully custom display, `--card-file` / `--card-json` can send raw interactive card JSON.
+
+> ⚠️ Raw cards allow **display-only elements + open_url buttons only**: any callback-firing control — callback buttons (with a `value`), dropdown / person selects, date-time pickers, inputs, form submits — is rejected. This prevents custom cards from forging interactive callbacks.
+
+## Custom card usage segments
+
+You can append your own text to the usage line (`ctx 23% · 5h 18% · 7d 5%`), e.g. gateway account quotas, build status or who is on call. Configure a command on the bot in bots.json:
+
+```json
+"cardFooterExtension": {
+  "command": "~/.botmux/scripts/quota.sh",
+  "refreshSeconds": 60
+}
+```
+
+- The daemon runs `/bin/sh -c <command>` lazily, only while cards are being rendered: when the cached result is at least `refreshSeconds` old (default 60, range 10–3600) a refresh starts in the background. There is no standalone timer, so no command runs while the bot sends no cards, and the first card after a long idle period may still show the previous result for up to 10 minutes; all of the bot's sessions share one result. Rendering a card only reads the cache and never waits for the command
+- Output one segment per line, or JSON `{"segments": ["…", "…"]}`; at most 4 segments of at most 40 characters each, rendered as plain text (markdown is escaped)
+- The environment carries `BOTMUX_LARK_APP_ID`, `BOTMUX_CLI_ID` and `BOTMUX_BOT_NAME` (the **bot-configured** CLI; it does not follow a session's temporary CLI override, since the result is shared per bot); stdin is closed, the timeout is 3 seconds, and a non-zero exit counts as a failure
+- On failure or timeout the last good result is kept; once the last success is older than 10 minutes nothing is shown
+- Works for every CLI; shown wherever `usageDisplay` puts the usage line (live card or reply-card footer) and hidden with it under `off`. Without the setting, cards are byte-for-byte unchanged
+
+Example output:
+
+```
+01 5h 2% 7d 2%
+02 5h 4% 7d 2%
+```
+
+renders as `ctx 14% · 01 5h 2% 7d 2% · 02 5h 4% 7d 2%`.
+
+## Charts in messages (vega-lite)
+
+A ` ```vega-lite ` fence in a `botmux send` body renders as a native Feishu Card 2.0 chart; other channels such as a Web view can render the same Vega-Lite directly. Supported subset:
+
+- Inline `data.values` only, at most 500 rows, values are string / number / boolean / null.
+- `mark`: `bar` (horizontal when only x is quantitative), `line`, `area`, `point`, `arc` (pie; `innerRadius > 0` for a donut). A pie takes only `theta` (value) + `color` (category); `x`/`y` are rejected and `theta` has no `title`.
+- Encoding channels: `x`, `y`, `color` (series), `theta` (pie value); each channel accepts only `field`, `type`, `title`. `x`/`y` titles become axis titles and the `color` title becomes the legend title. `type: temporal` is not parsed as a date: values are shown as categories in the given order, so sort them first.
+- At most 5 charts per card. The real limit is Feishu's **30KB card message request body** (including the envelope and the re-serialized `content`): once the card is assembled, charts that do not fit step down chart → 50-row data table → 10-row data table → notice only until the card fits. A single spec source is also capped at 30KB for parsing.
+
+Safety: the host **rebuilds** the VChart spec from recognised fields and never forwards the source JSON. `data.url`, `transform`, `params`, `expr`, `signal`, `datasets`, `layer` and similar are rejected. Unsupported or over-budget charts degrade to a one-line notice plus a plain-text data table (cells never become links or mentions), `botmux send` prints the reason on stderr, and the message is still delivered.
+
+`botmux send --dry-run` previews the rendering: it prints `{dryRun, bytes, fits, diagnostics, card}` (`bytes` is the Feishu request body size) without sending and without a session. It renders the body only (no image/file upload, mentions or footer).
+
+## Updating a card after sending (card patch)
+
+A successful `botmux send --card-file/--card-json` prints `{"success":true,"messageId":"om_...",...}`. `botmux card patch` updates that same card **in place** by its messageId — no new message, same chat/topic — which makes it ideal for progress cards:
+
+```bash
+# 1. Send an "in progress" card and grab its messageId from the JSON output
+botmux send --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"Deploy progress"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"Progress: 0%"}]}}' --no-mention
+# → {"success":true,"messageId":"om_xxx","sessionId":"..."}
+
+# 2. Extract the messageId with jq, then patch it to 50%
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"blue","title":{"tag":"plain_text","content":"Deploy progress"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"Progress: 50%"}]}}'
+
+# 3. Patch once more when done
+botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","header":{"template":"green","title":{"tag":"plain_text","content":"Deploy done"}},"body":{"direction":"vertical","elements":[{"tag":"markdown","content":"✅ Shipped"}]}}'
+```
+
+- The replacement card JSON goes through the **same safety validation** as sending (display-only + open_url; callback controls are rejected).
+- The `send` examples pass `--no-mention`: a progress card doesn't need to @ anyone, and explicitly opting out avoids the mention-policy gate (exit 2).
+- Bot identity is resolved from the session context (same as `send`); errors such as a withdrawn message, missing permission, or a non-card target are surfaced as-is (exit 1).
+- Success prints `{"success":true,"messageId":"om_xxx","sessionId":"..."}` (JSON only on stdout); usage errors exit 2.
+
+## Signed button: start a turn as the clicker
+
+A local integrator can ask the bot to post a single-use button into a chat it belongs to. The click starts a session turn whose `senderOpenId` is the **clicker**, the same way a message from that person would. When `triggerUserAuth` is on (`credentialSource: local`), credentials are issued for that turn sender. The session owner and creator are never a fallback.
+
+The daemon HMAC-signs the prompt, the target chat or session, the optional working directory and chat type, a nonce, and an expiry. The secret and the nonce file are per bot, under `<dataDir>/card-click-turn/<larkAppId>/` (`secret` and `nonces.json`). The session data directory is shared by every bot daemon in a fleet, so those files do not live at the data-dir root. A consume takes a cross-process lock and reloads the file first, so one daemon's rewrite cannot drop a nonce another daemon already used. Tampered, expired, and replayed clicks are rejected. Expiry is checked before the nonce is consumed, so the error is expiry rather than replay. A restart cannot reuse an unexpired button.
+
+The clicker must pass the same `evaluateTalk` checks as a message sender (allowed users, blocked users, grants), plus `canOperate` (with an `on_` union id when the callback has one) and `grantCommandRestriction`. A grant-only talker cannot use the button. While `restrictGrantCommands` is on, a click whose talk reason is `chatGrant` or `globalGrant` is rejected too. An app or bot gets no identity and does not start a turn. The evidence is a same-host peer, an identity-cache type of `bot` or `app`, or any of the three union-id tables (`isTeamBot`, `isPlatformTeamBot`, `isTrustedSameOwnerSiblingBot`). An operator with none of that evidence is still treated as a human. Card callbacks carry no platform `sender_type`; do not call `resolveSender` just to probe, because a missing type is written into the cache as `user`.
+
+A `cct_` turn is intentionally outside `isOrdinaryImTurnId` and outside the `om_` / `join_` human-registry whitelist. It has no ordinary-message delivery receipt, ACK, or cold-start retry. Current-turn provenance uses `session.lastCallerOpenId`, written with the quote target at the start of the turn, so both a new session and an existing session resolve the CLI caller as the clicker rather than the previous speaker. A principal-lane session, and any click while cross-principal interruption is enabled, is rejected before the nonce is consumed. The toast says so, and the click does not write `activeInteractiveTurn`.
+
+The card callback's immediate toast only says the click is starting. After the worker accepts the input, the chat gets "Started this turn as you". A failed delivery rolls back the quote target, reply target, `lastCallerOpenId`, and `activeInteractiveTurn` written for that attempt, then posts the failure instead. A session created by the button uses `creationSource: ordinary-feishu`, so a bot with a Codex instance pool does not leave the new session on the legacy instance.
+
+The signed target is exactly one of `chatId` or `sessionId`. A `sessionId` must already be an active session for this bot; a miss does not spawn a replacement and does not borrow that session's owner. A `chatId` with no chat-scope session creates one whose owner and creator are the clicker, and it requires an existing absolute working directory. An existing session whose working directory differs from the signed path is rejected. A new session with no signed `chatType` is authorized as a group; a private chat must be signed `p2p` or `p2pOpen` will not apply.
+
+The posting endpoint is the daemon IPC `POST /api/cards/click-turn` (same local HMAC as `POST /api/sessions/spawn`, and the daemon must already be bound to this bot). It is not a core-only public route.
+
+| Field | Meaning |
+| --- | --- |
+| `prompt` | Required. Sent as this turn's user text, at most 1500 characters |
+| `chatId` / `sessionId` | Exactly one. A chat-scope session for that chat, or one existing session |
+| `postChatId` | Where to post the card. Defaults to `chatId`. Required when only `sessionId` is set |
+| `workingDir` | Optional existing absolute path. Required when the click would create a session |
+| `chatType` | Optional `group` or `p2p` |
+| `ttlMs` | Optional, from 1 minute to 7 days. Default 1 hour |
+| `buttonLabel` / `title` | Optional |
+
+Success returns `{ ok, messageId, exp }`. If the bot is not in the destination chat the response is 403 `bot_not_in_chat`.

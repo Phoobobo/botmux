@@ -9,6 +9,7 @@
  * not call `botmux send`.
  */
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -24,6 +25,25 @@ interface HermesMessageRow {
   content: unknown;
   timestamp?: number;
   finish_reason?: string | null;
+}
+
+export function resolveHermesStateDbPath(
+  env: Record<string, string | undefined> = process.env,
+  opts: { botmuxSessionProfile?: boolean } = {},
+): string {
+  const explicitStateDb = env.BOTMUX_HERMES_STATE_DB?.trim();
+  if (explicitStateDb) return explicitStateDb;
+  if (opts.botmuxSessionProfile) {
+    const sessionId = env.BOTMUX_SESSION_ID?.trim();
+    if (sessionId) {
+      const sourceHome = env.HERMES_BOTMUX_SOURCE_HOME?.trim() || env.HERMES_HOME?.trim() || join(homedir(), '.hermes');
+      const profilesRoot = env.HERMES_BOTMUX_PROFILES_ROOT?.trim() || join(sourceHome, 'profiles');
+      const sessionHash = createHash('sha256').update(sessionId).digest('hex').slice(0, 16);
+      return join(profilesRoot, `botmux-${sessionHash}`, 'state.db');
+    }
+  }
+  const hermesHome = env.HERMES_HOME?.trim();
+  return hermesHome ? join(hermesHome, 'state.db') : HERMES_STATE_DB;
 }
 
 function decodeContent(content: unknown): string {
@@ -90,12 +110,13 @@ export function drainHermesStateDb(fromOffset: number, dbPath = HERMES_STATE_DB)
     if (typeof row.id === 'number' && row.id > newOffset) newOffset = row.id;
     const text = decodeContent(row.content).trim();
     if (!text) continue;
+    const sourceSessionId = row.session_id?.trim() || undefined;
     const timestampMs = typeof row.timestamp === 'number' ? row.timestamp * 1000 : Date.now();
     if (row.role === 'user') {
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId: row.session_id });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'user', text, sourceSessionId, preserveMarkTimeMs: true });
     } else if (row.role === 'assistant') {
       if (row.finish_reason !== 'stop') continue;
-      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId: row.session_id });
+      events.push({ uuid: `hermes:${row.id}`, timestampMs, kind: 'assistant_final', text, sourceSessionId });
     }
   }
   return { events, newOffset };
@@ -112,4 +133,50 @@ print(row[0] or 0)
   const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
   if (proc.status !== 0) return 0;
   return Number.parseInt(proc.stdout.trim(), 10) || 0;
+}
+
+export function hermesSessionExists(sessionId: string | undefined, dbPath = HERMES_STATE_DB): boolean | undefined {
+  const sid = sessionId?.trim();
+  if (!sid || !existsSync(dbPath)) return undefined;
+  // Three-state, deliberately conservative (the CliAdapter contract only lets us
+  // force a fresh session when we can PROVE the target is absent):
+  //   1       -> session provably exists  -> true
+  //   0       -> session provably absent  -> false
+  //   unknown -> can't tell (unrecognized schema / query error) -> undefined
+  //
+  // Hermes resume is authoritative on `sessions.id` (SessionDB.get_session in
+  // hermes-agent 0.18.x). An orphan row in `messages` whose session_id is not
+  // in `sessions` is NOT resumable, so once a `sessions` table is present we
+  // trust it alone and never let a stray message vote "exists". The `messages`
+  // fallback is only for older schemas that predate the `sessions` table. If we
+  // recognize neither table (unknown/future schema) we return unknown rather
+  // than "absent", so the worker keeps the resume attempt instead of silently
+  // dropping context to a fresh start.
+  const script = `
+import sqlite3
+conn = sqlite3.connect(${JSON.stringify(dbPath)})
+sid = ${JSON.stringify(sid)}
+
+def has_table(name):
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1", (name,)).fetchone()
+    return row is not None
+
+if has_table('sessions'):
+    row = conn.execute("SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (sid,)).fetchone()
+    print('1' if row is not None else '0')
+    raise SystemExit(0)
+
+if has_table('messages'):
+    row = conn.execute("SELECT 1 FROM messages WHERE session_id = ? LIMIT 1", (sid,)).fetchone()
+    print('1' if row is not None else '0')
+    raise SystemExit(0)
+
+print('unknown')
+`;
+  const proc = spawnSync('python3', ['-c', script], { encoding: 'utf8' });
+  if (proc.status !== 0) return undefined;
+  const out = proc.stdout.trim();
+  if (out === '1') return true;
+  if (out === '0') return false;
+  return undefined;
 }

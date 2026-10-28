@@ -50,8 +50,8 @@ describe('antigravity history.jsonl marker contract', () => {
 
   it('matches a real-world agy history line containing a botmux prompt', () => {
     // Verbatim shape produced by agy 1.0 — `<` already encoded as \u003c.
-    const onDiskLine = '{"display":"\\u003cuser_message\\u003e\\n潮种你好\\n\\u003c/user_message\\u003e","timestamp":1779347235804,"workspace":"/Users/bytedance"}';
-    const marker = jsonEncodedPrefix('<user_message>\n潮种你好\n</user_message>');
+    const onDiskLine = '{"display":"\\u003cuser_message\\u003e\\n示例你好\\n\\u003c/user_message\\u003e","timestamp":1779347235804,"workspace":"/Users/example"}';
+    const marker = jsonEncodedPrefix('<user_message>\n示例你好\n</user_message>');
     expect(onDiskLine.includes(`"display":"${marker}`)).toBe(true);
   });
 
@@ -94,9 +94,10 @@ describe('antigravity adapter — high-level invariants', () => {
     expect(a.altScreen).toBe(true);
   });
 
-  it('omits readyPattern/completionPattern (uses idle-detector quiescence)', () => {
+  it('requires the input footer before quiescence can indicate readiness', () => {
     const a = createAntigravityAdapter('/usr/local/bin/agy');
-    expect(a.readyPattern).toBeUndefined();
+    expect(a.readyPattern?.test('? for shortcuts')).toBe(true);
+    expect(a.readyPattern?.test('esc to cancel')).toBe(false);
     expect(a.completionPattern).toBeUndefined();
   });
 

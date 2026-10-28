@@ -98,6 +98,83 @@ export function evaluatePidResolverPullback(
   return { suppress: false, clearStale: true };
 }
 
+// ─── Pid-state switch history cutoff ───────────────────────────────────────
+
+/** Skew allowed between a Lark mark and Claude's write of that user line —
+ *  the same bound the fingerprint switch scans and splits with. */
+export const PENDING_MARK_SKEW_MS = 5_000;
+
+export interface PidRotationCutoffInput {
+  /** Last moment the bridge's current path was confirmed: bridge attach, the
+   *  previous switch, or a pid-resolver tick that reported `'same'`. */
+  confirmedAtMs: number;
+  /** Mark times of Lark turns whose user line has not been read yet. */
+  unstartedMarkTimesMs: readonly number[];
+}
+
+/**
+ * Where a pid-state switch splits the transcript it moves onto: events at or
+ * before the returned time are absorbed as history, later ones are ingested.
+ *
+ * The pid-state record names the transcript Claude writes NOW, not since when.
+ * The last confirmation of the previous path bounds that from below: whatever
+ * was written after it may belong to a turn the bridge has not read; whatever
+ * was written before was read from the previous path or predates this worker.
+ * The target is often not a new file — an in-pane `/resume` returns to an old
+ * conversation, and a daemon restart that missed a `/clear` finds hours of
+ * turns in the post-clear file — so reading it from offset 0 would replay them.
+ *
+ * A Lark mark still waiting for its user line pulls the cutoff earlier so that
+ * line stays live (strictly older than the fingerprint scan's floor).
+ */
+export function pidRotationHistoryCutoffMs(input: PidRotationCutoffInput): number {
+  let cutoff = input.confirmedAtMs;
+  for (const markMs of input.unstartedMarkTimesMs) {
+    cutoff = Math.min(cutoff, markMs - PENDING_MARK_SKEW_MS - 1);
+  }
+  return cutoff;
+}
+
+// ─── Recording the conversation Claude moved to ────────────────────────────
+
+export interface PidStateSessionRecordInput {
+  /** Session id Claude's pid-state record names, for the transcript the bridge
+   *  reads now. */
+  observedSessionId: string;
+  /** What a cold start would resume: the recorded CLI session id, else the
+   *  botmux session id the CLI was launched with. */
+  resumeSessionId: string;
+  /** An adopted CLI: botmux never relaunches it (the session closes when its
+   *  pane goes away), so there is no resume target to keep current. */
+  adopted: boolean;
+  /** Whether the observed session's transcript holds a conversation
+   *  `--resume` can open. Reads the file, so it is asked last. */
+  transcriptResumable: () => boolean;
+}
+
+/**
+ * Should the worker record the session id Claude's pid-state record names as
+ * the one to resume?
+ *
+ * Claude 2.1.305+ rewrites `sessions/<pid>.json` the moment it moves to
+ * another conversation — `/clear`, an in-pane `/resume`, `/branch` (`/compact`
+ * stays in the same one). Otherwise the id is reported only around a Lark
+ * message's submit, so after a `/clear` followed by local turns alone the next
+ * cold start (`--resume <recorded id>`) brought back the conversation the user
+ * had just cleared.
+ *
+ * Only once its transcript holds a conversation: `--resume` of an id without
+ * one makes Claude exit ("No conversation found"). A `--fork-session` launch
+ * names its new id before the file exists, and the file starts out as a few
+ * metadata records before the conversation lands in it (2.1.308). Until then
+ * the recorded id stays what it was — which is what the next start resumes, or
+ * forks from again.
+ */
+export function shouldRecordPidStateSessionId(input: PidStateSessionRecordInput): boolean {
+  if (input.adopted || input.observedSessionId === input.resumeSessionId) return false;
+  return input.transcriptResumable();
+}
+
 // ─── Two-phase fingerprint-fallback decision ───────────────────────────────
 
 /** UUID-shaped Claude jsonl filename (sessionId.jsonl). Duplicated from
@@ -183,4 +260,52 @@ export function decideFingerprintSwitch(
     return { action: 'abstain', reason: 'multiple-unknown-exact', candidates: exact };
   }
   return { action: 'switch', path: exact[0], reason: 'unknown-sid-exact' };
+}
+
+// ─── Absent-baseline self-heal ─────────────────────────────────────────────
+
+export interface AbsentBaselineHealInput {
+  /** Whether the bridge has already completed baseline (gate already open). */
+  baselineDone: boolean;
+  /** Whether a `bridgeJsonlPath` is currently pinned. */
+  hasJsonlPath: boolean;
+  /** Whether that pinned path currently exists on disk. */
+  jsonlFileExists: boolean;
+}
+
+/**
+ * Decide whether a pending Lark turn arriving against a not-yet-baselined
+ * bridge should SELF-HEAL by arming fresh-empty readiness, instead of being
+ * dropped with "baseline not ready".
+ *
+ * Background: in `baseline-existing` (resume / restart-restore) mode the
+ * worker pins `bridgeJsonlPath` to `<sessionId>.jsonl` and waits for that
+ * file to appear before baselining. If Claude wrote its transcript under a
+ * DIFFERENT sessionId than the one we guessed — `--session-id` not honoured,
+ * a stale resume id, or an /adopt sid persisted as the botmux sid — the
+ * guessed file never appears, `baselineDone` stays false forever, and every
+ * turn is dropped ("baseline not ready"). The bridge is then permanently
+ * stuck on a path that does not exist (the user-reported "message went into
+ * the PTY but final_output was never attributed" symptom). The pid-state
+ * resolver that would normally correct this needs a live CLI pid, which is
+ * often missing on restart-restore — so the only recovery path that still
+ * works is the exact-content fingerprint scan, and IT is starved because no
+ * turn is ever marked.
+ *
+ * An ABSENT file has no prior history to absorb, so it is safe to declare
+ * fresh-empty readiness (offset 0, baseline done) here: the pending turn
+ * then gets marked, which arms the per-tick exact-content fingerprint
+ * recovery (`decideFingerprintSwitch`) to discover the jsonl Claude actually
+ * appended this message to and switch the bridge onto it — no dependence on
+ * Claude's internal pid-state / tasks files, so it is Claude-version-robust.
+ *
+ * Returns true ONLY when baseline isn't done, a path is pinned, and that
+ * path is absent. When the file EXISTS (the genuine slow-resume-with-history
+ * case), this returns false so normal lazy-baseline runs instead and prior
+ * turns are absorbed rather than re-emitted.
+ */
+export function shouldHealAbsentBaseline(input: AbsentBaselineHealInput): boolean {
+  if (input.baselineDone) return false;
+  if (!input.hasJsonlPath) return false;
+  return !input.jsonlFileExists;
 }

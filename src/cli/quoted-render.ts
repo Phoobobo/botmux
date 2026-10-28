@@ -1,15 +1,36 @@
 /**
- * Pure-function render pipeline for `botmux quoted`. Extracted so unit tests
+ * Fetch/render pipeline for `botmux quoted`. Extracted so unit tests
  * can exercise the wire-up (numberer sharing, extraResources merging) without
  * spinning up the CLI dispatcher or hitting Lark APIs.
  */
 import type { LarkMessage } from '../types.js';
+import { LARK_CODE_MESSAGE_INTERNAL_ERROR, structuredLarkCode } from '../im/lark/lark-errors.js';
 import {
   parseApiMessage,
   extractResources,
   createImgNumberer,
   type MessageResource,
 } from '../im/lark/message-parser.js';
+
+/** Keep full card JSON on successful lookups. Some merge_forward parents return
+ *  Lark 2200 with user_card_content; retry once without that parameter so the
+ *  renderer can reach the existing forwarded-tree/card recovery pipeline. */
+export async function getQuotedMessageDetail(
+  larkAppId: string,
+  messageId: string,
+  getMessageDetail: typeof import('../im/lark/client.js').getMessageDetail,
+): Promise<any> {
+  try {
+    return await getMessageDetail(larkAppId, messageId);
+  } catch (err) {
+    // Only the known provider error gets a representation fallback. Permission,
+    // withdrawn-message, rate-limit and transport failures remain failures.
+    if (structuredLarkCode(err) !== LARK_CODE_MESSAGE_INTERNAL_ERROR) throw err;
+    // 2200 describes a representation failure, not one message type. Standalone
+    // cards can also degrade to a placeholder; the fallback is attempted once.
+    return getMessageDetail(larkAppId, messageId, { userCardContent: false });
+  }
+}
 
 /** Subset of expandMergeForward used here — accepts the parsed message and a
  *  numberer, mutates parsed.content to the rendered tree, returns extra
@@ -19,10 +40,23 @@ export type ExpandMergeForwardFn = (
   messageId: string,
   parsed: LarkMessage,
   numberer: ReturnType<typeof createImgNumberer>,
+  initialDetail?: { items?: any[] },
 ) => Promise<{ extraResources: MessageResource[] }>;
+
+/** Subset of resolveMergedCardContent used here (dependency-injected so tests
+ *  can stub it): resolves an interactive card to its merged text + structured
+ *  JSON + resources, numbering [图片 N] via the given numberer. */
+export type ResolveMergedCardFn = (
+  larkAppId: string,
+  messageId: string,
+  numberer: ReturnType<typeof createImgNumberer>,
+) => Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null>;
 
 export interface RenderedQuotedMessage extends LarkMessage {
   resources: MessageResource[];
+  /** Structured card JSON from the merge pass — set only for interactive
+   *  messages that were successfully re-resolved (`quoted --raw` → cardJson). */
+  mergedStructuredContent?: string;
 }
 
 /**
@@ -41,6 +75,8 @@ export async function renderQuotedMessage(
   larkAppId: string,
   rawMessage: any,
   expandMergeForward: ExpandMergeForwardFn,
+  resolveMergedCard?: ResolveMergedCardFn,
+  initialDetail?: { items?: any[] },
 ): Promise<RenderedQuotedMessage> {
   const numberer = createImgNumberer();
   // Order: extractResources first so top-level keys get their numbers, then
@@ -51,8 +87,23 @@ export async function renderQuotedMessage(
   const resources = extractResources(rawMessage.msg_type ?? '', rawMessage.body?.content ?? '', numberer);
   const parsed = parseApiMessage(rawMessage, numberer);
   if (parsed.msgType === 'merge_forward') {
-    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer);
+    const { extraResources } = await expandMergeForward(larkAppId, parsed.messageId, parsed, numberer, initialDetail);
     resources.push(...extraResources);
+  }
+  // Interactive cards: union both im.message.get representations so the quoted
+  // view matches history/live. Fresh numberer + FULL replacement (content AND
+  // resources): the merge re-renders the card from scratch, so [图片 N] must
+  // restart at 1 aligned with merged.resources — reusing the numberer above
+  // would leave merged text misnumbered, and keeping the pre-merge resources
+  // would let the list view's upgrade-fallback shell image linger. Attachment
+  // download (in cmdQuoted) runs on the replaced list.
+  if (parsed.msgType === 'interactive' && resolveMergedCard) {
+    const cardNumberer = createImgNumberer();
+    const merged = await resolveMergedCard(larkAppId, parsed.messageId, cardNumberer).catch(() => null);
+    if (merged) {
+      parsed.content = merged.text;
+      return { ...parsed, resources: merged.resources, mergedStructuredContent: merged.structuredContent };
+    }
   }
   return { ...parsed, resources };
 }

@@ -1,0 +1,181 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Session } from '../src/types.js';
+
+vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+  updateSession: vi.fn(),
+}));
+
+import * as sessionStore from '../src/services/session-store.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import {
+  buildBotmuxLarkNativeSessionTitle,
+  extractBotmuxLarkNativeSessionTitlePrompt,
+  normalizeSessionTitleSource,
+  updateSessionTitle,
+} from '../src/core/session-title.js';
+
+function makeSession(): Session {
+  return {
+    sessionId: 'session-1',
+    chatId: 'chat-1',
+    rootMessageId: 'root-1',
+    title: 'Old title',
+    status: 'active',
+    createdAt: '2026-07-13T00:00:00.000Z',
+  };
+}
+
+describe('buildBotmuxLarkNativeSessionTitle', () => {
+  it('brands the title and strips consecutive leading mentions', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux Oncall @CoCo  排查这个 logid', [
+      { name: 'Botmux' },
+      { name: 'Botmux Oncall' },
+      { name: 'CoCo' },
+    ])).toBe('[BotMux·Lark] 排查这个 logid');
+  });
+
+  it('keeps ambiguous unstructured text intact instead of splitting a multi-word mention', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux Oncall 看下这个问题'))
+      .toBe('[BotMux·Lark] @Botmux Oncall 看下这个问题');
+  });
+
+  it('flattens whitespace and control characters', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('  第一行\n\t第二行\u0000  结论')).toBe('[BotMux·Lark] 第一行 第二行 结论');
+  });
+
+  it('falls back for empty topic content', () => {
+    expect(buildBotmuxLarkNativeSessionTitle('@Botmux', [{ name: 'Botmux' }])).toBe('[BotMux·Lark] 新话题');
+    expect(buildBotmuxLarkNativeSessionTitle('@@Botmux', [{ name: 'Botmux' }])).toBe('[BotMux·Lark] 新话题');
+    expect(buildBotmuxLarkNativeSessionTitle(undefined)).toBe('[BotMux·Lark] 新话题');
+  });
+
+  it('uses the group name when mention-only topic content has no semantic title', () => {
+    expect(buildBotmuxLarkNativeSessionTitle(
+      '@@Botmux',
+      [{ name: 'Botmux' }],
+      '  BotMux 标题优化群  ',
+    )).toBe('[BotMux·Lark] BotMux 标题优化群');
+    expect(buildBotmuxLarkNativeSessionTitle(
+      '@Botmux 排查这个 logid',
+      [{ name: 'Botmux' }],
+      '不会覆盖正文',
+    )).toBe('[BotMux·Lark] 排查这个 logid');
+  });
+
+  it('limits the complete title to 200 characters with an ellipsis', () => {
+    const title = buildBotmuxLarkNativeSessionTitle('话'.repeat(300));
+
+    expect(Array.from(title)).toHaveLength(200);
+    expect(title.startsWith('[BotMux·Lark] ')).toBe(true);
+    expect(title.endsWith('…')).toBe(true);
+  });
+});
+
+describe('extractBotmuxLarkNativeSessionTitlePrompt', () => {
+  it('extracts only the first user message from the Botmux routing envelope', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(`
+<botmux_routing>不要把这段路由说明当成标题</botmux_routing>
+<user_message>
+@TestBot 调查图片生成返回 12008 的原因
+</user_message>
+<sender type="user" name="Alice" />
+`, [{ name: 'TestBot' }])).toBe('调查图片生成返回 12008 的原因');
+  });
+
+  it('strips duplicated and consecutive known mentions before extracting the topic', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@@TestBot @CoCo 帮我查下当前会话标题</user_message>',
+      [{ name: 'TestBot' }, { name: 'CoCo' }],
+    )).toBe('帮我查下当前会话标题');
+  });
+
+  it('removes transport hints and bounds the untrusted model input', () => {
+    const prompt = extractBotmuxLarkNativeSessionTitlePrompt(
+      `[用户引用了消息 用 botmux quoted om_xxx 查看]\n${'话'.repeat(2_100)}`,
+    );
+
+    expect(prompt).toBe('话'.repeat(2_000));
+  });
+
+  it('returns undefined when no user topic remains', () => {
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@TestBot</user_message>',
+      [{ name: 'TestBot' }],
+    )).toBeUndefined();
+    expect(extractBotmuxLarkNativeSessionTitlePrompt(
+      '<user_message>@@TestBot</user_message>',
+      [{ name: 'TestBot' }],
+    )).toBeUndefined();
+  });
+});
+
+describe('updateSessionTitle', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('normalizes, persists, and publishes one dashboard patch with title metadata', () => {
+    const session = makeSession();
+    session.nativeSessionTitleAwaitingContent = true;
+    const events: DashboardEvent[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+    let result;
+
+    try {
+      result = updateSessionTitle(session, '  First line\n  Second line  ', 'agent');
+    } finally {
+      unsubscribe();
+    }
+
+    expect(result).toMatchObject({
+      ok: true,
+      title: 'First line Second line',
+      source: 'agent',
+    });
+    expect(session).toMatchObject({
+      title: 'First line Second line',
+      titleSource: 'agent',
+      titleUpdatedAt: expect.any(String),
+    });
+    expect(session.nativeSessionTitle).toBe('First line Second line');
+    expect(session.nativeSessionTitleUserDefined).toBe(true);
+    expect(session.nativeSessionTitleAwaitingContent).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(session);
+    expect(events).toEqual([{
+      type: 'session.update',
+      body: {
+        sessionId: 'session-1',
+        patch: {
+          title: 'First line Second line',
+          titleUpdatedAt: session.titleUpdatedAt,
+          titleSource: 'agent',
+        },
+      },
+    }]);
+  });
+
+  it('rejects an empty title without mutating or publishing', () => {
+    const session = makeSession();
+    const events: DashboardEvent[] = [];
+    const unsubscribe = dashboardEventBus.subscribe(event => events.push(event));
+
+    try {
+      expect(updateSessionTitle(session, '   ', 'dashboard')).toEqual({
+        ok: false,
+        error: 'bad_title',
+      });
+    } finally {
+      unsubscribe();
+    }
+
+    expect(session.title).toBe('Old title');
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it('normalizes untrusted source labels to the caller fallback', () => {
+    expect(normalizeSessionTitleSource('agent', 'dashboard')).toBe('agent');
+    expect(normalizeSessionTitleSource('spoofed', 'dashboard')).toBe('dashboard');
+  });
+});

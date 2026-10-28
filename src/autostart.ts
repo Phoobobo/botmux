@@ -6,16 +6,23 @@
  * Linux  — installs a user systemd unit at ~/.config/systemd/user/botmux.service
  *          and enables it (no sudo). Reminds the user to run
  *          `loginctl enable-linger` if the unit needs to survive logout.
+ * Windows — installs a per-user Task Scheduler task, or falls back to the
+ *            current user's Startup folder if task registration is denied.
  *
- * The unit invokes `node <PKG_ROOT>/dist/cli.js start`, which goes through
- * the same pm2 path as `botmux start`. PATH from the install-time shell is
- * captured into the unit so node-pty / claude / codex resolve correctly when
- * launchd or systemd starts us with a minimal environment.
+ * The boot hook runs `botmux start`, the same path as a manual `botmux start`.
+ * HOW it names botmux depends on the runtime shape — `node <PKG_ROOT>/dist/cli.js`
+ * for a Node install, the compiled binary itself when there is no cli.js on disk;
+ * see {@link launchProgram}, and do not reintroduce a `dist/cli.js` path that is
+ * only correct for one of them. PATH from the install-time shell is captured into
+ * the unit so node-pty / claude / codex resolve correctly when launchd or systemd
+ * starts us with a minimal environment.
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
+import { isStandaloneBinary } from './core/self-spawn.js';
+import { isCliIdentityPath } from './utils/child-env.js';
 
 export interface AutostartOpts {
   /** Absolute path to the botmux package root (one level up from dist/). */
@@ -24,14 +31,79 @@ export interface AutostartOpts {
   configDir: string;
   /** Absolute path to the daemon log dir (used for launchd stdout/err). */
   logDir: string;
+  /**
+   * Runtime shape override, for tests. Production leaves this unset and the
+   * answer comes from `isStandaloneBinary()`; the boot-hook renderers are pure
+   * functions of their inputs so both shapes can be asserted without building a
+   * real compiled binary. See {@link launchProgram}.
+   */
+  standalone?: boolean;
+  /** Executable to name in the boot hook, for tests. Defaults to
+   *  `process.execPath` (the Node binary, or the compiled binary itself). */
+  execPath?: string;
+  /** PATH to persist in the boot hook, for tests. Defaults to `process.env.PATH`. */
+  environmentPath?: string;
+}
+
+/** Minimal registration state used by the Dashboard toggle. */
+export interface AutostartState {
+  supported: boolean;
+  enabled: boolean;
 }
 
 const LABEL = 'com.botmux.daemon';
 const SERVICE_NAME = 'botmux.service';
+// Companion crash watchdog (Linux user systemd only). The boot unit below is
+// Type=oneshot + RemainAfterExit: it launches the daemon once at login and
+// never restarts it. If the detached built-in supervisor dies (or is
+// stopped) the fleet stays down until someone manually re-runs `start`. This
+// timer runs a lightweight local liveness check every 30s, so a dead fleet
+// self-heals without doing full startup work while it is healthy.
+const WATCHDOG_SERVICE_NAME = 'botmux-watchdog.service';
+const WATCHDOG_TIMER_NAME = 'botmux-watchdog.timer';
+const WATCHDOG_INTERVAL_SEC = 30;
+const WATCHDOG_STOP_INTENT_FILE = 'watchdog-stopped';
+const WINDOWS_FALLBACK_PATH = '%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem';
 
-function platform(): 'macos' | 'linux' | 'unsupported' {
+/**
+ * Env marker the generated boot hooks set on themselves, so `botmux start` can
+ * tell it was launched at boot rather than by a person.
+ *
+ * WHY OUR OWN MARKER: systemd's `INVOCATION_ID` would match ANY systemd-run
+ * process, not specifically our boot hook, and launchd/Windows set nothing
+ * comparable — this works identically on all three.
+ *
+ * MUST BE CONSUMED AND DELETED by whoever reads it (see `cmdStart`). The fleet
+ * spawns the supervisor with `{...process.env}`, and daemons/workers/session CLIs
+ * inherit from there; a marker left in the environment would make any later
+ * `botmux start` in a descendant look like a boot hook and silently skip the
+ * autostart refresh and the dashboard hint.
+ */
+export const AUTOSTART_UNIT_ENV = 'BOTMUX_AUTOSTART_UNIT';
+
+/**
+ * Read the boot-hook marker and REMOVE it, whatever it held.
+ *
+ * Must be called before anything that can spawn a child or await: the fleet
+ * supervisor is spawned with `{...process.env}` and daemons/workers/session CLIs
+ * inherit from there, so a marker left in place would make a later `botmux start`
+ * in any descendant look like a boot hook. Dependency probes/installers run as
+ * children too, so "consume on entry" has to mean the very first statement.
+ *
+ * Deleting even on a non-'1' value is deliberate — the marker is single-use, and
+ * leaving a stray unrecognised value behind would keep leaking to children.
+ */
+export function consumeAutostartUnitMarker(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[AUTOSTART_UNIT_ENV];
+  delete env[AUTOSTART_UNIT_ENV];
+  return raw === '1';
+}
+const WINDOWS_TASK_NAME = 'botmux-daemon';
+
+function platform(): 'macos' | 'linux' | 'windows' | 'unsupported' {
   if (process.platform === 'darwin') return 'macos';
   if (process.platform === 'linux') return 'linux';
+  if (process.platform === 'win32') return 'windows';
   return 'unsupported';
 }
 
@@ -47,37 +119,129 @@ function unitPath(): string {
   return join(homedir(), '.config', 'systemd', 'user', SERVICE_NAME);
 }
 
-function nodeBin(): string {
-  // process.execPath is the Node binary that's currently running cli.js.
-  // Using its absolute path means launchd/systemd doesn't have to resolve
-  // `node` from a stripped PATH (and we keep the same Node version the
-  // user installed botmux under, which matters for native modules like
-  // node-pty).
-  return process.execPath;
+function watchdogServicePath(): string {
+  return join(homedir(), '.config', 'systemd', 'user', WATCHDOG_SERVICE_NAME);
 }
 
-function cliJs(opts: AutostartOpts): string {
-  return join(opts.pkgRoot, 'dist', 'cli.js');
+function watchdogTimerPath(): string {
+  return join(homedir(), '.config', 'systemd', 'user', WATCHDOG_TIMER_NAME);
 }
 
-function currentPath(): string {
+function watchdogStopIntentPath(configDir: string): string {
+  return join(configDir, WATCHDOG_STOP_INTENT_FILE);
+}
+
+export function watchdogStopRequested(configDir: string): boolean {
+  return existsSync(watchdogStopIntentPath(configDir));
+}
+
+/**
+ * Stop-intent marker contract (watchdog suppression):
+ *
+ * - WRITERS: every intentional-shutdown entry must write the marker BEFORE
+ *   mutating the fleet. Today that is CLI `botmux stop` (cmdStop). Any future
+ *   shutdown entry — including external callers of the trusted supervisor
+ *   shutdown IPC route (SUPERVISOR_SHUTDOWN_ROUTE, handled in
+ *   core/dashboard-ipc-server.ts) — must write it too; otherwise the watchdog
+ *   will mistake the outage for a crash and resurrect the fleet.
+ * - READERS: the `__watchdog` tick checks the marker first and returns quietly
+ *   while it exists.
+ * - CLEARERS: an explicit `start`/`restart`/boot start always clears it (a
+ *   newer start intent overrides a previous stop intent). `stop` itself clears
+ *   it again when the stop demonstrably did NOT happen (fleet-mutation lock
+ *   timeout, supervisor stop timeout) so a half-stopped fleet keeps healing.
+ */
+export function markWatchdogStopped(configDir: string): void {
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(watchdogStopIntentPath(configDir), `${new Date().toISOString()}\n`, { mode: 0o600 });
+}
+
+export function clearWatchdogStopped(configDir: string): void {
+  const path = watchdogStopIntentPath(configDir);
+  if (existsSync(path)) unlinkSync(path);
+}
+
+/**
+ * The program arguments (executable first) that run botmux from a boot hook.
+ * Callers append the subcommand (`start` / `stop`).
+ *
+ * NODE: `process.execPath` is the Node binary currently running cli.js, and the
+ * script is `<pkgRoot>/dist/cli.js`. Using absolute paths means launchd/systemd
+ * doesn't have to resolve `node` from a stripped PATH (and we keep the same Node
+ * version the user installed botmux under, which matters for native modules like
+ * node-pty).
+ *
+ * COMPILED BINARY: there is NO `dist/cli.js` on disk. The module graph lives in
+ * the virtual, read-only `/$bunfs/`, so `join(pkgRoot,'dist','cli.js')` — pkgRoot
+ * being `__dirname`-derived — yields a path that does not exist outside this
+ * process. That is the documented `__dirname` hazard in CLAUDE.md, and a boot
+ * hook is exactly the "path handed to another process" case it warns about.
+ *
+ * It FAILED SILENTLY, which is why this went unnoticed (MEASURED on a devbox
+ * running the npm-installed compiled binary): the written unit was
+ * `ExecStart=<binary> /$bunfs/dist/cli.js start`, and the binary parses that
+ * bogus path as its subcommand token, does not recognise it, prints the help
+ * text and exits 0. systemd sees success, `start` is swallowed as an argument,
+ * and no daemon ever comes up — so the fleet does not return after a reboot and
+ * nothing anywhere reports an error. `botmux restart` re-synced the unit on every
+ * run, keeping the broken path fresh.
+ *
+ * The binary re-execs itself for every other child process (`resolveEntrySpawn`
+ * in core/self-spawn.ts); a boot hook is the same shape, so it does the same
+ * thing — and `process.execPath` IS the real on-disk binary in compiled mode
+ * (verified: argv[1] is `/$bunfs/root/<name>` while execPath is the true path).
+ */
+export function launchProgram(opts: AutostartOpts): string[] {
+  const exec = opts.execPath ?? process.execPath;
+  const standalone = opts.standalone ?? isStandaloneBinary();
+  if (standalone) return [exec];
+  return [exec, join(opts.pkgRoot, 'dist', 'cli.js')];
+}
+
+/** {@link launchProgram} plus `sub`, rendered as one command line. `quote`
+ *  wraps each element in double quotes (Windows .bat; systemd/launchd keep the
+ *  historical unquoted/array forms). */
+export function launchCommand(opts: AutostartOpts, sub: string, quote = false): string {
+  const parts = [...launchProgram(opts), sub];
+  return (quote ? parts.map((p) => `"${p}"`) : parts).join(' ');
+}
+
+export function autostartPath(
+  pathValue: string = process.env.PATH || '',
+  targetPlatform: NodeJS.Platform = process.platform,
+): string {
   // Capture PATH from the install-time shell so the unit can find any
   // binaries the user expects (node-pty's `node`, the AI CLI binaries,
-  // tmux, etc.). Falls back to a sane default if PATH is empty.
-  const p = process.env.PATH || '';
-  if (p) return p;
-  return process.platform === 'darwin'
+  // tmux, etc.). Session-scoped argv[0] shims from TRAE, Codex, and other AI
+  // CLIs live under a `tmp/arg0` path segment and must not be made durable in
+  // a boot hook.
+  const separator = targetPlatform === 'win32' ? ';' : ':';
+  const entries = pathValue
+    .split(separator)
+    .filter(Boolean)
+    .filter(entry => !isCliIdentityPath(entry))
+    .filter(entry => !entry.replace(/\\/g, '/').includes('/tmp/arg0/'));
+  const stable = [...new Set(entries)].join(separator);
+  if (stable) return stable;
+  if (targetPlatform === 'win32') {
+    return WINDOWS_FALLBACK_PATH;
+  }
+  return targetPlatform === 'darwin'
     ? '/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin'
     : '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
 }
 
 // ─── macOS (launchd) ─────────────────────────────────────────────────────────
 
-function plistContent(opts: AutostartOpts): string {
-  const node = escapeXml(nodeBin());
-  const cli = escapeXml(cliJs(opts));
+export function plistContent(opts: AutostartOpts): string {
+  // ProgramArguments is an array, so render one <string> per element: the
+  // compiled binary contributes ONE element (itself), a Node install two
+  // (node + dist/cli.js). See launchProgram.
+  const program = launchProgram(opts)
+    .map((p) => `        <string>${escapeXml(p)}</string>`)
+    .join('\n');
   const cwd = escapeXml(opts.configDir);
-  const path = escapeXml(currentPath());
+  const path = escapeXml(autostartPath(opts.environmentPath, 'darwin'));
   const outLog = escapeXml(join(opts.logDir, 'autostart-out.log'));
   const errLog = escapeXml(join(opts.logDir, 'autostart-err.log'));
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -88,8 +252,7 @@ function plistContent(opts: AutostartOpts): string {
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${node}</string>
-        <string>${cli}</string>
+${program}
         <string>start</string>
     </array>
     <key>RunAtLoad</key>
@@ -102,6 +265,8 @@ function plistContent(opts: AutostartOpts): string {
     <dict>
         <key>PATH</key>
         <string>${path}</string>
+        <key>${AUTOSTART_UNIT_ENV}</key>
+        <string>1</string>
     </dict>
     <key>StandardOutPath</key>
     <string>${outLog}</string>
@@ -186,16 +351,17 @@ function statusMac(): void {
   console.log(`Plist 存在: ${existsSync(path) ? 'yes' : 'no'}`);
   console.log(`launchd 已加载: ${loaded ? 'yes' : 'no'}`);
   if (existsSync(path) && !loaded) {
-    console.log(`提示: plist 存在但未加载，运行 botmux autostart enable 重新激活`);
+    console.log(`提示: plist 已注册，将在下次登录时由 launchd 加载`);
   }
 }
 
 // ─── Linux (user systemd) ────────────────────────────────────────────────────
 
-function unitContent(opts: AutostartOpts): string {
-  // Type=oneshot + RemainAfterExit=yes because `botmux start` calls pm2
-  // start which forks and returns immediately; without RemainAfterExit
-  // systemd would consider the unit "inactive (dead)" right after launch.
+export function unitContent(opts: AutostartOpts): string {
+  // Type=oneshot + RemainAfterExit=yes because `botmux start` hands the fleet to
+  // the built-in supervisor, which is spawned detached and outlives the starting
+  // process — `botmux start` then returns. Without RemainAfterExit systemd would
+  // consider the unit "inactive (dead)" right after launch.
   return `[Unit]
 Description=botmux daemon (IM <-> AI coding CLI bridge)
 After=network-online.target
@@ -205,12 +371,48 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${opts.configDir}
-Environment=PATH=${currentPath()}
-ExecStart=${nodeBin()} ${cliJs(opts)} start
-ExecStop=${nodeBin()} ${cliJs(opts)} stop
+Environment=PATH=${autostartPath(opts.environmentPath, 'linux')}
+Environment=${AUTOSTART_UNIT_ENV}=1
+ExecStart=${launchCommand(opts, 'start')}
+ExecStop=${launchCommand(opts, 'stop')}
 
 [Install]
 WantedBy=default.target
+`;
+}
+
+/**
+ * Companion watchdog service + timer.
+ *
+ * The service invokes a lightweight local liveness command. `KillMode=process`
+ * is load-bearing: the command launches the supervisor detached, but that child
+ * remains in the unit cgroup. The default `control-group` would kill the newly
+ * recovered supervisor as soon as this oneshot becomes inactive.
+ */
+function watchdogServiceContent(opts: AutostartOpts): string {
+  return `[Unit]
+Description=Ensure the botmux fleet is running (crash watchdog)
+
+[Service]
+Type=oneshot
+WorkingDirectory=${opts.configDir}
+Environment=PATH=${autostartPath(opts.environmentPath, 'linux')}
+Environment=${AUTOSTART_UNIT_ENV}=1
+KillMode=process
+ExecStart=${launchCommand(opts, '__watchdog')}
+`;
+}
+
+function watchdogTimerContent(): string {
+  return `[Unit]
+Description=Restart the botmux fleet if it is not running
+
+[Timer]
+OnActiveSec=${WATCHDOG_INTERVAL_SEC}s
+OnUnitActiveSec=${WATCHDOG_INTERVAL_SEC}s
+
+[Install]
+WantedBy=timers.target
 `;
 }
 
@@ -233,7 +435,7 @@ function enableLinux(opts: AutostartOpts): void {
     console.error(`❌ 当前会话连不上 user systemd（缺少 DBus / 容器环境）。`);
     console.error(``);
     console.error(`   回退方案：把下面这条写入系统级 cron / rc.local / 你常用的 init：`);
-    console.error(`     ${nodeBin()} ${cliJs(opts)} start`);
+    console.error(`     ${launchCommand(opts, 'start')}`);
     console.error(``);
     console.error(`   或在有 systemd --user 的桌面环境里再次运行 botmux autostart enable。`);
     process.exit(1);
@@ -242,6 +444,7 @@ function enableLinux(opts: AutostartOpts): void {
   const path = unitPath();
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, unitContent(opts));
+  writeWatchdogUnits(opts);
   console.log(`✅ 已写入 systemd unit: ${path}`);
 
   const reload = spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
@@ -264,6 +467,10 @@ function enableLinux(opts: AutostartOpts): void {
   console.log(`✅ 已启用 ${SERVICE_NAME}`);
   console.log(`   下次开机自动启动。立即启动: botmux start`);
 
+  // Enable only after all unit files have been written and daemon-reload has
+  // made their latest contents visible to the user manager.
+  enableWatchdogTimer();
+
   if (!lingerEnabled()) {
     const username = userInfo().username;
     console.log(``);
@@ -279,6 +486,11 @@ function disableLinux(): void {
     console.error(`   如曾手工创建过 unit，请手动 rm: ${unitPath()}`);
     process.exit(1);
   }
+
+  // Remove the crash watchdog first so it does not resurrect the fleet while
+  // (or right after) we disable the boot hook.
+  removeWatchdogUnits();
+
   const path = unitPath();
   // No `--now`: only undo the boot hook. Without --now systemd skips ExecStop,
   // so the running pm2 daemon is left untouched. To stop it, the user runs
@@ -291,11 +503,13 @@ function disableLinux(): void {
   if (existsSync(path)) {
     unlinkSync(path);
     console.log(`✅ 已删除 ${path}`);
-    spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
   } else {
     console.log(`ℹ️  ${path} 不存在`);
   }
-  console.log(`   pm2 daemon 仍在运行；要停止请跑 botmux stop`);
+  // Always reload: watchdog files may have existed even if the main unit did
+  // not (for example after an interrupted older install).
+  spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
+  console.log(`   supervisor 仍在运行；要停止请跑 botmux stop`);
 }
 
 function statusLinux(): void {
@@ -309,21 +523,234 @@ function statusLinux(): void {
   }
   const isEnabled = spawnSync('systemctl', ['--user', 'is-enabled', SERVICE_NAME], { stdio: 'pipe' });
   const isActive = spawnSync('systemctl', ['--user', 'is-active', SERVICE_NAME], { stdio: 'pipe' });
+  const watchdogActive = spawnSync('systemctl', ['--user', 'is-active', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
   console.log(`enabled: ${isEnabled.stdout.toString().trim() || isEnabled.stderr.toString().trim()}`);
   console.log(`active: ${isActive.stdout.toString().trim() || isActive.stderr.toString().trim()}`);
+  console.log(`watchdog enabled: ${watchdogEnabled() ? 'yes' : 'no'}`);
+  console.log(`watchdog active: ${watchdogActive.stdout.toString().trim() || watchdogActive.stderr.toString().trim()}`);
   console.log(`Linger: ${lingerEnabled() ? 'yes' : 'no（登出后服务会停）'}`);
 }
 
+function watchdogEnabled(): boolean {
+  return spawnSync('systemctl', ['--user', 'is-enabled', WATCHDOG_TIMER_NAME], { stdio: 'pipe' }).status === 0;
+}
+
+function writeWatchdogUnits(opts: AutostartOpts): void {
+  writeFileSync(watchdogServicePath(), watchdogServiceContent(opts));
+  writeFileSync(watchdogTimerPath(), watchdogTimerContent());
+}
+
+function enableWatchdogTimer(): boolean {
+  const en = spawnSync('systemctl', ['--user', 'enable', '--now', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
+  if (en.status !== 0) {
+    // Watchdog is best-effort: the boot unit still works without it. Warn but
+    // do not fail the whole `autostart enable`.
+    console.warn(`⚠️  崩溃守护 timer 启用失败（不影响开机自启）:`);
+    console.warn(en.stderr.toString().trim());
+    return false;
+  }
+  console.log(`✅ 已启用崩溃守护 ${WATCHDOG_TIMER_NAME}（每 ${WATCHDOG_INTERVAL_SEC}s 检查，fleet 挂了自动拉起）`);
+  return true;
+}
+
+function removeWatchdogUnits(): void {
+  const stop = spawnSync('systemctl', ['--user', 'disable', '--now', WATCHDOG_TIMER_NAME], { stdio: 'pipe' });
+  void stop; // Non-zero (already disabled) is expected on older installs.
+  if (existsSync(watchdogTimerPath())) unlinkSync(watchdogTimerPath());
+  if (existsSync(watchdogServicePath())) unlinkSync(watchdogServicePath());
+}
+
+// ─── Windows (Task Scheduler / Startup folder) ─────────────────────────────
+
+function escapeCmdValue(s: string): string {
+  // Batch files expand %VAR% while parsing. Keep the captured PATH literal.
+  return s.replace(/\^/g, '^^').replace(/%/g, '%%');
+}
+
+function windowsPathValue(pathValue: string | undefined): string {
+  const normalized = autostartPath(pathValue, 'win32');
+  // The fallback deliberately contains expandable %SystemRoot% references.
+  // Captured PATH values must stay literal, but escaping the fallback would
+  // turn those references into literal text when cmd.exe executes the script.
+  return normalized === WINDOWS_FALLBACK_PATH ? normalized : escapeCmdValue(normalized);
+}
+
+function escapeVbsString(s: string): string {
+  return s.replace(/"/g, '""');
+}
+
+function windowsScriptPath(): string {
+  return join(homedir(), '.botmux', 'autostart.cmd');
+}
+
+function windowsStartupDir(): string {
+  return join(
+    process.env.APPDATA || join(homedir(), 'AppData', 'Roaming'),
+    'Microsoft',
+    'Windows',
+    'Start Menu',
+    'Programs',
+    'Startup',
+  );
+}
+
+function windowsStartupLauncherPath(): string {
+  return join(windowsStartupDir(), 'botmux-autostart.vbs');
+}
+
+function windowsLogPath(opts: AutostartOpts, name: string): string {
+  return join(opts.logDir, name);
+}
+
+export function windowsScriptContent(opts: AutostartOpts): string {
+  const path = windowsPathValue(opts.environmentPath);
+  const cwd = opts.configDir;
+  const outLog = windowsLogPath(opts, 'autostart-out.log');
+  const errLog = windowsLogPath(opts, 'autostart-err.log');
+  return `@echo off
+setlocal
+set "PATH=${path}"
+set "${AUTOSTART_UNIT_ENV}=1"
+cd /d "${cwd}"
+${launchCommand(opts, 'start', true)} >> "${outLog}" 2>> "${errLog}"
+`;
+}
+
+function windowsLauncherContent(scriptPath: string): string {
+  const script = escapeVbsString(scriptPath);
+  return `Set shell = CreateObject("WScript.Shell")
+shell.Run Chr(34) & "${script}" & Chr(34), 0, False
+`;
+}
+
+function windowsTaskExists(): boolean {
+  const r = spawnSync('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME], { stdio: 'pipe' });
+  return r.status === 0;
+}
+
+function createWindowsTask(scriptPath: string): ReturnType<typeof spawnSync> {
+  return spawnSync(
+    'schtasks',
+    ['/Create', '/TN', WINDOWS_TASK_NAME, '/SC', 'ONLOGON', '/TR', `"${scriptPath}"`, '/F'],
+    { stdio: 'pipe' },
+  );
+}
+
+function writeWindowsStartupLauncher(scriptPath: string): string {
+  const launcher = windowsStartupLauncherPath();
+  mkdirSync(dirname(launcher), { recursive: true });
+  writeFileSync(launcher, windowsLauncherContent(scriptPath));
+  return launcher;
+}
+
+function enableWindows(opts: AutostartOpts): void {
+  const script = windowsScriptPath();
+  mkdirSync(dirname(script), { recursive: true });
+  mkdirSync(opts.logDir, { recursive: true });
+  writeFileSync(script, windowsScriptContent(opts));
+  console.log(`✅ 已写入 Windows 启动脚本: ${script}`);
+
+  const r = createWindowsTask(script);
+  if (r.status === 0) {
+    console.log(`✅ 已创建/更新 Windows 任务计划: ${WINDOWS_TASK_NAME}`);
+    const launcher = windowsStartupLauncherPath();
+    if (existsSync(launcher)) {
+      unlinkSync(launcher);
+      console.log(`✅ 已清理 Startup 回退启动器: ${launcher}`);
+    }
+  } else {
+    const msg = (r.stderr.toString() || r.stdout.toString()).trim();
+    console.warn(`⚠️  任务计划创建失败，改用当前用户 Startup 文件夹自启。`);
+    if (msg) console.warn(msg);
+    const launcher = writeWindowsStartupLauncher(script);
+    console.log(`✅ 已写入 Startup 启动器: ${launcher}`);
+  }
+
+  console.log(`   下次登录 Windows 时自动启动。立即启动: botmux start`);
+}
+
+function disableWindows(): void {
+  const r = spawnSync('schtasks', ['/Delete', '/TN', WINDOWS_TASK_NAME, '/F'], { stdio: 'pipe' });
+  if (r.status === 0) {
+    console.log(`✅ 已删除 Windows 任务计划: ${WINDOWS_TASK_NAME}`);
+  } else {
+    console.warn(`⚠️  删除任务计划返回非零（可能本来就未启用）`);
+    const msg = (r.stderr.toString() || r.stdout.toString()).trim();
+    if (msg) console.warn(msg);
+  }
+
+  const launcher = windowsStartupLauncherPath();
+  if (existsSync(launcher)) {
+    unlinkSync(launcher);
+    console.log(`✅ 已删除 ${launcher}`);
+  } else {
+    console.log(`ℹ️  ${launcher} 不存在`);
+  }
+
+  const script = windowsScriptPath();
+  if (existsSync(script)) {
+    unlinkSync(script);
+    console.log(`✅ 已删除 ${script}`);
+  } else {
+    console.log(`ℹ️  ${script} 不存在`);
+  }
+  console.log(`   pm2 daemon 仍在运行；要停止请跑 botmux stop`);
+}
+
+function statusWindows(): void {
+  const script = windowsScriptPath();
+  const launcher = windowsStartupLauncherPath();
+  console.log(`平台: Windows (Task Scheduler / Startup folder)`);
+  console.log(`任务名称: ${WINDOWS_TASK_NAME}`);
+  console.log(`启动脚本: ${script}`);
+  console.log(`启动脚本存在: ${existsSync(script) ? 'yes' : 'no'}`);
+  console.log(`Startup 启动器: ${launcher}`);
+  console.log(`Startup 启动器存在: ${existsSync(launcher) ? 'yes' : 'no'}`);
+
+  const r = spawnSync('schtasks', ['/Query', '/TN', WINDOWS_TASK_NAME, '/FO', 'LIST', '/V'], { stdio: 'pipe' });
+  if (r.status === 0) {
+    console.log(`任务计划存在: yes`);
+    const text = r.stdout.toString().trim();
+    if (text) console.log(text);
+  } else {
+    console.log(`任务计划存在: no`);
+  }
+}
+
 // ─── Public dispatch ─────────────────────────────────────────────────────────
+
+export function inspectAutostart(): AutostartState {
+  switch (platform()) {
+    case 'macos':
+      return { supported: true, enabled: existsSync(plistPath()) };
+    case 'linux': {
+      if (!userSystemdAvailable()) {
+        return { supported: true, enabled: existsSync(unitPath()) };
+      }
+      const result = spawnSync(
+        'systemctl',
+        ['--user', 'is-enabled', SERVICE_NAME],
+        { stdio: 'pipe' },
+      );
+      return { supported: true, enabled: result.status === 0 };
+    }
+    case 'windows':
+      return {
+        supported: true,
+        enabled: windowsTaskExists() || existsSync(windowsStartupLauncherPath()),
+      };
+    default:
+      return { supported: false, enabled: false };
+  }
+}
 
 export function enableAutostart(opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return enableMac(opts);
     case 'linux': return enableLinux(opts);
+    case 'windows': return enableWindows(opts);
     default:
       console.error(`❌ 当前平台 ${process.platform} 暂不支持 botmux autostart。`);
-      console.error(`   Windows 用户可用任务计划程序 (Task Scheduler) 调用:`);
-      console.error(`     ${nodeBin()} ${cliJs(opts)} start`);
       process.exit(1);
   }
 }
@@ -332,6 +759,7 @@ export function disableAutostart(_opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return disableMac();
     case 'linux': return disableLinux();
+    case 'windows': return disableWindows();
     default:
       console.error(`❌ 当前平台 ${process.platform} 暂不支持 botmux autostart。`);
       process.exit(1);
@@ -342,6 +770,7 @@ export function autostartStatus(_opts: AutostartOpts): void {
   switch (platform()) {
     case 'macos': return statusMac();
     case 'linux': return statusLinux();
+    case 'windows': return statusWindows();
     default:
       console.log(`平台: ${process.platform} (不支持)`);
   }
@@ -362,16 +791,68 @@ export function refreshAutostart(opts: AutostartOpts): boolean {
       return true;
     }
     case 'linux': {
+      let changed = false;
       const path = unitPath();
-      if (!existsSync(path)) return false;
-      const next = unitContent(opts);
-      const prev = readFileSync(path, 'utf-8');
-      if (prev === next) return false;
-      writeFileSync(path, next);
-      if (userSystemdAvailable()) {
+      if (existsSync(path)) {
+        const next = unitContent(opts);
+        const prev = readFileSync(path, 'utf-8');
+        if (prev !== next) {
+          writeFileSync(path, next);
+          changed = true;
+        }
+        // Existing users already opted into autostart. Install the watchdog
+        // during their next manual start instead of requiring another explicit
+        // `autostart enable` after upgrade.
+        const wdService = watchdogServiceContent(opts);
+        const wdTimer = watchdogTimerContent();
+        const prevService = existsSync(watchdogServicePath()) ? readFileSync(watchdogServicePath(), 'utf-8') : '';
+        const prevTimer = existsSync(watchdogTimerPath()) ? readFileSync(watchdogTimerPath(), 'utf-8') : '';
+        if (prevService !== wdService) {
+          writeFileSync(watchdogServicePath(), wdService);
+          changed = true;
+        }
+        if (prevTimer !== wdTimer) {
+          writeFileSync(watchdogTimerPath(), wdTimer);
+          changed = true;
+        }
+      }
+      const systemdAvailable = userSystemdAvailable();
+      if (changed && systemdAvailable) {
         spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'pipe' });
       }
-      return true;
+      if (existsSync(path) && systemdAvailable && !watchdogEnabled()) {
+        changed = enableWatchdogTimer() || changed;
+      }
+      return changed;
+    }
+    case 'windows': {
+      const script = windowsScriptPath();
+      const launcher = windowsStartupLauncherPath();
+      if (!existsSync(script) && !existsSync(launcher) && !windowsTaskExists()) return false;
+
+      mkdirSync(dirname(script), { recursive: true });
+      mkdirSync(opts.logDir, { recursive: true });
+      const next = windowsScriptContent(opts);
+      const prev = existsSync(script) ? readFileSync(script, 'utf-8') : '';
+      let changed = prev !== next;
+      if (changed) writeFileSync(script, next);
+
+      const task = createWindowsTask(script);
+      if (task.status === 0) {
+        if (existsSync(launcher)) {
+          unlinkSync(launcher);
+          changed = true;
+        }
+        return changed;
+      }
+
+      const nextLauncher = windowsLauncherContent(script);
+      const prevLauncher = existsSync(launcher) ? readFileSync(launcher, 'utf-8') : '';
+      if (prevLauncher !== nextLauncher) {
+        writeWindowsStartupLauncher(script);
+        changed = true;
+      }
+      return changed;
     }
     default: return false;
   }

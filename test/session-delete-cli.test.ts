@@ -1,0 +1,688 @@
+/**
+ * CLI boundary regression for `botmux delete` daemon-first close semantics.
+ *
+ * Runs the source CLI through tsx against a tiny fake daemon. The daemon route
+ * itself is covered separately; these tests prove the CLI never kills/persists
+ * locally while a live owner daemon is authoritative, carries the current
+ * session capability, and retains an offline fallback.
+ */
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createServer, type IncomingMessage } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import {
+  readPersistedSessionRows,
+  seedOccupancyLease,
+  seedPersistedSessionRows,
+  sessionStorePath,
+} from './helpers/session-store-disk.js';
+import {
+  managedOriginCapabilityPath,
+  RELAY_ORIGIN_CAPABILITY_BASENAME,
+} from '../src/core/managed-origin-capability.js';
+
+const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
+const APP_ID = 'cli_delete_test';
+const CAPABILITY = 'ab'.repeat(32);
+const ORIGIN_CHANNEL = 'cd'.repeat(32);
+const tempDirs: string[] = [];
+
+interface StoredSession {
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  status: 'active' | 'closed';
+  createdAt: string;
+  closedAt?: string;
+  larkAppId?: string;
+  adoptedFrom?: { source: 'tmux'; tmuxTarget: string; cwd: string };
+  /** Live preview loopback registered by the worker generation being closed. */
+  previewTarget?: { host: string; port: number; registeredAt: string };
+}
+
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** A pid that certainly belonged to a process which has already exited and
+ *  been reaped. Expired-lease cases must seed this instead of a hardcoded pid:
+ *  hostOccupancyLeaseHeld() fails closed on a LIVE owner even past the TTL, and
+ *  a fixed number (e.g. 4242) occasionally belongs to a real CI-runner process. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  if (!child.pid) throw new Error('could not spawn a throwaway child');
+  return child.pid;
+}
+
+function makeSession(sessionId: string, overrides: Partial<StoredSession> = {}): StoredSession {
+  return {
+    sessionId,
+    chatId: 'oc_delete_test',
+    rootMessageId: 'om_delete_test',
+    title: sessionId,
+    status: 'active',
+    createdAt: '2026-07-22T00:00:00.000Z',
+    larkAppId: APP_ID,
+    ...overrides,
+  };
+}
+
+/** Seed this bot's per-bot store: `session-stores/<appId>/sessions.db`. */
+function writeSessions(dataDir: string, sessions: StoredSession[]): void {
+  mkdirSync(dataDir, { recursive: true });
+  seedPersistedSessionRows(dataDir, APP_ID, Object.fromEntries(sessions.map(s => [s.sessionId, s])));
+}
+
+function readSessions(dataDir: string): Record<string, StoredSession> {
+  return readPersistedSessionRows(dataDir, APP_ID) as Record<string, StoredSession>;
+}
+
+function writeDaemonDescriptor(dataDir: string, port: number): void {
+  const dir = join(dataDir, 'dashboard-daemons');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, `${APP_ID}.json`), JSON.stringify({
+    larkAppId: APP_ID,
+    ipcPort: port,
+    lastHeartbeat: Date.now(),
+  }));
+}
+
+function writeRelayCapability(relayDir: string): void {
+  mkdirSync(relayDir, { recursive: true });
+  const path = join(relayDir, RELAY_ORIGIN_CAPABILITY_BASENAME);
+  writeFileSync(
+    path,
+    JSON.stringify({ token: CAPABILITY, turnId: 'turn-delete', dispatchAttempt: 3 }),
+  );
+  chmodSync(path, 0o600);
+}
+
+function writeReadIsolatedCapability(dataDir: string, sessionId: string): void {
+  const path = managedOriginCapabilityPath(dataDir, sessionId, ORIGIN_CHANNEL);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    sessionId,
+    channelId: ORIGIN_CHANNEL,
+    capability: CAPABILITY,
+    turnId: 'turn-delete',
+    dispatchAttempt: 3,
+  }));
+  chmodSync(path, 0o600);
+}
+
+function runCli(
+  dataDir: string,
+  args: string[],
+  envOverrides: Record<string, string | undefined> = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      SESSION_DATA_DIR: dataDir,
+      ...envOverrides,
+    };
+    // The CLI classifies itself as sandboxed from positive env signals; a
+    // read-isolated host running this suite must not leak that into the
+    // offline cases (the sandboxed cases set BOTMUX_SEND_RELAY explicitly).
+    if (envOverrides.BOTMUX_READ_ISOLATED === undefined) delete env.BOTMUX_READ_ISOLATED;
+    if (envOverrides.BOTMUX_ORIGIN_CHANNEL_ID === undefined) delete env.BOTMUX_ORIGIN_CHANNEL_ID;
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete env[key];
+    }
+    const child = spawnTsScript(
+      CLI_PATH,
+      args,
+      { env, stdio: ['ignore', 'pipe', 'pipe'] },
+    ) as ChildProcessWithoutNullStreams;
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.on('data', (chunk: string) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', status => resolve({ status, stdout, stderr }));
+  });
+}
+
+function runDelete(
+  dataDir: string,
+  args: string[],
+  envOverrides: Record<string, string | undefined> = {},
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return runCli(dataDir, ['delete', ...args], envOverrides);
+}
+
+function readRequestBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve) => {
+    let raw = '';
+    req.setEncoding('utf8');
+    req.on('data', chunk => { raw += chunk; });
+    req.on('end', () => {
+      try { resolve(raw ? JSON.parse(raw) : {}); }
+      catch { resolve({}); }
+    });
+  });
+}
+
+describe('primary coordination local lifecycle gate', () => {
+  it.each([
+    ['delete one', ['delete', 'sess-primary-local']],
+    ['delete all', ['delete', 'all']],
+    ['delete stopped', ['delete', 'stopped']],
+    ['resume', ['resume', 'sess-primary-local']],
+    ['suspend', ['suspend', 'all']],
+  ])('rejects %s before any Pod-local lifecycle mutation', async (_label, args) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-lifecycle-'));
+    const dataDir = join(root, 'must-not-be-created');
+    tempDirs.push(root);
+
+    const result = await runCli(dataDir, args, {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(result.stderr).toContain('PostgreSQL');
+    expect(result.stderr).toContain('本次未做任何修改');
+  });
+
+  it('reads primary mode from ~/.botmux/.env in a standalone shell', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-primary-env-file-'));
+    const homeDir = join(root, 'home');
+    const dataDir = join(root, 'data');
+    const configDir = join(homeDir, '.botmux');
+    tempDirs.push(root);
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(join(configDir, '.env'), 'BOTMUX_COORDINATION_MODE=primary\n');
+    const session = makeSession('sess-primary-env-file');
+    writeSessions(dataDir, [session]);
+
+    const result = await runCli(dataDir, ['delete', session.sessionId], {
+      HOME: homeDir,
+      BOTMUX_COORDINATION_MODE: undefined,
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('BOTMUX_COORDINATION_MODE=primary');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('keeps list read-only and skips local auto-prune in primary mode', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-primary-list-'));
+    tempDirs.push(dataDir);
+    const scratch = makeSession('sess-primary-scratch', { larkAppId: APP_ID });
+    writeSessions(dataDir, [scratch]);
+
+    const result = await runCli(dataDir, ['list', '--plain'], {
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toContain('已跳过 1 个本地会话的自动清理');
+    expect(readSessions(dataDir)[scratch.sessionId].status).toBe('active');
+  });
+});
+
+describe('botmux delete — daemon-first close', () => {
+  it('delegates a current-session close to the daemon with its rotating capability', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, homeDir);
+    const session = makeSession('sess-delete-current');
+    writeSessions(dataDir, [session]);
+    writeReadIsolatedCapability(dataDir, session.sessionId);
+
+    let requestUrl = '';
+    let requestBody: Record<string, unknown> = {};
+    const server = createServer(async (req, res) => {
+      requestUrl = req.url ?? '';
+      requestBody = await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+        HOME: homeDir,
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('已关闭 1 个会话');
+      expect(requestUrl).toBe(`/api/sessions/${session.sessionId}/close`);
+      expect(requestBody).toMatchObject({
+        originCapability: CAPABILITY,
+        originTurnId: 'turn-delete',
+        originDispatchAttempt: 3,
+      });
+      // The fake daemon deliberately does not persist. Staying active proves
+      // the CLI did not run the legacy local fallback after an IPC success.
+      const stored = readSessions(dataDir);
+      expect(stored[session.sessionId].status).toBe('active');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('does NOT claim a plain delete when the daemon reports an uncancelled remote', async () => {
+    // The daemon closed the local row but could not cancel the remote session. The
+    // CLI used to flatten the whole response into {ok:true} and print the green
+    // "已关闭 N 个会话", so the operator walked away from a live agent that still
+    // holds the injected credential.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const homeDir = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, homeDir);
+    const session = makeSession('sess-delete-residual');
+    writeSessions(dataDir, [session]);
+    writeReadIsolatedCapability(dataDir, session.sessionId);
+
+    const server = createServer(async (req, res) => {
+      await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'mojo_lineage_quarantined', taskId: 'mojo-parked-9' },
+        alreadyClosed: false,
+      }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+        HOME: homeDir,
+      });
+
+      const output = `${result.stdout}\n${result.stderr}`;
+      expect(output).toContain('mojo-parked-9');
+      expect(output).toContain('远端会话未取消');
+      // The summary must flag it rather than reporting an unqualified success.
+      // (Wording is residual-kind-neutral now that a LOCAL subtree residual can
+      // also appear here — the per-line message above still names the remote one.)
+      expect(output).toContain('有残留需人工清理');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('fails closed when a discovered daemon rejects the close', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-delete-relay-'));
+    tempDirs.push(dataDir, relayDir);
+    const session = makeSession('sess-delete-rejected');
+    writeSessions(dataDir, [session]);
+    writeRelayCapability(relayDir);
+
+    const server = createServer(async (req, res) => {
+      await readRequestBody(req);
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end('{"ok":false,"error":"origin_unproven"}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: relayDir,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('origin_unproven');
+      expect(result.stdout).toContain('0 个会话');
+      const stored = readSessions(dataDir);
+      expect(stored[session.sessionId].status).toBe('active');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('fails closed on a daemon rejection even when the occupancy lease has expired', async () => {
+    // A daemon that ANSWERS is alive and authoritative whatever the lease row
+    // says (its renew may have lapsed); an expired lease must never turn its
+    // rejection into a licence to close the row behind it.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const relayDir = mkdtempSync(join(tmpdir(), 'botmux-delete-relay-'));
+    tempDirs.push(dataDir, relayDir);
+    const session = makeSession('sess-delete-rejected-expired-lease');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
+    writeRelayCapability(relayDir);
+
+    const server = createServer(async (req, res) => {
+      await readRequestBody(req);
+      res.writeHead(502, { 'content-type': 'application/json' });
+      res.end('{"ok":false,"error":"worker_unreachable"}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, [session.sessionId], {
+        BOTMUX_SESSION_ID: session.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: relayDir,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('worker_unreachable');
+      expect(result.stdout).toContain('0 个会话');
+      expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('refuses the offline close while a live occupancy lease exists and no daemon is discoverable', async () => {
+    // Heartbeat file gone (or never written) but the store is leased by a live
+    // process: the Stage 1 hole. The CLI must leave the row and the worker alone.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-leased');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: process.pid, bootId: 'boot-live', leaseUntil: Date.now() + 60_000 });
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('daemon 在线');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('closes offline once the lease has expired and no daemon is discoverable', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-lease-lapsed');
+    writeSessions(dataDir, [session]);
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('daemon 离线，本地收口');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('closed');
+  });
+
+  it('uses the legacy local close only when no daemon is online', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-offline', {
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+      // A retained target would let a later reader proxy into whatever local
+      // server re-acquires the port; offline close must drop it exactly like
+      // the daemon-side closeSession() does.
+      previewTarget: { host: '127.0.0.1', port: 43111, registeredAt: '2026-07-22T00:00:00.000Z' },
+    });
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('daemon 离线，本地收口');
+    const stored = readSessions(dataDir);
+    expect(stored[session.sessionId].status).toBe('closed');
+    expect(stored[session.sessionId].closedAt).toBeTruthy();
+    expect(stored[session.sessionId]).not.toHaveProperty('previewTarget');
+  });
+
+  it('never writes a token snapshot from the host shell (the daemon samples it, the host leaves the field alone)', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-no-usage');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(0);
+    const stored = readSessions(dataDir)[session.sessionId];
+    expect(stored.status).toBe('closed');
+    expect(stored).not.toHaveProperty('tokenUsage');
+  });
+
+  it('fails closed when only BOTMUX_ORIGIN_CHANNEL_ID is set and no daemon is reachable', async () => {
+    // The worker stamps this on every isolated child (full sandbox, read
+    // isolation, credential-only). Those children must not become a store
+    // host: credential-only still leaves ~/.botmux writable, so this is a
+    // confused-deputy gate, not "the write would fail anyway". A host shell
+    // never receives the variable from device enrollment.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-origin-channel');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_ORIGIN_CHANNEL_ID: ORIGIN_CHANNEL,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('隔离会话内不能离线修改会话');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('fails closed inside a sandboxed CLI when no daemon is reachable — no offline write', async () => {
+    // A sandboxed / read-isolated CLI can only SEND commands (design §1). With
+    // no daemon it must fail explicitly, not degrade into a write behind the
+    // sandbox's read-only store grant.
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    tempDirs.push(dataDir);
+    const relayDir = join(dataDir, 'relay');
+    mkdirSync(relayDir, { recursive: true });
+    const session = makeSession('sess-delete-sandboxed');
+    writeSessions(dataDir, [session]);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: undefined,
+      BOTMUX_SEND_RELAY: relayDir,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('隔离会话内不能离线修改会话');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('orders the current session last for delete all', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-data-'));
+    const fakeHome = mkdtempSync(join(tmpdir(), 'botmux-delete-home-'));
+    tempDirs.push(dataDir, fakeHome);
+    const self = makeSession('sess-delete-self');
+    const other = makeSession('sess-delete-other');
+    writeSessions(dataDir, [self, other]);
+    mkdirSync(join(fakeHome, '.botmux'), { recursive: true });
+    writeFileSync(join(fakeHome, '.botmux', '.dashboard-secret'), 'delete-test-secret');
+
+    const seen: string[] = [];
+    const server = createServer(async (req, res) => {
+      seen.push(req.url ?? '');
+      await readRequestBody(req);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end('{"ok":true,"outcome":"closed","alreadyClosed":false}');
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const port = (server.address() as AddressInfo).port;
+      writeDaemonDescriptor(dataDir, port);
+      const result = await runDelete(dataDir, ['all'], {
+        HOME: fakeHome,
+        BOTMUX_SESSION_ID: self.sessionId,
+        BOTMUX_LARK_APP_ID: APP_ID,
+        BOTMUX_SEND_RELAY: undefined,
+        BOTMUX_DAEMON_IPC_PORT: String(port),
+      });
+
+      expect(result.status).toBe(0);
+      expect(seen).toEqual([
+        `/api/sessions/${other.sessionId}/close`,
+        `/api/sessions/${self.sessionId}/close`,
+      ]);
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        server.close(err => err ? reject(err) : resolve());
+      });
+    }
+  });
+
+  it('refuses delete when the store is still unmigrated leftover JSON', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-unimported-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-unimported');
+    mkdirSync(dataDir, { recursive: true });
+    const jsonFp = join(dataDir, `sessions-${APP_ID}.json`);
+    writeFileSync(jsonFp, JSON.stringify({ [session.sessionId]: session }));
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('尚未迁移到 SQLite');
+    expect(result.stderr + result.stdout).not.toContain('没有活跃会话');
+    expect(JSON.parse(readFileSync(jsonFp, 'utf-8'))[session.sessionId].status).toBe('active');
+    expect(existsSync(sessionStorePath(dataDir, APP_ID))).toBe(false);
+  });
+
+  it('refuses delete against a fresh pre-capability daemon and leaves the row', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-legacy-daemon-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-legacy-daemon');
+    writeSessions(dataDir, [session]);
+    writeDaemonDescriptor(dataDir, 1);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('后台 daemon 是升级前的旧进程');
+    expect(result.stderr).toContain('botmux restart');
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('does not mention botmux restart in a session-scoped delete against a legacy daemon', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-scoped-legacy-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-delete-scoped-legacy');
+    writeSessions(dataDir, [session]);
+    writeDaemonDescriptor(dataDir, 1);
+
+    const result = await runDelete(dataDir, [session.sessionId], {
+      BOTMUX_SESSION_ID: session.sessionId,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('本次未做任何修改');
+    expect(result.stderr).not.toContain('botmux restart');
+    expect(result.stderr).not.toMatch(/\bpid\b/i);
+    expect(result.stderr).not.toMatch(/\bport\b/i);
+    expect(result.stderr).not.toMatch(/v?\d+\.\d+\.\d+/);
+    expect(readSessions(dataDir)[session.sessionId].status).toBe('active');
+  });
+
+  it('list prints unmigrated instead of 没有活跃会话 when only leftover JSON exists', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-unmigrated-'));
+    tempDirs.push(dataDir);
+    const session = makeSession('sess-list-unmigrated');
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, `sessions-${APP_ID}.json`), JSON.stringify({ [session.sessionId]: session }));
+
+    const result = await runCli(dataDir, ['list', '--plain'], {
+      BOTMUX_SESSION_ID: undefined,
+      BOTMUX_LARK_APP_ID: APP_ID,
+      BOTMUX_SEND_RELAY: undefined,
+      BOTMUX_DAEMON_IPC_PORT: undefined,
+    });
+
+    expect(result.stderr).toContain('尚未迁移到 SQLite');
+    expect(result.stdout + result.stderr).not.toContain('没有活跃会话');
+  });
+});

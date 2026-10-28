@@ -43,11 +43,16 @@ vi.mock('../src/services/observed-bots-store.js', async (importOriginal) => {
 
 const deps = { activeSessions: new Map(), sessionReply: vi.fn(async () => 'mid'), lastRepoScan: new Map() } as any;
 
+// 通知卡 / 部分失败文字 / 撤回原卡现在走 fire-and-forget 后台（handleCardAction 先同步返回
+// 终态卡避免 callback 超时 → 300000）。一次宏任务把整条后台微任务链排空再断言后台副作用。
+const flushBackground = () => new Promise(resolve => setTimeout(resolve, 0));
+
 async function fresh() {
   vi.resetModules();
   const registry = await import('../src/bot-registry.js');
   const pending = await import('../src/im/lark/grant-pending.js');
   const handler = await import('../src/im/lark/card-handler.js');
+  pending._resetForTest(); // grant-pending 落盘：新模块图会读到上个用例的文件
   const bot = registry.registerBot({ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
   bot.botOpenId = 'ou_bot';
   bot.resolvedAllowedUsers = ['ou_owner'];
@@ -72,16 +77,22 @@ describe('card-handler 部分授权失败', () => {
     };
   }
 
-  it('部分成功：失败 target 的 pending 被清（不再永久 throttle），owner 收到失败清单，成功 bot 仍登记+撤卡', async () => {
+  it('部分成功：失败 target 的 pending 被清（不再永久 throttle），owner 收到失败清单，成功 bot 仍登记，原卡就地更新为终态（不撤卡）', async () => {
     const { pending, handler } = await fresh();
     const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_ok', 'ou_fail']);
-    await handler.handleCardAction(multiAction(['ou_ok', 'ou_fail'], ['好机器人', '坏目标'], nonce), deps, 'h1');
+    const res = await handler.handleCardAction(multiAction(['ou_ok', 'ou_fail'], ['好机器人', '坏目标'], nonce), deps, 'h1');
 
-    // 失败 target 的 pending 必须清掉：checkNonce/isThrottled 都不再挡它
+    // 失败 target 的 pending 必须清掉：checkNonce/isThrottled 都不再挡它（同步发生，扣 pending 在落库阶段）
     expect(pending.checkNonce('h1', 'oc_1', 'ou_fail', nonce)).toBe(false);
     expect(pending.isThrottled('h1', 'oc_1', 'ou_fail')).toBe(false);
     // 成功 target 也清了
     expect(pending.checkNonce('h1', 'oc_1', 'ou_ok', nonce)).toBe(false);
+
+    // 授权成功就地 patch 原卡为终态（绿头 update_multi），同步返回该 body——不再撤卡（见 2d1faa4c）
+    expect(res?.config?.update_multi).toBe(true);
+    expect(res?.header?.template).toBe('green');
+
+    await flushBackground();   // 失败清单文字走后台 fire-and-forget
 
     // owner 收到失败清单（含失败目标名），且不是静默
     const partialReply = replyMock.mock.calls.find(c => typeof c[2] === 'string' && String(c[2]).includes('坏目标'));
@@ -92,8 +103,8 @@ describe('card-handler 部分授权失败', () => {
     const [, , , entries] = recordObservedMock.mock.calls.at(-1)!;
     expect(entries).toEqual([{ openId: 'ou_ok', name: '好机器人' }]);
 
-    // 卡仍撤回
-    expect(deleteMock).toHaveBeenCalledWith('h1', 'om_card');
+    // 原卡就地更新即完成，不再撤回（2d1faa4c：不发通知卡 + 不撤原卡）
+    expect(deleteMock).not.toHaveBeenCalled();
   });
 
   it('全部失败：保留 pending（owner 可点原卡重试）+ toast 报错，不撤卡', async () => {
@@ -108,5 +119,32 @@ describe('card-handler 部分授权失败', () => {
     expect(pending.checkNonce('h1', 'oc_1', 'ou_fail2', nonce)).toBe(true);
     expect(deleteMock).not.toHaveBeenCalled();
     expect(recordObservedMock).not.toHaveBeenCalled();
+  });
+
+  it('grant-store 抛异常（bots.json 锁超时等）按失败处理：已落盘的卡放回去，重启后仍可重试', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_a', 'ou_b']);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_a', 'ou_b'], nonce);
+    addChatGrantMock.mockImplementation(async () => { throw new Error('file-lock timeout'); });
+    const res = await handler.handleCardAction(multiAction(['ou_a', 'ou_b'], ['甲', '乙'], nonce), deps, 'h1');
+
+    expect(res?.toast).toEqual({ type: 'error', content: '授权失败：file-lock timeout' });
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_a', nonce)).toBe(true);
+    pending._simulateRestartForTest();
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_b', nonce)).toBe(true);
+  });
+
+  it('部分目标抛异常：成功的照常授权，抛异常的目标进失败清单', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_ok', 'ou_throw']);
+    addChatGrantMock.mockImplementation(async (_app: string, _chat: string, openId: string) => {
+      if (openId === 'ou_throw') throw new Error('EIO');
+      return { ok: true, created: true };
+    });
+    const res = await handler.handleCardAction(multiAction(['ou_ok', 'ou_throw'], ['好', '抛'], nonce), deps, 'h1');
+    expect(res?.toast).toBeUndefined();
+    await flushBackground();
+    expect(replyMock.mock.calls.some(c => String(c[2]).includes('抛'))).toBe(true);
+    expect(pending.checkNonce('h1', 'oc_1', 'ou_throw', nonce)).toBe(false);
   });
 });

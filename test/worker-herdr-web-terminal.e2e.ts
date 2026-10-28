@@ -1,0 +1,503 @@
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { WebSocket } from 'ws';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+
+const children = new Set<ChildProcess>();
+const sessions = new Set<string>();
+const tempDirs = new Set<string>();
+// Keep the XDG root short enough for macOS's Unix-domain socket path limit.
+const herdrFixtureRoot = mkdtempSync('/tmp/botmux-herdr-worker-');
+const herdrXdgConfigHome = join(herdrFixtureRoot, 'xdg');
+const herdrConfigDir = join(herdrXdgConfigHome, 'herdr');
+const herdrConfigPath = join(herdrConfigDir, 'config.toml');
+const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+const originalHerdrConfigPath = process.env.HERDR_CONFIG_PATH;
+
+mkdirSync(herdrConfigDir, { recursive: true });
+writeFileSync(herdrConfigPath, `[terminal]
+default_shell = "/bin/sh"
+shell_mode = "non_login"
+`);
+process.env.XDG_CONFIG_HOME = herdrXdgConfigHome;
+process.env.HERDR_CONFIG_PATH = herdrConfigPath;
+
+afterEach(() => {
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
+  children.clear();
+  for (const session of sessions) HerdrBackend.killSession(session);
+  sessions.clear();
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+  tempDirs.clear();
+});
+
+afterAll(() => {
+  // A fresh worker uses the isolated shared host, not its legacy bmx-* name.
+  HerdrBackend.killSession(HerdrBackend.managedSessionName());
+  if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+  else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+  if (originalHerdrConfigPath === undefined) delete process.env.HERDR_CONFIG_PATH;
+  else process.env.HERDR_CONFIG_PATH = originalHerdrConfigPath;
+  rmSync(herdrFixtureRoot, { recursive: true, force: true });
+});
+
+async function waitFor<T>(
+  probe: () => T | null | undefined | false,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = probe();
+    if (value) return value;
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 100));
+  }
+  throw new Error(`waitFor timeout: ${label}`);
+}
+
+function spawnWorker(dataDir: string, sessionId: string, logs: string[]): ChildProcess {
+  const child = spawnTsScript(resolve('src/worker.ts'), [], {
+    cwd: resolve('.'),
+    env: {
+      ...process.env,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_SESSION_ID: sessionId,
+      LARK_APP_ID: 'app_worker_herdr_e2e',
+      LARK_APP_SECRET: 'secret',
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  children.add(child);
+  child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+  child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+  return child;
+}
+
+function waitForReady(
+  child: ChildProcess,
+  logs: string[],
+): Promise<Extract<WorkerToDaemon, { type: 'ready' }>> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => {
+      rejectPromise(new Error(`worker ready timeout\n${logs.join('')}`));
+    }, 20_000);
+    child.on('message', raw => {
+      const msg = raw as WorkerToDaemon;
+      if (msg.type === 'ready') {
+        clearTimeout(timer);
+        resolvePromise(msg);
+      } else if (msg.type === 'error') {
+        clearTimeout(timer);
+        rejectPromise(new Error(`worker error: ${msg.message}\n${logs.join('')}`));
+      }
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      rejectPromise(new Error(`worker exited before ready (${code ?? signal})\n${logs.join('')}`));
+    });
+  });
+}
+
+async function openWriteWebSocket(
+  ready: Extract<WorkerToDaemon, { type: 'ready' }>,
+  onMessage?: (frame: string) => void,
+): Promise<WebSocket> {
+  const ws = new WebSocket(`ws://127.0.0.1:${ready.port}/?token=${encodeURIComponent(ready.token)}`);
+  // Connection-time frames (seed, grid pin) can arrive together with the upgrade
+  // response, before an `await` continuation could attach a listener.
+  if (onMessage) ws.on('message', data => onMessage(data.toString()));
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const timer = setTimeout(() => rejectPromise(new Error('websocket open timeout')), 5_000);
+    ws.once('open', () => {
+      clearTimeout(timer);
+      resolvePromise();
+    });
+    ws.once('error', err => {
+      clearTimeout(timer);
+      rejectPromise(err);
+    });
+  });
+  return ws;
+}
+
+function latestSizeRecord(path: string): { pid: string; size: string; count: number } | null {
+  if (!existsSync(path)) return null;
+  const lines = readFileSync(path, 'utf8').trim().split('\n').filter(Boolean);
+  if (lines.length === 0) return null;
+  const [pid, rows, cols] = lines.at(-1)!.split(/\s+/);
+  return { pid, size: `${rows} ${cols}`, count: lines.length };
+}
+
+function agentPaneId(sessionName: string): string {
+  const raw = execFileSync(
+    'herdr',
+    ['--session', sessionName, 'agent', 'get', 'botmux'],
+    { encoding: 'utf8', timeout: 5_000 },
+  );
+  const paneId = JSON.parse(raw)?.result?.agent?.pane_id;
+  if (typeof paneId !== 'string' || !paneId) throw new Error('missing Herdr pane id');
+  return paneId;
+}
+
+describe('worker Herdr web terminal lifecycle', () => {
+  it.skipIf(!HerdrBackend.isAvailable())(
+    'restores the connected browser grid automatically after an in-worker restart',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-restart-'));
+      tempDirs.add(root);
+      const sizeLog = join(root, 'sizes.log');
+      const fakeCli = join(root, 'claude');
+      writeFileSync(fakeCli, `#!/bin/bash
+export HERDR_AGENT=claude
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent claude --state idle >/dev/null 2>&1
+record_size() { printf '%s %s\\n' "$$" "$(stty size)" >> '${sizeLog}'; }
+trap record_size WINCH
+record_size
+while :; do sleep 0.1; done
+`);
+      chmodSync(fakeCli, 0o755);
+
+      const sessionId = `hrrst${Date.now().toString(36)}`;
+      sessions.add(HerdrBackend.managedSessionName());
+      const logs: string[] = [];
+      const child = spawnWorker(root, sessionId, logs);
+      const init: DaemonToWorker = {
+        type: 'init',
+        sessionId,
+        chatId: 'oc_herdr_restart',
+        rootMessageId: 'om_herdr_restart',
+        workingDir: root,
+        cliId: 'claude-code',
+        cliPathOverride: fakeCli,
+        backendType: 'herdr',
+        prompt: '',
+        larkAppId: 'app_worker_herdr_e2e',
+        larkAppSecret: 'secret',
+      };
+      child.send(init);
+      const ready = await waitForReady(child, logs);
+      const ws = await openWriteWebSocket(ready);
+      ws.send(JSON.stringify({ type: 'resize', cols: 120, rows: 36 }));
+
+      const before = await waitFor(() => {
+        const record = latestSizeRecord(sizeLog);
+        return record?.size === '36 120' ? record : null;
+      }, 12_000, 'initial browser grid reaches Herdr pane').catch((err) => {
+        const sizes = existsSync(sizeLog) ? readFileSync(sizeLog, 'utf8') : '<missing>';
+        throw new Error(`${err instanceof Error ? err.message : String(err)}\nsizes:\n${sizes}\nworker:\n${logs.join('')}`);
+      });
+
+      child.send({ type: 'restart' } satisfies DaemonToWorker);
+      const after = await waitFor(() => {
+        const record = latestSizeRecord(sizeLog);
+        return record
+          && record.pid !== before.pid
+          && record.size === '36 120'
+          && record.count > before.count
+          ? record
+          : null;
+      }, 20_000, 'replacement Herdr pane restores browser grid without another resize');
+
+      expect(after.pid).not.toBe(before.pid);
+      expect(after.size).toBe('36 120');
+      expect(ws.readyState).toBe(WebSocket.OPEN);
+      ws.close();
+      child.send({ type: 'close' } satisfies DaemonToWorker);
+    },
+    35_000,
+  );
+
+  it.skipIf(!HerdrBackend.isAvailable())(
+    'streams live snapshots from an adopted external Herdr pane',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-'));
+      tempDirs.add(root);
+      const trigger = join(root, 'emit-live');
+      const fakeAgent = join(root, 'pi');
+      writeFileSync(fakeAgent, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+      chmodSync(fakeAgent, 0o755);
+      const externalSession = `adopt-e2e-${Date.now().toString(36)}`;
+      sessions.add(externalSession);
+      const external = new HerdrBackend(externalSession);
+      external.spawn(fakeAgent, [
+        '-lc',
+        `echo ADOPT_INITIAL; while [ ! -f '${trigger}' ]; do sleep 0.1; done; `
+        + 'echo ADOPT_LIVE_UPDATE; while :; do sleep 1; done',
+      ], {
+        cwd: root,
+        cols: 100,
+        rows: 30,
+        env: { ...process.env } as Record<string, string>,
+      });
+      await waitFor(
+        () => external.captureCurrentScreen().includes('ADOPT_INITIAL'),
+        10_000,
+        'external pane initial marker',
+      );
+
+      const sessionId = `hradp${Date.now().toString(36)}`;
+      const logs: string[] = [];
+      const child = spawnWorker(root, sessionId, logs);
+      const paneId = agentPaneId(externalSession);
+      const init: DaemonToWorker = {
+        type: 'init',
+        sessionId,
+        chatId: 'oc_herdr_adopt',
+        rootMessageId: 'om_herdr_adopt',
+        workingDir: root,
+        cliId: 'claude-code',
+        backendType: 'herdr',
+        prompt: '',
+        larkAppId: 'app_worker_herdr_e2e',
+        larkAppSecret: 'secret',
+        adoptMode: true,
+        adoptSource: 'herdr',
+        adoptHerdrSessionName: externalSession,
+        adoptHerdrTarget: paneId,
+        adoptHerdrPaneId: paneId,
+        adoptPaneCols: 100,
+        adoptPaneRows: 30,
+      };
+      child.send(init);
+      const ready = await waitForReady(child, logs);
+      let received = '';
+      const ws = await openWriteWebSocket(ready, frame => { received += frame; });
+      await waitFor(
+        () => received.includes('ADOPT_INITIAL'),
+        5_000,
+        'adopt initial screen seed',
+      );
+
+      received = '';
+      writeFileSync(trigger, 'go');
+      await waitFor(
+        () => received.includes('ADOPT_LIVE_UPDATE'),
+        5_000,
+        'adopt live snapshot relay',
+      );
+
+      expect(received).toContain('ADOPT_LIVE_UPDATE');
+      ws.close();
+      child.send({ type: 'close' } satisfies DaemonToWorker);
+      external.destroySession();
+    },
+    35_000,
+  );
+
+  it.skipIf(!HerdrBackend.isAvailable())(
+    'pins adopted Herdr viewers to the pane PTY grid and re-pins after the pane resizes',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-grid-'));
+      tempDirs.add(root);
+      const ttyFile = join(root, 'pane-tty');
+      const fakeAgent = join(root, 'pi');
+      writeFileSync(fakeAgent, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+      chmodSync(fakeAgent, 0o755);
+      const externalSession = `adopt-grid-${Date.now().toString(36)}`;
+      sessions.add(externalSession);
+      const external = new HerdrBackend(externalSession);
+      external.spawn(fakeAgent, [
+        '-lc',
+        `tty > '${ttyFile}'; echo ADOPT_GRID_READY; while :; do sleep 1; done`,
+      ], {
+        cwd: root,
+        cols: 100,
+        rows: 30,
+        env: { ...process.env } as Record<string, string>,
+      });
+      await waitFor(
+        () => external.captureCurrentScreen().includes('ADOPT_GRID_READY') && existsSync(ttyFile),
+        10_000,
+        'external pane ready',
+      );
+      // Stand in for the user's Herdr client sizing the pane.
+      const paneTty = readFileSync(ttyFile, 'utf8').trim();
+      const sttyDeviceFlag = process.platform === 'linux' ? '-F' : '-f';
+      const resizePane = (cols: number, rows: number) => execFileSync(
+        'stty', [sttyDeviceFlag, paneTty, 'cols', String(cols), 'rows', String(rows)],
+      );
+      resizePane(123, 37);
+
+      const sessionId = `hragr${Date.now().toString(36)}`;
+      const logs: string[] = [];
+      const child = spawnWorker(root, sessionId, logs);
+      const paneId = agentPaneId(externalSession);
+      child.send({
+        type: 'init',
+        sessionId,
+        chatId: 'oc_herdr_adopt_grid',
+        rootMessageId: 'om_herdr_adopt_grid',
+        workingDir: root,
+        cliId: 'claude-code',
+        backendType: 'herdr',
+        prompt: '',
+        larkAppId: 'app_worker_herdr_e2e',
+        larkAppSecret: 'secret',
+        adoptMode: true,
+        adoptSource: 'herdr',
+        adoptHerdrSessionName: externalSession,
+        adoptHerdrTarget: paneId,
+        adoptHerdrPaneId: paneId,
+        // A stale discovery-time guess that matches neither the pane nor the browser.
+        adoptPaneCols: 200,
+        adoptPaneRows: 50,
+      } satisfies DaemonToWorker);
+      const ready = await waitForReady(child, logs);
+      const frames: string[] = [];
+      const ws = await openWriteWebSocket(ready, frame => { frames.push(frame); });
+      ws.send(JSON.stringify({ type: 'resize', cols: 90, rows: 30 }));
+
+      const initialPin = '\x1b]1989;123;37\x07';
+      await waitFor(() => frames.includes(initialPin), 5_000, 'connect-time pin to the pane grid')
+        .catch((err) => {
+          throw new Error(`${err instanceof Error ? err.message : String(err)}\nframes: ${JSON.stringify(frames)}\nworker:\n${logs.join('')}`);
+        });
+
+      // The pane text does not change: only the grid does.
+      resizePane(111, 33);
+      const resizedPin = '\x1b]1989;111;33\x07';
+      await waitFor(() => frames.includes(resizedPin), 15_000, 're-pin after the pane resizes')
+        .catch((err) => {
+          throw new Error(`${err instanceof Error ? err.message : String(err)}\nframes: ${JSON.stringify(frames)}\nworker:\n${logs.join('')}`);
+        });
+      const pinIndex = frames.indexOf(resizedPin);
+      expect(frames[pinIndex + 1]).toMatch(/^\x1b\]1989;history;\d+\x07[\s\S]*ADOPT_GRID_READY/);
+      // Herdr reports no cursor for an adopted pane: every frame parks xterm's
+      // cursor at column 1 and hides it instead of leaving it after the text.
+      expect(frames[pinIndex + 1].endsWith('\r\x1b[?25l')).toBe(true);
+      // A browser resize never stands in for the adopted pane's grid.
+      expect(frames.some(frame => frame.includes('\x1b]1989;90;30\x07'))).toBe(false);
+
+      ws.close();
+      child.send({ type: 'close' } satisfies DaemonToWorker);
+      external.destroySession();
+    },
+    40_000,
+  );
+
+  it.skipIf(!HerdrBackend.isAvailable())(
+    'publishes the adopted Herdr pane CLI pid and start identity before ready',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-herdr-adopt-attest-'));
+      tempDirs.add(root);
+      const paneMarker = `botmux-adopt-attest-${Date.now().toString(36)}`;
+      const fakeAgent = join(root, 'pi');
+      writeFileSync(fakeAgent, `#!/bin/bash
+export HERDR_AGENT=pi
+herdr pane report-agent "$HERDR_PANE_ID" \\
+  --source custom:botmux-worker-e2e --agent pi --state idle >/dev/null 2>&1
+/bin/bash "$@"
+`);
+      chmodSync(fakeAgent, 0o755);
+      const externalSession = `adopt-attest-${Date.now().toString(36)}`;
+      sessions.add(externalSession);
+      const external = new HerdrBackend(externalSession);
+      external.spawn(fakeAgent, ['-lc', `echo ${paneMarker}; while :; do sleep 1; done`], {
+        cwd: root,
+        cols: 100,
+        rows: 30,
+        env: { ...process.env } as Record<string, string>,
+      });
+      await waitFor(
+        () => external.captureCurrentScreen().includes(paneMarker),
+        10_000,
+        'external pane initial marker',
+      );
+      // The Herdr backend never records the external pane's CLI pid, so resolve
+      // the live pane process from the OS by its unique marker command instead
+      // of falling back to this test runner's pid.
+      const panePid = await waitFor(
+        () => {
+          try {
+            const out = execFileSync('pgrep', ['-f', paneMarker], { encoding: 'utf8' }).trim();
+            const pid = out.split('\n').map(Number).find(n => Number.isInteger(n) && n > 1 && n !== process.pid);
+            return pid ?? null;
+          } catch { return null; }
+        },
+        10_000,
+        'external pane process pid',
+      );
+      expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
+
+      const sessionId = `hratt${Date.now().toString(36)}`;
+      const logs: string[] = [];
+      const messages: WorkerToDaemon[] = [];
+      const child = spawnWorker(root, sessionId, logs);
+      child.on('message', raw => messages.push(raw as WorkerToDaemon));
+      const paneId = agentPaneId(externalSession);
+      child.send({
+        type: 'init',
+        sessionId,
+        chatId: 'oc_herdr_adopt_attest',
+        rootMessageId: 'om_herdr_adopt_attest',
+        workingDir: root,
+        cliId: 'claude-code',
+        backendType: 'herdr',
+        prompt: '',
+        larkAppId: 'app_worker_herdr_e2e',
+        larkAppSecret: 'secret',
+        turnId: 'om_turn',
+        adoptMode: true,
+        adoptSource: 'herdr',
+        adoptHerdrSessionName: externalSession,
+        adoptHerdrTarget: paneId,
+        adoptHerdrPaneId: paneId,
+        adoptCliPid: panePid,
+        adoptPaneCols: 100,
+        adoptPaneRows: 30,
+      } satisfies DaemonToWorker);
+
+      const ready = await waitForReady(child, logs);
+      const attestation = messages.find(
+        (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }> =>
+          m.type === 'local_process_attestation',
+      );
+      expect(attestation, JSON.stringify(messages)).toBeDefined();
+      expect(attestation!.cliPid).toBe(panePid);
+      expect(typeof attestation!.cliProcStart === 'string' && attestation!.cliProcStart!.length > 0).toBe(true);
+      expect(attestation!.backendType).toBe('herdr');
+      const attestationIndex = messages.findIndex(m => m.type === 'local_process_attestation');
+      const readyIndex = messages.findIndex(m => m.type === 'ready');
+      expect(attestationIndex).toBeGreaterThanOrEqual(0);
+      expect(attestationIndex).toBeLessThan(readyIndex);
+      // The attestation must precede the current turn's origin snapshot: the
+      // daemon records this CLI pid before it snapshots the turn's pre-existing
+      // descendants, so a managed_turn_origin for om_turn follows the attestation.
+      const originAfter = messages.findIndex(
+        (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+      );
+      expect(originAfter).toBeGreaterThan(attestationIndex);
+
+      void ready;
+      child.send({ type: 'close' } satisfies DaemonToWorker);
+      external.destroySession();
+    },
+    35_000,
+  );
+});

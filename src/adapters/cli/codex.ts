@@ -1,20 +1,122 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { wrapBracketedPaste } from './tui-input.js';
+import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-json.js';
+import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
+import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
+import {
+  drainCodexRollout,
+  findCodexRolloutByPid,
+  findCodexRolloutBySessionId,
+  findCodexRolloutSetByPid,
+  findCodexSessionIdByBotmuxSessionId,
+  type CodexDrainState,
+} from '../../services/codex-transcript.js';
+import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
+import { delay, scaleMs } from '../../utils/timing.js';
+
+const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
+
+/**
+ * Pre-trust the session cwd so Codex's startup folder-trust screen never
+ * renders (its option wording has already changed once upstream — "Yes,
+ * continue" → "Trust and continue" (npm 0.156-alpha.1; source first at
+ * 0.155-alpha.4, see #1519) — and may change again; matching the text is
+ * inherently reactive, while the persisted decision makes the dialog
+ * structurally unreachable).
+ *
+ * Codex stores folder trust in config.toml's `projects` table; the TUI skips
+ * the onboarding trust step when `active_project.trust_level == "trusted"`.
+ * We inject it as a PROCESS-LEVEL `-c` override (never written to the user's
+ * config), expressed as an inline TOML table. Inline-table form is mandatory:
+ * the dotted-key spelling `projects."/a/b".trust_level=…` does NOT take effect
+ * via `-c` on standalone codex 0.153/0.157 at all — verified to leave the
+ * project untrusted even for dot-free paths, so it is not just the quoted-key
+ * dotted-segmentation corner case; the quoted table key in
+ * `projects={"<cwd>"={trust_level="trusted"}}` is the reliably-accepted form
+ * for any path spelling. TOML tables deep-merge with the loaded config, so
+ * existing trusted projects are preserved. Trust becoming effective is
+ * observable on every tested version as the `codex exec` sandbox default
+ * moving read-only → workspace-write (standalone codex 0.144.6 / 0.153.4 /
+ * 0.157-alpha); note the interactive TUI trust screen itself only exists on
+ * ≥0.156 in current builds, so dialog-suppression is directly demonstrated
+ * there.
+ *
+ * Plain owned TUI fresh launches only (the caller attaches the result to `-C`
+ * args): `--remote` viewers run against an app-server whose trust is decided
+ * host-side and never reach this helper; adopt panes are user-owned and are not
+ * spawned through this path; real resume/fork reuse the original session's
+ * already-persisted trust decision.
+ */
+function codexCwdTrustOverrideArgs(workingDir?: string): string[] {
+  if (!workingDir) return [];
+  return ['-c', `projects={${JSON.stringify(workingDir)}={trust_level="trusted"}}`];
+}
+
+
+/** ZMX resume can replace the entire banner with restored history; warm worker
+ * reattach can leave the original loaded banner far above the viewport. Either
+ * native header plus a bottom empty composer + explicit Ready footer proves
+ * initialization without guessing the PTY's current viewport geometry.
+ * Do not use a prompt/footer found in the middle of scrollback as evidence. */
+function restoredCodexHistoryReady(history: string): boolean {
+  const restored = /^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history);
+  const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
+  const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
+  const lines = history.trimEnd().split(/\r?\n/);
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  const nativeFooter = codexNativeFooterRows(footer);
+  if (nativeFooter === undefined) return false;
+  const restoredReady = (restored || initialized)
+    && /^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0]!);
+  // Codex 0.154 can resume straight into the composer without repainting the
+  // banner or restoration marker. Its bottom Context footer is the positive
+  // initialization evidence in that layout; the loading skeleton never has it.
+  const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
+  // A custom status_line may omit both directory and Context. The complete
+  // native thread-id is also initialization evidence; reuse the same segment
+  // parser as terminal identity binding (no truncated/path/ambiguous UUIDs).
+  const threadReady = codexFooterSessionId(nativeFooter) !== undefined;
+  if (!restoredReady && !contextReady && !threadReady) return false;
+  // History has no viewport bounds: never guess how far above the composer a
+  // loading/status row can be. Conflicting evidence remains conservatively held.
+  return !/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(history);
+}
+
+/** Only the current viewport is meaningful here: stripping the PTY stream
+ * leaves erased loading screens and old transcript prompts in the text. */
+function resumedCodexPromptReady(screen: string): boolean {
+  if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
+  const lines = screen.trimEnd().split('\n');
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*[›»](?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*[›»]\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  // The composer must be the bottom input surface, followed only by its
+  // initialized model/path or thread-id footer. Pickers, dialogs and history alone
+  // cannot satisfy this shape. Do not depend on a particular model name.
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  const nativeFooter = codexNativeFooterRows(footer);
+  return nativeFooter !== undefined && (/^\s*\S[^\n]* · (?:\/|~)\S*/.test(footer[0])
+    || codexFooterSessionId(nativeFooter) !== undefined);
+}
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
  *  file, which Codex creates lazily at the first submit (chicken-and-egg:
  *  you can't use it to verify the *first* submit that we're trying to fix). */
-const HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
-
-function delay(ms: number): Promise<void> {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -23,9 +125,57 @@ function currentFileSize(path: string): number {
 interface HistoryMatch {
   found: boolean;
   cliSessionId?: string;
+  /** True only when the matched line's session id passed a POSITIVE ownership
+   *  check (explicit expected thread id, or an available owned-rollout set that
+   *  contains it). An unfiltered match or one accepted because enumeration was
+   *  unavailable is a submit confirmation, not proof that THIS pane consumed
+   *  the input. */
+  ownershipProven?: boolean;
 }
 
-function matchHistoryDelta(path: string, fromByte: number, marker: string): HistoryMatch {
+function historyMatchResult(match: HistoryMatch, requireOwnership: boolean): { submitted: true; cliSessionId?: string; ownershipProven?: true; unprovenCliSessionId?: string } {
+  const exposeSid = !!match.cliSessionId && (!requireOwnership || !!match.ownershipProven);
+  return {
+    submitted: true,
+    ...(exposeSid ? { cliSessionId: match.cliSessionId } : {}),
+    ...(match.ownershipProven ? { ownershipProven: true } : {}),
+    // Codex creates the rollout lazily at the first submit and appends the
+    // history line from a separate task, so the line can be readable before
+    // the pid holds the rollout open. Hand the id back as a candidate only; the
+    // worker binds it once the pid is seen holding that rollout.
+    ...(match.cliSessionId && !exposeSid ? { unprovenCliSessionId: match.cliSessionId } : {}),
+  };
+}
+
+function readCliSessionId(parsed: unknown): string | undefined {
+  return parsed && typeof parsed === 'object' && typeof (parsed as any).session_id === 'string'
+    ? (parsed as any).session_id
+    : undefined;
+}
+
+function normaliseHistoryText(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function historyTextMatches(actual: string, expected: string): boolean {
+  return actual === expected || normaliseHistoryText(actual) === normaliseHistoryText(expected);
+}
+
+/** Optional ownership filter for a history match. `history.jsonl` is a single
+ *  global file shared by every Codex pane under one CODEX_HOME, so a concurrent
+ *  sibling pane submitting identical text can land its line first. When a filter
+ *  is supplied, a same-text line is only accepted if `acceptSid(sid)` is true —
+ *  a foreign sibling's line is skipped and scanning continues for the owned one.
+ *  The filter is re-evaluated on every call (not snapshotted) so a lazily-opened
+ *  owned rollout fd that appears AFTER its history line can still be accepted on
+ *  a later poll. */
+type HistorySidFilter = (cliSessionId: string | undefined) => boolean;
+/** Positive ownership predicate; see HistoryMatch.ownershipProven. */
+type HistorySidProof = (cliSessionId: string | undefined) => boolean;
+
+function matchHistoryDelta(
+  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
+): HistoryMatch {
   if (!existsSync(path)) return { found: false };
   let size: number;
   try { size = statSync(path).size; } catch { return { found: false }; }
@@ -39,95 +189,273 @@ function matchHistoryDelta(path: string, fromByte: number, marker: string): Hist
     closeSync(fd);
   }
   const delta = buf.toString('utf8');
-  for (const line of delta.split('\n')) {
-    if (!line.includes(marker)) continue;
+  const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
+  for (const line of lines) {
     try {
       const parsed = JSON.parse(line);
-      return {
-        found: true,
-        cliSessionId: typeof parsed.session_id === 'string' ? parsed.session_id : undefined,
-      };
+      if (typeof parsed?.text === 'string' && historyTextMatches(parsed.text, expectedText)) {
+        const cliSessionId = readCliSessionId(parsed);
+        // Skip a same-text line owned by a DIFFERENT pane (shared-CODEX_HOME
+        // collision). Keep scanning — the owned line may be later in this delta
+        // or arrive on a subsequent poll.
+        if (acceptSid && !acceptSid(cliSessionId)) continue;
+        return { found: true, cliSessionId, ownershipProven: !!proveSid && proveSid(cliSessionId) };
+      }
     } catch {
-      return { found: true };
+      // Ignore partial/non-JSON lines. A later poll will see the completed
+      // history entry if Codex was still writing it.
     }
   }
   return { found: false };
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, marker: string, timeoutMs: number,
+  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
 ): Promise<HistoryMatch> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
-    const match = matchHistoryDelta(path, fromByte, marker);
+    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid, proveSid);
     if (match.found) return match;
     await delay(100);
   }
   return { found: false };
 }
 
-/** Build a JSON-escaped prefix of the content so substring-match against the
- *  raw history.jsonl file content (where text fields store \n as the two-char
- *  escape `\n`, not a literal newline) finds our line. The prefix length is
- *  chosen to be unique-enough even when two bots submit near-identical text. */
-function historyMarker(content: string): string {
-  const prefix = content.slice(0, 40);
-  return JSON.stringify(prefix).slice(1, -1);  // strip surrounding quotes
+function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
+  // Resume must find the mapping however old it is, so no tail cap; the lookup
+  // is a bounded-memory newest-first scan that stops at the first hit, and a
+  // mention without a session_id falls through to an older one.
+  return findCodexSessionIdByBotmuxSessionId(botmuxSessionId, {
+    maxTailBytes: Number.POSITIVE_INFINITY,
+    skipUnmapped: true,
+  });
 }
 
-function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | undefined {
-  if (!existsSync(HISTORY_PATH)) return undefined;
-  try {
-    const size = statSync(HISTORY_PATH).size;
-    const fd = openSync(HISTORY_PATH, 'r');
-    const buf = Buffer.alloc(size);
-    try {
-      readSync(fd, buf, 0, size, 0);
-    } finally {
-      closeSync(fd);
-    }
-    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
-    const lines = buf.toString('utf8').trimEnd().split('\n');
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i]!;
-      if (!line.includes(marker)) continue;
-      try {
-        const parsed = JSON.parse(line);
-        if (typeof parsed.session_id === 'string') return parsed.session_id;
-      } catch {
-        continue;
-      }
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
+/** Codex rollout bridge. Spawn attach additionally honours an existing App Server
+ *  share (`split-live`); terminal `/adopt` keeps a dedicated worker branch because
+ *  the thread id comes from a live terminal-session refresh. */
+export const codexBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainCodexRollout(path, offset, ctx.state as CodexDrainState | undefined),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => findCodexRolloutBySessionId(sessionId),
+    byPid: pid => findCodexRolloutByPid(pid)?.path,
+  },
+  spawn: { sessionId: 'cli', baseline: 'resume-aware', appServerShare: true },
+};
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'codex');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'codex';
+  let cachedBin: string | undefined;
+  const detectModelCapabilities = async (
+    options?: { env?: NodeJS.ProcessEnv },
+  ): Promise<readonly DebugModelCapabilities[] | null> => {
+    try {
+      return await loadCodexServiceTierCatalog({
+        cliBin: (cachedBin ??= resolveCommand(rawBin)),
+        env: options?.env,
+      });
+    } catch {
+      return null;
+    }
+  };
   return {
     id: 'codex',
-    resolvedBin: bin,
+    bridgeSpec: codexBridgeSpec,
+    mcpGateway: {
+      get configPath(): string { return join(codexHome(), 'config.toml'); },
+      format: 'codex-toml',
+    },
+    // codex 0.137's own filesystem profile can't express a read blocklist, so
+    // isolation is enforced by the worker's whole-process macOS Seatbelt wrapper.
+    // e2e verified: codex under `sandbox-exec -f <profile>` (with bypass) is
+    // blocked from denied paths and runs normally; its sessions/auth live in the
+    // per-bot BOT_HOME via CODEX_HOME redirection. (Read isolation does NOT consult
+    // authPaths — that only feeds the bwrap file sandbox below.)
+    supportsReadIsolation: true,
+    // Whole ~/.codex kept REAL, not just auth.json: codex writes SQLite state/log
+    // DBs (state_*.sqlite / logs_*.sqlite) + history/sessions there. The file
+    // sandbox is a fresh tmpfs root where ONLY allow-listed paths are bound in.
+    // A single-file carve-out (just auth.json) would technically still let codex
+    // create + fcntl-lock sibling DBs — verified: a fresh tmpfs supports SQLite
+    // byte-range locks and sibling creation just fine — but those live in the
+    // EPHEMERAL tmpfs: they vanish when the sandbox tears down (no persistence)
+    // and the daemon's transcript bridge / resume never sees them (they're not on
+    // the real host path). Binding the whole dir REAL is what keeps login +
+    // history + state persistent across sessions AND visible to the worker's
+    // bridge/resume on the same host path. NOTE this rationale is for the
+    // NON-redirected path; when CLI data is redirected to BOT_HOME the worker
+    // drops this host authPath (authPathsSurvivingCliDataRedirect) — codex then
+    // reads/writes its DBs under CODEX_HOME=BOT_HOME/codex instead, and exposing
+    // the host ~/.codex would only leak history/sessions it never touches.
+    authPaths: ['~/.codex'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+      if (promptInjection === 'none') {
+        assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
+      }
+      // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
+      // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
+      // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
+      // path, no history.jsonl verify. --no-alt-screen keeps pane capture working.
+      // A submit Enter can accept Codex's low-quota picker (default: switch).
+      // Suppress it at the TUI boundary, including the RPC viewer. Keep this
+      // independent of approval/sandbox bypass and leave user config untouched.
+      const modelNudgeArgs = hideRateLimitModelNudge
+        ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
+      if (remoteWsUrl && remoteThreadId) {
+        if (codexProfile) throw new Error('Codex profile is not supported by the RPC app-server/viewer');
+        // -c check_for_update_on_startup=false: an RPC pane is a pure viewer with
+        // NO terminal input path, so codex's interactive "Update available … Press
+        // enter to continue" dialog would block the resume forever and freeze the
+        // Web terminal. Disable the check at the PROCESS level (never the user's
+        // global config). The bounded startup-dialog watcher is only a fail-safe.
+        //
+        // -c notice.hide_rate_limit_model_nudge=true: the viewer is itself a TUI
+        // and renders the low-usage luna switch popup. botmux never injects keys
+        // here, so it cannot be confirmed by accident, but the modal still covers
+        // the pane and confuses screen-state detection / manual inspection; keep
+        // it suppressed like the startup update picker.
+        // Keep only config overrides before the subcommand. A launcher may
+        // prepend its own -c, which Codex 0.156 can lose if another -c follows
+        // `resume`; --no-alt-screen retains its original subcommand scope.
+        return ['--remote', remoteWsUrl,
+          '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs,
+          ...(quietResume ? ['-c', 'tui.auto_recap=false'] : []),
+          'resume', '--no-alt-screen', remoteThreadId];
+      }
+      // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
+      // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
+      // So spawn args are unchanged — keep bypass so codex's own nested sandbox
+      // is OFF and the outer Seatbelt profile is the sole enforcer.
       const baseArgs = [
+        ...(codexProfile ? (codexProfile.startsWith('-') ? [`--profile=${codexProfile}`] : ['--profile', codexProfile]) : []),
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        // Codex 0.14x added a second interactive gate AFTER folder trust: the
+        // botmux-installed UserPromptSubmit + Stop hooks in ~/.codex/hooks.json
+        // must be manually trusted ("Press t to trust"), and every botmux upgrade
+        // rewrites codex-hook.sh → its trusted_hash changes → the gate re-fires. A
+        // botmux-managed plain-TUI pane has no human at its PTY to press `t`, so the
+        // first Lark turn wedges forever. This gate is TUI-only: this branch never
+        // runs for --remote (see the early return above), and the app-server rejects
+        // the flag. (`codex exec` DOES accept it, but botmux never launches exec.)
+        //
+        // This is a SEPARATE knob from the approval/sandbox bypass: the flag trusts
+        // ALL hook sources codex sees (user/project/plugin), not only botmux's, so it
+        // is gated by its own global toggle `bypassHookTrust` (default ON, operator can
+        // disable) — expressing "approvals bypassed, hook-trust review kept". Still
+        // ANDed with `!disableCliBypass`: a restricted bot never gets it regardless.
+        ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
+        '-c',
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(shellSubprocessEnv?.BOTMUX_SESSION_ID ?? sessionId)}`,
+        // A botmux session cannot safely interact with Codex's startup update
+        // picker: the first queued Lark message can be consumed by the menu.
+        // Treat botmux as the runtime manager for every launch (sandboxed or
+        // not); the host-side daily monitor reports newer versions to the owner.
+        '-c',
+        'check_for_update_on_startup=false',
+        // Codex 0.151+ opens a "Switch to <luna-tier model> for lower credit
+        // usage?" selection view once the primary usage limit is >=90% used
+        // (upstream RATE_LIMIT_SWITCH_PROMPT_THRESHOLD). Its first item is the
+        // default selection and performs the switch, so this paste path's
+        // trailing submit Enter confirms the popup instead of sending the Lark
+        // message — the session silently downgrades model AND reasoning effort,
+        // or the Enter is swallowed and the message never runs (see #1281).
+        // Process-level opt-out, equivalent to the popup's "Keep current model
+        // (never show again)"; never written to the user's global config. Added
+        // on BOTH TUI launch shapes (this plain pane and the --remote viewer
+        // above); app-server/runner CLIs render no TUI popup and need no flag.
+        ...modelNudgeArgs,
       ];
+      // Under read isolation the worker denies bots.json, so `botmux send` (a shell
+      // subprocess) registers this bot from the worker-written cred FILE, keyed by
+      // SESSION_DATA_DIR + BOTMUX_LARK_APP_ID. Codex does NOT forward its env to shell
+      // subprocesses by default (only shell_environment_policy.set/inherit do), so
+      // without this those two vars never reach `botmux send` → "Bot not registered".
+      // Forward codex's full env to shell commands so the cred-file lookup works. No
+      // secret is forwarded — it lives only in the cred file (not env/argv), so it is
+      // NOT exposed to other bots via `ps aux`. (inherit rather than set: the two vars
+      // are already in codex's env from the worker.)
+      if (readIsolation) {
+        baseArgs.push(
+          '-c', 'shell_environment_policy.inherit="all"',
+          '-c', 'shell_environment_policy.ignore_default_excludes=true',
+        );
+      }
+      // Trigger-user CLI identity: the wrapper only intercepts `lark-cli` if the
+      // shell codex spawns can see these. Same mechanism as the block above and
+      // the same failure if omitted — measured: without them `lark-cli whoami`
+      // inside a session reports the machine owner, not the acting identity.
+      //
+      // Enumerated with `.set` rather than `inherit="all"`: this needs exactly
+      // these keys, while inherit would hand every shell command the whole
+      // worker environment, which is a much wider surface for a narrower need.
+      for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (key === 'BOTMUX_SESSION_ID' || value === undefined) continue;
+        baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
+      }
       if (model && model.trim()) {
         // Codex 接受 `--model <id>` / `-m <id>`，写全名最稳，错的会在 codex 自己启动时报。
         baseArgs.push('--model', model.trim());
       }
+      if (reasoningEffort) {
+        // Per-turn reasoning effort → codex model_reasoning_effort（进程级 -c 覆盖，
+        // 不动用户全局 config）。Codex 0.146.1 实测接受
+        // low/medium/high/xhigh/max/ultra，故原样透传，不做降级——收敛会静默改变
+        // 用户请求的档位。
+        baseArgs.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+      }
+      if (serviceTier) {
+        // A root override also covers resume/fork; the splitter below moves it
+        // before the subcommand where launcher-provided -c flags stay active.
+        baseArgs.push('-c', `service_tier=${JSON.stringify(serviceTier)}`);
+      }
       // Codex app-server can keep its own cwd at $HOME; -C pins fresh agent roots.
+      // NOTE: canonicalization of workingDir for the file sandbox is done ONCE in
+      // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
+      // lexical path — realpath'ing here unconditionally would desync codex's cwd
+      // semantics vs the worker's lexical bridge/state tracking.
+      //
+      // Pre-trust the cwd we are about to pin (see codexCwdTrustOverrideArgs).
+      // Only on FRESH launches: a real `resume`/`fork` below runs without -C in
+      // the thread's original directory, whose trust decision was already
+      // persisted when that session first started — injecting trust for a cwd we
+      // are not pinning would be meaningless; the worker's text-matching Enter
+      // stays the fail-safe for any untrusted resume cwd.
+      const cwdTrustArgs = codexCwdTrustOverrideArgs(workingDir);
       const freshArgs = workingDir
-        ? [...baseArgs, '-C', workingDir]
+        ? [...baseArgs, ...cwdTrustArgs, '-C', workingDir]
         : baseArgs;
-      if (!resume) return freshArgs;
-
-      const codexSessionId = resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
+      const codexSessionId = resume
+        ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)
+        : undefined;
+      // Session fork: `codex fork <id>` copies the source rollout up to its tip
+      // into a NEW rollout + session id (session_meta records forked_from_id),
+      // leaving the source rollout untouched. Unlike Claude, Codex has no
+      // privilege-escalation guard on fork. Falls back to plain `resume` when we
+      // somehow lack a source id (nothing to fork from). Move only -c overrides
+      // before the subcommand so a launcher's earlier -c remains active; keep
+      // other flags in their original subcommand scope.
       if (!codexSessionId) return freshArgs;
-      return ['resume', ...baseArgs, codexSessionId];
+      const rootConfigArgs: string[] = [];
+      const subcommandArgs: string[] = [];
+      for (let index = 0; index < baseArgs.length; index++) {
+        const arg = baseArgs[index]!;
+        if (arg === '-c' || arg === '--profile') rootConfigArgs.push(arg, baseArgs[++index]!);
+        else if (arg.startsWith('--profile=')) rootConfigArgs.push(arg);
+        else if (arg === '--model') subcommandArgs.push(arg, baseArgs[++index]!);
+        else subcommandArgs.push(arg);
+      }
+      return [...rootConfigArgs,
+        ...(quietResume && !forkSession ? ['-c', 'tui.auto_recap=false'] : []),
+        forkSession ? 'fork' : 'resume', ...subcommandArgs, codexSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -140,7 +468,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       return `codex resume ${sid}`;
     },
 
-    async writeInput(pty: PtyHandle, content: string) {
+    /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for
+     *  resumable sessions (session_meta carries the resume id + cwd). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverRolloutSessions(codexSessionsRoot(), limit, exclude);
+    },
+
+    async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
+      const terminalSession = await refreshCodexTerminalSession(pty);
       // Codex's input mode treats every literal \n as Enter. The old path
       // (`send-keys -l` with the whole multi-line blob) therefore submitted
       // each line as its own turn — a single Lark message fragmented into
@@ -172,8 +507,57 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      const baseByte = currentFileSize(HISTORY_PATH);
-      const marker = historyMarker(content);
+      const historyPath = codexHistoryPath();
+      const baseByte = currentFileSize(historyPath);
+
+      // Ownership filter for the shared global history.jsonl. An external App
+      // Server viewer cannot own the rollout fd: `codex --remote` is merely a
+      // second client and the existing App Server holds the actual thread. For
+      // that explicit mode accept ONLY its already-selected thread id. A local
+      // daemon-backed TUI proves its exact thread through its live footer;
+      // embedded sessions retain the PID/rollout ownership filter.
+      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+        ? pty.cliPid
+        : undefined;
+      const expectedRemoteSid = terminalSession.kind === 'terminal' ? terminalSession.sessionId
+        : typeof pty.expectedCodexSessionId === 'string'
+        && pty.expectedCodexSessionId.trim()
+        ? pty.expectedCodexSessionId.trim()
+        : undefined;
+      // Sandboxed Linux processes can deny /proc/<pid>/fd access even to
+      // their owner. Bare identical text in a shared history is not proof of
+      // which pane consumed it. A fresh per-write marker makes the exact
+      // post-baseByte history match unique without trusting a cwd/latest file
+      // or relaxing the owned-fd filter. Keep adopt, zero-prompt and explicit
+      // remote-thread input byte-for-byte unchanged (the worker opts in).
+      const initialOwned = cliPid ? findCodexRolloutSetByPid(cliPid) : undefined;
+      const correlated = context?.correlateTranscript === true && !!cliPid
+        && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
+      if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
+      const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            if (!owned || owned.size === 0) return true;
+            return owned.has(sid.toLowerCase());
+          }
+          : undefined;
+      // Positive ownership only: the explicit thread, an owned rollout fd,
+      // or this write's fresh correlation marker in the exact history match.
+      // Uncorrelated empty/unavailable-set acceptances remain submit evidence
+      // only, and never bind this pane to a sibling's conversation.
+      const proveSid: HistorySidProof | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            if (owned?.size) return owned.has(sid.toLowerCase());
+            return correlated && bindCodexSessionFromCorrelatedInput(pty, cliPid, sid);
+          }
+          : undefined;
 
       try {
         if (pty.pasteText) {
@@ -183,7 +567,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           pty.pasteText(content);
         } else {
           // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write('\x1b[200~' + content + '\x1b[201~');
+          pty.write(wrapBracketedPaste(content));
         }
       } catch {
         return { submitted: false };
@@ -192,30 +576,61 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : undefined;
-        }
+        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+        if (match.found) return historyMatchResult(match, cliPid !== undefined);
         if (!trySendEnter()) return { submitted: false };
       }
-      const match = await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : undefined;
-      }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+      if (match.found) return historyMatchResult(match, cliPid !== undefined);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
-      const recheck = (): boolean => matchHistoryDelta(HISTORY_PATH, baseByte, marker).found;
+      const recheck = () => {
+        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
+        return late.found ? historyMatchResult(late, cliPid !== undefined) : false;
+      };
       return { submitted: false, recheck };
     },
 
     completionPattern: undefined,
-    readyPattern: /›|\d+% left/,  // › for input box, or status bar pattern (e.g. "97% left")
+    // Codex redraws this status line while a turn is active. Require both text
+    // anchors on one line so transcript prose or an idle composer cannot revive
+    // a completed Lark card.
+    busyPattern: CODEX_ACTIVE_BUSY_PATTERN,
+    idleToBusyPattern: CODEX_ACTIVE_BUSY_PATTERN,
+    // Codex's update picker also renders `› 1. Update now`; a bare /›/ treats
+    // that menu as the composer and lets botmux's queued first message select
+    // the update. Keep accepting the composer marker anywhere in a TUI redraw,
+    // but reject numbered menu choices. This remains necessary for wrappers
+    // such as Aiden that cannot forward the startup-update config override.
+    readyPattern: /[›»](?!\s*\d+\.)|\d+% left/,
+    // 0.153.x paints a skeleton composer before thread initialization. The
+    // `›` and two seconds of silence do not prove it can submit yet; history
+    // can remain empty throughout bootstrap even when a TUI input is queued.
+    // Release only on complete initialized banner cells, including custom
+    // models/paths. The footer can already show a model during loading. Match
+    // cell boundaries, not literal newlines: PTY redraws also move the cursor.
+    startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
+    startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
+    startupReadyFromHistory: restoredCodexHistoryReady,
+    startupResume: {
+      historyPattern: /Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript/,
+      isReady: resumedCodexPromptReady,
+    },
+    // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
+    // Wait for the real composer marker so the bare-shell guard does not treat
+    // a still-loading zsh wrapper as a failed launch.
+    deferFirstPromptTimeoutUntilReady: true,
+    // Native interactive controls that are safe and useful as the FIRST topic
+    // message (cold-start: an empty topic spawns a session to run them). /goal
+    // starts goal work, so it belongs here. /fast is deliberately NOT here: it
+    // is a tier toggle, not "start a unit of work", and owner policy is that a
+    // bare /fast in an empty topic must not spawn a session — it lives in the
+    // global PASSTHROUGH_COMMANDS instead (forwarded to Codex on an existing
+    // session; harmless unknown-command on other CLIs).
+    defaultPassthroughCommands: ['/goal'],
+    buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an
@@ -232,9 +647,36 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // time even for a parked message, so writeInput's verification confirms the
     // submit immediately and never spuriously reports a mid-turn send failure.
     supportsTypeAhead: true,
+    reliableTurnTerminal: true,
+    // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
+    // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a
+    // structured `limited` state — so codex is the rate-limit authority and the
+    // screen-scan `rate` heuristic is suppressed for it (see
+    // isStructuredRateLimitAuthoritative). Only codex among the codexBridgeQueue
+    // CLIs runs that emit (structuredBridgeIsCodex gate), so the flag stays here.
+    emitsStructuredRateLimit: true,
     altScreen: false,   // --no-alt-screen disables alternate screen
-    modelChoices: ['gpt-5', 'gpt-5-codex', 'o3', 'o3-mini'],
+    // Codex has no per-session skill injection like Claude's `--plugin-dir`.
+    // Verified empirically on codex 0.136.0 (via `codex debug prompt-input`,
+    // which dumps the model-visible skill list): config keys
+    // (skills.directories/paths/dirs/extra_dirs/...), env vars
+    // (CODEX_SKILLS_DIR/...), and `[[skills.config]]`'s `path` (enable/disable
+    // only — can't register an arbitrary path) all fail to add a scan root.
+    // Codex only reads hard-coded roots, so — like gemini/opencode/cursor — we
+    // install into Codex's global skills dir under CODEX_HOME (default ~/.codex;
+    // a getter so a custom CODEX_HOME is honored, matching where Codex actually
+    // scans). This is visible to a standalone `codex` too, but every botmux-*
+    // skill's description is tightly bound to "当前飞书话题", so implicit
+    // mis-fire risk is negligible.
+    get skillsDir(): string { return join(codexHome(), 'skills'); },
+    // 静态列表是 `codex debug models` visibility=list 的快照（2026-08）；
+    // live 探测成功时只使用 live 目录；live 不可用时以此快照兜底。
+    modelChoices: CLI_MODEL_CHOICES['codex'],
+    // 与保存/启动校验共用真实 binary + env 的能力目录、超时和缓存。
+    detectModelCapabilities,
+
+    async detectModels(): Promise<readonly string[] | null> {
+      return capabilitySlugs(await detectModelCapabilities());
+    },
   };
 }
-
-export const create = createCodexAdapter;

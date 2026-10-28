@@ -3,13 +3,21 @@
  *
  * Run: pnpm vitest run test/setup-verify-permissions.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 
 // 占位 mock — 单测里不真实调 Lark.Client. checkRequiredScopes / applyScopesUnverified
 // 单测都需要 mock 这个.
 vi.mock('@larksuiteoapi/node-sdk', () => {
   const scopeListMock = vi.fn();
   const scopeApplyMock = vi.fn();
+  // bun's vi.mock replaces the module but does not surface extra named
+  // exports like `__scopeListMock` (measured: scopeListMock is undefined and
+  // every `beforeEach` throws). Stash the spies on globalThis so the test
+  // body can reset them under both runners.
+  (globalThis as { __botmuxSetupVerifySdkMocks?: { scopeListMock: ReturnType<typeof vi.fn>; scopeApplyMock: ReturnType<typeof vi.fn> } }).__botmuxSetupVerifySdkMocks = {
+    scopeListMock,
+    scopeApplyMock,
+  };
   class FakeClient {
     application = { scope: { list: scopeListMock, apply: scopeApplyMock } };
     // checkRequiredScopes now reads scopes via client.request() (GET empty-body
@@ -22,25 +30,33 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     Client: FakeClient,
     Domain: { Feishu: 0, Lark: 1 },
     LoggerLevel: { error: 0, fatal: 0 },
-    // 暴露 mock 函数给 test 直接拿到
-    __scopeListMock: scopeListMock,
-    __scopeApplyMock: scopeApplyMock,
   };
 });
 
-import * as sdk from '@larksuiteoapi/node-sdk';
 import {
   validateCredentials,
+  readCriticalScopesFromApplicationInfo,
   checkRequiredScopes,
   applyScopesUnverified,
   buildScopeDeepLink,
   buildEventSubDeepLink,
   buildRemainingSteps,
+  registerBotmuxRedirectUrlCollector,
   BOTMUX_REQUIRED_SCOPES,
+  DOC_FEATURE_SCOPES,
+  DOC_WATCH_SCOPES,
+  VC_MEETING_BOT_EVENTS,
+  VC_MEETING_FEATURE_SCOPES,
+  APP_SLASH_COMMAND_FEATURE_SCOPES,
 } from '../src/setup/verify-permissions.js';
+import { DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 
-const scopeListMock = (sdk as any).__scopeListMock as ReturnType<typeof vi.fn>;
-const scopeApplyMock = (sdk as any).__scopeApplyMock as ReturnType<typeof vi.fn>;
+const { scopeListMock, scopeApplyMock } = (globalThis as {
+  __botmuxSetupVerifySdkMocks: {
+    scopeListMock: ReturnType<typeof vi.fn>;
+    scopeApplyMock: ReturnType<typeof vi.fn>;
+  };
+}).__botmuxSetupVerifySdkMocks;
 
 // fetch 在 verify-permissions.ts 里只在 validateCredentials 用. mock 掉.
 const fetchMock = vi.fn();
@@ -135,22 +151,48 @@ describe('validateCredentials', () => {
   it('uses larksuite.com host when brand=lark', async () => {
     fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ code: 0, tenant_access_token: 'x' }) });
     await validateCredentials('cli_x', 'sec', 'lark');
-    expect(fetchMock).toHaveBeenCalledWith(
-      expect.stringContaining('open.larksuite.com'),
-      expect.any(Object),
-    );
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain('open.larksuite.com');
+  });
+});
+
+describe('readCriticalScopesFromApplicationInfo', () => {
+  it('uses the effective application-info scopes and reports missing critical names', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({
+        json: async () => ({ code: 0, data: { app: { scopes: [{ scope: 'im:message' }] } } }),
+      });
+    const result = await readCriticalScopesFromApplicationInfo('cli_x', 'secret');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.granted).toEqual(['im:message']);
+      expect(result.missingCritical.map(scope => scope.name)).toContain('contact:user.base:readonly');
+      expect(result.missingCritical.map(scope => scope.name)).not.toContain('im:message');
+    }
+    expect(fetchMock.mock.calls[1][0]).toContain('/open-apis/application/v6/applications/cli_x');
+  });
+
+  it('fails closed when application self-inspection is unavailable', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ json: async () => ({ code: 0, tenant_access_token: 'tenant-token' }) })
+      .mockResolvedValueOnce({ json: async () => ({ code: 99991672, msg: 'forbidden' }) });
+    expect(await readCriticalScopesFromApplicationInfo('cli_x', 'secret')).toEqual({
+      ok: false,
+      error: 'need_self_manage',
+      message: 'missing application:application:self_manage',
+    });
   });
 });
 
 describe('checkRequiredScopes (helper, not in main path)', () => {
-  it('lists granted scopes and computes missing critical/optional via grant_status===2', async () => {
+  it('lists granted scopes and computes missing critical/optional (grant_status 1 OR 2 both granted)', async () => {
     scopeListMock.mockResolvedValue({
       code: 0,
       data: {
         scopes: [
           { scope_name: 'im:message', grant_status: 2 },
-          { scope_name: 'im:resource', grant_status: 1 }, // 已申请未生效, 算 missing
-          { scope_name: 'unrelated:scope', grant_status: 2 },
+          { scope_name: 'im:resource', grant_status: 1 }, // spike: 已开通 scope 返回 1, 算 granted
+          { scope_name: 'unrelated:scope', grant_status: 1 },
         ],
       },
     });
@@ -158,11 +200,42 @@ describe('checkRequiredScopes (helper, not in main path)', () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.granted).toContain('im:message');
-      expect(r.granted).not.toContain('im:resource');
-      // missingCritical 应该包含 im:resource (critical=true, granted_status!=2)
-      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(true);
-      // im:message 已 granted, 不应该在 missingCritical 里
+      expect(r.granted).toContain('im:resource');
+      // im:message / im:resource 已 granted, 不应该在 missingCritical 里
+      expect(r.missingCritical.some(s => s.name === 'im:resource')).toBe(false);
       expect(r.missingCritical.some(s => s.name === 'im:message')).toBe(false);
+      // 未出现在 scope.list 里的 critical 项（如 im:chat.members:read）仍算 missing
+      expect(r.missingCritical.some(s => s.name === 'im:chat.members:read')).toBe(true);
+    }
+  });
+
+  it('treats grant_status===1 as granted — Lark 国际版真机实证 status=1 的 scope API 直调可用', async () => {
+    // 自建应用已开通的 scope 在 scope.list 返回 grant_status=1（tenant token 直调
+    // im/v1/messages 与 im/v1/chats/{id}/members 均 code 0）。全量 critical scope
+    // 以 status=1 返回时, missingCritical 必须为空, 不能持续误报缺权限。
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: {
+        scopes: BOTMUX_REQUIRED_SCOPES
+          .filter(s => s.critical)
+          .map(s => ({ scope_name: s.name, grant_status: 1 })),
+      },
+    });
+    const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.missingCritical).toEqual([]);
+  });
+
+  it('treats im:chat.members:write_only as CRITICAL (拉群刚需) so its absence is surfaced', async () => {
+    scopeListMock.mockResolvedValue({
+      code: 0,
+      data: { scopes: [{ scope_name: 'im:message', grant_status: 2 }] }, // write_only NOT granted
+    });
+    const r = await checkRequiredScopes('cli_x', 'sec', 'feishu');
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.missingCritical.some(s => s.name === 'im:chat.members:write_only')).toBe(true);
+      expect(r.missingOptional.some(s => s.name === 'im:chat.members:write_only')).toBe(false);
     }
   });
 
@@ -230,6 +303,41 @@ describe('deep-link builders', () => {
     expect(steps.length).toBe(2);
     for (const s of steps) expect(s.url).toContain('open.larksuite.com');
   });
+
+  describe('重定向 URL 提示按实际配置生成', () => {
+    // collector 是模块级单例，用完必须还原成「与未注册时等价」的行为（本文件不 import
+    // open-platform-automation，所以未注册状态就等于只有 loopback 那一条），
+    // 否则会泄漏到同文件后续用例。
+    let restore: (() => void) | undefined;
+    afterEach(() => { restore?.(); restore = undefined; });
+
+    it('列出 collectBotmuxRedirectUrls 给的每一条，而不是写死 127.0.0.1', () => {
+      registerBotmuxRedirectUrlCollector(() => [
+        'http://127.0.0.1:9768/callback',
+        'https://m-abc.example.com/oauth/callback',
+      ]);
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      const redirectStep = buildRemainingSteps('cli_x')[1];
+      // 配了 oauthRedirectBase / 平台绑定 / 反代的机器，真正发起授权用的是
+      // <base>/oauth/callback；只提示 loopback 那条，用户照做完照样 20029。
+      expect(redirectStep.title).toContain('http://127.0.0.1:9768/callback');
+      expect(redirectStep.title).toContain('https://m-abc.example.com/oauth/callback');
+    });
+
+    it('collector 抛错 / 给空数组时回落到 loopback 单条，绝不炸', () => {
+      // buildRemainingSteps 会在「读不到 global-config」的上下文里被调到
+      //（onboarding 落终态），提示生成失败不能反过来把整条链路带崩。
+      registerBotmuxRedirectUrlCollector(() => { throw new Error('config unavailable'); });
+      restore = () => registerBotmuxRedirectUrlCollector(() => ['http://127.0.0.1:9768/callback']);
+
+      expect(() => buildRemainingSteps('cli_x')).not.toThrow();
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+
+      registerBotmuxRedirectUrlCollector(() => []);
+      expect(buildRemainingSteps('cli_x')[1].title).toContain('http://127.0.0.1:9768/callback');
+    });
+  });
 });
 
 describe('BOTMUX_REQUIRED_SCOPES', () => {
@@ -249,6 +357,25 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
     const entry = BOTMUX_REQUIRED_SCOPES.find(s => s.name === 'im:message.group_msg');
     expect(entry, 'im:message.group_msg should be in BOTMUX_REQUIRED_SCOPES').toBeDefined();
     expect(entry?.critical).toBe(true);
+  });
+
+  it('checks the optional chat-tab scopes at startup', () => {
+    const scopes = new Map(BOTMUX_REQUIRED_SCOPES.map(scope => [scope.name, scope]));
+    expect(scopes.get('im:chat.tabs:read')?.critical).toBe(false);
+    expect(scopes.get('im:chat.tabs:write_only')?.critical).toBe(false);
+  });
+
+  it('declares all Buzz channels as optional auto-top-up scopes', () => {
+    for (const name of [
+      'im:message.urgent',
+      'im:message.urgent:sms',
+      'im:message.urgent:phone',
+    ]) {
+      expect(BOTMUX_REQUIRED_SCOPES.find(scope => scope.name === name)).toMatchObject({
+        name,
+        critical: false,
+      });
+    }
   });
 
   it('every required scope exists in lark-scopes.json manifest (no bare names that Lark API would never return)', async () => {
@@ -275,5 +402,117 @@ describe('BOTMUX_REQUIRED_SCOPES', () => {
       missing,
       `BOTMUX_REQUIRED_SCOPES entries not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`,
     ).toEqual([]);
+  });
+
+  it('DOC_FEATURE_SCOPES are valid manifest scopes and match DOC_COMMENT_OAUTH_SCOPES (no drift)', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = DOC_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `DOC_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+
+    // The startup-check list and the OAuth-request list must stay name-aligned.
+    expect(DOC_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([...DOC_COMMENT_OAUTH_SCOPES].sort());
+    // Doc-feature scopes are opt-in → must never be critical (would nag every bot).
+    expect(DOC_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    expect(DOC_WATCH_SCOPES.map(s => s.name).sort()).toEqual([
+      'docs:document.comment:create',
+      'docs:document.comment:read',
+      'wiki:wiki:readonly',
+    ]);
+    expect(DOC_WATCH_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('VC meeting feature scopes are valid manifest scopes and opt-in only', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const missing = VC_MEETING_FEATURE_SCOPES.filter(s => !declared.has(s.name));
+    expect(missing, `VC_MEETING_FEATURE_SCOPES not in lark-scopes.json: ${missing.map(s => s.name).join(', ')}`).toEqual([]);
+    expect(VC_MEETING_FEATURE_SCOPES.map(s => s.name).sort()).toEqual([
+      'vc:meeting.bot.join:write',
+      'vc:meeting.meetingevent:read',
+      'vc:meeting.message:write',
+    ]);
+    expect(VC_MEETING_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+  });
+
+  it('native slash-command scopes are optional feature scopes: never required, never auto-imported', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+    const names = APP_SLASH_COMMAND_FEATURE_SCOPES.map(s => s.name).sort();
+
+    expect(names).toEqual([
+      'application:app_slash_command:read',
+      'application:app_slash_command:write',
+    ]);
+    expect(APP_SLASH_COMMAND_FEATURE_SCOPES.every(s => !s.critical)).toBe(true);
+    // Not in BOTMUX_REQUIRED_SCOPES: the startup self-check would otherwise
+    // silently top them up and publish a new app version for a gated,
+    // Dashboard-only feature.
+    expect(BOTMUX_REQUIRED_SCOPES.filter(s => names.includes(s.name))).toEqual([]);
+    // Not in the default manifest: tenants outside Lark's gated rollout may not
+    // even have these scopes in their catalog.
+    expect(names.filter(name => declared.has(name))).toEqual([]);
+  });
+
+  it('manifest excludes the scopes the tenant auto-rejects (nothing in botmux calls them)', async () => {
+    // 2026-09: 飞书把这几项加进了《不开放权限（自动驳回）汇总》，新建应用只要
+    // 申请到其中任意一项，「企业自建应用发布申请」就被规则引擎**整批自动拒绝**，
+    // 且驳回通知不点名是哪一项（只给一份政策文档链接）——线上实际踩到过。
+    //
+    // 它们从 375418fd9「权限对齐内部 wiki 完整 JSON」整份粘进来那天起就没有
+    // 调用方：全仓（含 dist / docs / 脚本）搜这几个名字，唯一命中就是 manifest
+    // 自己。删掉零功能损失。
+    //
+    // ⚠️ 这条测试防的是**再次整份粘贴** wiki 全量权限包把它们带回来：那样
+    // 每个新用户建 bot 都会被自动驳回，而且症状（无具体原因的驳回）极难归因。
+    // 特别提示 `im:app_feed_card:write`（应用消息流卡片）**不是**会话标签/消息
+    // 分组用的那个——后者是 `im:feed_group_v1:read/write`，走 user 身份的
+    // /open-apis/im/v1/groups，仍在清单里，别混淆后把它加回来。
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, '..', 'src', 'setup', 'lark-scopes.json'), 'utf-8'));
+    const declared = new Set<string>([...(manifest.scopes?.tenant ?? []), ...(manifest.scopes?.user ?? [])]);
+
+    const autoRejected = [
+      'drive:file:favorite',
+      'drive:file:favorite:readonly',
+      'im:app_feed_card:write',
+      'im:special_focus',
+      'im:url_preview.update',
+    ];
+    const reintroduced = autoRejected.filter(name => declared.has(name));
+    expect(
+      reintroduced,
+      `lark-scopes.json 含被飞书自动驳回的权限，会让新建应用发版申请被整批拒绝: ${reintroduced.join(', ')}`,
+    ).toEqual([]);
+
+    // 阴性对照：别让上面那条因为 manifest 读空/路径写错而恒真地"通过"。
+    expect(declared.has('im:message')).toBe(true);
+    expect(declared.has('im:feed_group_v1:write')).toBe(true);
+  });
+
+  it('VC meeting bot event checklist uses the confirmed Open Platform keys', () => {
+    expect([...VC_MEETING_BOT_EVENTS]).toEqual([
+      'vc.bot.meeting_invited_v1',
+      'vc.bot.meeting_activity_v1',
+      'vc.bot.meeting_ended_v1',
+      'vc.meeting.participant_meeting_joined_v1',
+    ]);
   });
 });

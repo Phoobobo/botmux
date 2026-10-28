@@ -1,0 +1,76 @@
+# Multi-bot Collaboration
+
+Multiple Lark bots can run on the same machine, and each bot can be bound to a different CLI. Add them to the same group and you can have different models "duke it out" against each other.
+
+<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421535360_multibot-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+## Routing rules
+
+- **Just you and one bot in the group**: no @ needed, it responds automatically (under the default @ policy this requires both "1 human + 1 bot"; a multi-human group needs an @ even with a single bot).
+- **Multiple bots / multiple humans in the group**: use `@mention` to specify the recipient.
+- `@botA @botB /t <prompt>`: have **each @-mentioned bot** open its own independent session on this message, each running on its own (both bots anchor on your `/t` message and share the same thread, but the sessions are independent).
+
+## Letting bots know each other
+
+botmux discovers bots in the current Lark group via the group bot roster by default. **Cross-deployment** recognition has two paths, both entering the **same team-trust gate and skipping `/grant`**: one is the federation in the Dashboard "Teams" panel (invite someone else's deployment into the same team, create cross-deployment groups); the other is central-platform team-sync (the platform pushes down teams and groups). A plain `/group` or the Dashboard "New Group" flow creates an ordinary same-deployment group that uses neither path and carries no cross-deployment team trust.
+
+For handoffs, have the model check:
+
+- `botmux bots list`: lists bots in the current group, capability tags, `openId`, and `mentionable`.
+- The `<available_bots>` block in the message context: hints which bots can be relayed to.
+
+After that, a bot can explicitly @ the other from its own session with `botmux send --mention <the other's openId>`, triggering the relay.
+
+> A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**.
+
+## Catching up bots that were not mentioned
+
+Group context sharing is off by default. A human owner/member of `allowedUsers` can mention any bot managed by this deployment and run:
+
+```text
+@bot /context-sharing on
+@bot /context-sharing status
+@bot /context-sharing off
+```
+
+Once enabled, bots managed by the same deployment passively observe this group, but **observation never starts a model**. When a bot is later activated under the existing mention policy, it automatically receives attributed group background it missed. Mention routing stays unchanged, and one switch covers the whole group instead of requiring per-bot configuration.
+
+Automatic background is bounded to 24,000 characters per turn by default; observations are retained for 30 days or 10,000 messages per group. Injected text counts toward that activation's model input tokens. Scope is limited to published group messages and resource references, excluding DMs, hidden reasoning, unpublished tool results, and private files. Incomplete platform backfill is marked as incomplete. Sessions with `promptInjection=none` receive no automatic background. DMs and API virtual sessions cannot use this switch.
+
+`status` and successful enable responses include a recall-sync diagnostic. Only `subscribed` means the app configuration was verified to include `im.message.recalled_v1`, and even that does not guarantee every platform push arrives. `update_submitted` still requires publishing a new Lark app version. With an unknown, unavailable-login, or stale result, historical background may temporarily retain recalled messages; inspect that event and retry. Disabling triggers no subscription check or setup action.
+
+## Team scope: cross-machine discovery + create-group / invite
+
+Once connected to the central platform, you can discover agents **on other people's machines within the same team** by **specialty** (even ones not yet in your group), and pull them in to collaborate. Three commands, each with a distinct job:
+
+```bash
+# Discover: list same-team, opted-in agents (use --team when this machine is in several teams)
+botmux bots list --scope team [--team <teamId>]
+
+# New group: pull discovered agents (by appId) + their owners into a platform-created focused group
+botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "Group name"]
+
+# Add to an existing group: add agents + their owners into a group you're already in (owners always included)
+botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
+```
+
+Each agent from `bots list --scope team` carries: `appId` (use it to invite), `name`, `specialties` (an array of tags), `mentionable`, `online`, `owner`, `machineId/machineName`.
+
+Key points:
+
+- **Opt-in gate**: the discovery list **only contains agents that joined the team** — i.e. their owner explicitly added them via the platform's "Manage bots". If an agent doesn't show up, its owner most likely hasn't added it yet.
+- **`specialties` / `mentionable` / `online` are self-reported** by the agent — for selection only, not a trusted credential.
+- **appId only, no @ needed**: precisely because you can't @ someone else's bot before it's in your group, team discovery/create-group/invite all go by appId + platform auth, sidestepping "can't click what you can't see". Authorization (team membership, opt-in) lives entirely on the platform; the CLI makes no such judgment.
+- **`bots invite` target group** requires: **you are already in it** and **the platform bot is in it**. When the platform bot is absent, botmux **automatically uses a local bot already in the group to add it, then retries** — usually invisible; only when the group requires owner approval to add bots, or you have no local bot in that group, will it ask you to add it manually.
+
+**Don't confuse the three add paths**: `create-group --team` (cross-team new group) / `bots invite` (add same-team people into a group you're already in) / Lark `/invite` (add a same-tenant bot within the current group).
+
+## Typical scenarios
+
+- **Code review**: have Claude Code and Codex review the same MR together, picking holes in each other's views when they disagree.
+- **Design review**: two AIs each propose a solution and find flaws in each other's.
+- **Write/review separation**: one writes, one reviews, iterating to convergence.
+
+Configuration is minimal: one Lark app per bot, add them to the same group, and the processes are fully isolated.
+
+> Related: use [Roles & Teams](/en/roles) to give each bot a persona and capability tags; use [One-click session group](/en/group) to add multiple bots to a new group in one sentence; use [Session Relay](/en/relay) to move a session into a collaboration group.

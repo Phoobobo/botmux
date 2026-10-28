@@ -1,0 +1,1943 @@
+/**
+ * 入群主动开工的会话与飞书展示路由回归测试。
+ *
+ * Run: pnpm vitest run test/group-join-shared-routing.test.ts
+ */
+import { cardVisibleText } from './helpers/card-visible-text.js';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  forkWorker: vi.fn(),
+  registerHostAsk: vi.fn(),
+  getAvailableBots: vi.fn(async () => []),
+  getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
+    chatId,
+    name: '【Pippit】【BUG】测试群',
+    description: '缺陷：https://example.test/issue/detail/123',
+    mode: 'group' as const,
+    fetchStatus: 'ok' as const,
+  })),
+  getProjectScanDirs: vi.fn(() => [] as string[]),
+  ensureDefaultOncallBound: vi.fn(async () => undefined),
+  downloadResources: vi.fn(async () => ({ attachments: [] as any[], needLogin: false })),
+  deleteMessage: vi.fn(async () => true),
+  listChatMemberOpenIds: vi.fn(async () => ['ou_owner']),
+  replyMessage: vi.fn(async () => 'om_reply'),
+  scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
+  sendMessage: vi.fn(async () => 'om_join_seed'),
+}));
+
+vi.mock('../src/core/ask-broker.js', async () => ({
+  ...await vi.importActual<any>('../src/core/ask-broker.js'),
+  registerHostAsk: mocks.registerHostAsk,
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  class FakeWSClient { start() {} }
+  class FakeEventDispatcher { register() {} }
+  return {
+    Client: FakeClient,
+    WSClient: FakeWSClient,
+    EventDispatcher: FakeEventDispatcher,
+    LoggerLevel: { info: 2 },
+  };
+});
+
+vi.mock('../src/im/lark/client.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/client.js');
+  return {
+    ...actual,
+    deleteMessage: mocks.deleteMessage,
+    getChatContext: mocks.getChatContext,
+    listChatMemberOpenIds: mocks.listChatMemberOpenIds,
+    replyMessage: mocks.replyMessage,
+    sendMessage: mocks.sendMessage,
+  };
+});
+
+vi.mock('../src/core/session-manager.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-manager.js');
+  return {
+    ...actual,
+    downloadResources: mocks.downloadResources,
+    ensureSessionWhiteboard: vi.fn(),
+    getAvailableBots: mocks.getAvailableBots,
+    getProjectScanDirs: mocks.getProjectScanDirs,
+  };
+});
+
+vi.mock('../src/services/project-scanner.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/project-scanner.js');
+  return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
+});
+
+vi.mock('../src/services/oncall-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/oncall-store.js');
+  return { ...actual, ensureDefaultOncallBound: mocks.ensureDefaultOncallBound };
+});
+
+vi.mock('../src/core/worker-pool.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/worker-pool.js');
+  return { ...actual, forkWorker: mocks.forkWorker };
+});
+
+let tempRoot = '';
+let modules: Awaited<ReturnType<typeof loadModules>>;
+
+function tempDir(name: string): string {
+  const dir = join(tempRoot, name);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+async function loadModules() {
+  const registry = await import('../src/bot-registry.js');
+  const sessionStore = await import('../src/services/session-store.js');
+  const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
+  const daemon = await import('../src/daemon.js');
+  const types = await import('../src/core/types.js');
+  sessionStore.init('test-app');
+  const policy = await import('../src/core/trusted-session-controller.js');
+  const interruptions = await import('../src/core/cross-principal-interruption-store.js');
+  const identities = await import('../src/im/lark/identity-cache.js');
+  const replyTarget = await import('../src/core/reply-target.js');
+  return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore, identities, replyTarget };
+}
+
+beforeAll(async () => {
+  tempRoot = mkdtempSync(join(tmpdir(), 'botmux-group-join-shared-'));
+  process.env.SESSION_DATA_DIR = tempDir('sessions');
+  modules = await loadModules();
+}, 30_000);
+
+beforeEach(() => {
+  delete process.env.BOTMUX_HOOKS_JSON;
+  modules.registry.__testOnly_resetBotRegistry();
+  modules.daemon.__testOnly_activeSessions.clear();
+  modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
+  vi.clearAllMocks();
+  mocks.forkWorker.mockReset();
+  mocks.getChatContext.mockImplementation(async (_appId: string, chatId: string) => ({
+    chatId,
+    name: '【Pippit】【BUG】测试群',
+    description: '缺陷：https://example.test/issue/detail/123',
+    mode: 'group',
+    fetchStatus: 'ok',
+  }));
+  mocks.getProjectScanDirs.mockReturnValue([]);
+  mocks.ensureDefaultOncallBound.mockResolvedValue(undefined);
+  mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+  mocks.deleteMessage.mockResolvedValue(true);
+  mocks.listChatMemberOpenIds.mockResolvedValue(['ou_owner']);
+  mocks.replyMessage.mockResolvedValue('om_reply');
+  mocks.scanMultipleProjects.mockReturnValue([]);
+  mocks.sendMessage.mockResolvedValue('om_join_seed');
+});
+
+afterEach(() => {
+  delete process.env.BOTMUX_HOOKS_JSON;
+  for (const ds of modules.daemon.__testOnly_activeSessions.values()) clearTimeout(ds.crossPrincipalWaitTimer);
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
+});
+
+afterAll(() => {
+  delete process.env.SESSION_DATA_DIR;
+  modules?.identities.flushIdentityCacheSync();
+  rmSync(tempRoot, { recursive: true, force: true });
+});
+
+describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('excluded group joins send no greeting and start no worker', async () => {
+    const { daemon, registry } = modules;
+    registry.registerBot({ larkAppId: 'app_excluded', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true, autoStartExcludedChats: ['oc_quiet'] });
+    await daemon.__testOnly_handleBotAdded('oc_quiet', 'ou_owner', 'app_excluded');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_explicit_worker';
+    const chatId = 'oc_join_explicit_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: false,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker']);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('项目群开启自动纳入后，新 Bot 即使未开启入群自动开工也会加入 Worker 白名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_project_worker';
+    const chatId = 'oc_join_project_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: true,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker', appId]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('创建一个话题根并复用 chat-scope session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared';
+    const chatId = 'oc_join_shared';
+    const seedId = 'om_join_seed';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '处理群内未完成请求',
+      defaultWorkingDir: tempDir('repo-shared'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      appId,
+      chatId,
+      '🚀 已加入本群，开始工作…',
+      'text',
+    );
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds).toBeDefined();
+    expect(ds?.scope).toBe('chat');
+    expect(ds?.session.rootMessageId).toBe(chatId);
+    expect(ds?.session.currentReplyTarget).toMatchObject({
+      rootMessageId: seedId,
+      turnId: seedId,
+    });
+    expect(ds?.pendingTurnId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.anything(),
+      expect.objectContaining({ turnId: seedId }),
+      expect.any(Object),
+    );
+    expect(mocks.getChatContext).toHaveBeenCalledOnce();
+    expect(mocks.getChatContext).toHaveBeenCalledWith(appId, chatId);
+    const firstTurn = mocks.forkWorker.mock.calls[0]?.[1];
+    expect(firstTurn.content).toContain('<chat_context source="lark" trust="untrusted" fetch_status="ok">');
+    expect(firstTurn.content).toContain('<name>【Pippit】【BUG】测试群</name>');
+    expect(firstTurn.content).toContain('issue/detail/123');
+    expect(firstTurn.content).not.toContain('<chat_mode>');
+    // Legacy toggle (no gateRequired): the opening turn is byte-identical to
+    // pre-feature behaviour — no lifecycle block, no sender tag, no caller, and
+    // no identity-cache contact lookup.
+    expect(firstTurn.content).not.toContain('<botmux_group_join');
+    expect(firstTurn.content).not.toContain('<sender ');
+    expect(firstTurn.content).not.toContain('<turn_id>om_join_seed</turn_id>');
+    expect(mocks.forkWorker.mock.calls[0]?.[2]).toMatchObject({ turnId: seedId });
+    // The option key is present-but-undefined exactly as on pre-feature master
+    // (forkReservedInitialSession lists it unconditionally); no caller means no
+    // managed-turn authority is established.
+    expect(mocks.forkWorker.mock.calls[0]?.[2].trustedCaller).toBeUndefined();
+    expect(ds?.activeInteractiveTurn).toBeUndefined();
+    expect(modules.identities.getIdentity(appId, 'ou_owner')).toBeUndefined();
+    expect(ds?.pendingChatContext).toBeUndefined();
+
+    await daemon.__testOnly_sessionReply(chatId, '最终回复', 'text', appId, seedId);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      appId,
+      seedId,
+      '最终回复',
+      'text',
+      true,
+      undefined,
+      expect.anything(),
+    );
+  });
+
+  it('首轮登记拉 bot 入群的操作人为 sender（schedule 身份），且保持 mention 安全方向', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_sender';
+    const chatId = 'oc_join_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-sender'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
+  it('操作人缺失时首轮登记保持无 sender（fail-closed）', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_no_operator';
+    const chatId = 'oc_join_no_operator';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir('repo-join-no-operator'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toBeDefined();
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+  });
+
+  it('chat 模式（非 shared）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_sender';
+    const chatId = 'oc_join_chat_sender';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-chat-sender'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entries = Object.entries(ds?.session.replyTargets ?? {});
+    const joinEntry = entries.find(([turnId]) => turnId.startsWith('join_'));
+    expect(joinEntry?.[1]).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+    // chat 顶层无根：join_ 首轮不带 rootMessageId。
+    expect(joinEntry?.[1]?.rootMessageId).toBeUndefined();
+  });
+
+  it('话题群（thread scope）首轮同样登记操作人 sender', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_sender';
+    const chatId = 'oc_join_topic_sender';
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-join-topic-sender'),
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.replyTargets?.om_join_seed).toMatchObject({
+      senderOpenId: 'ou_owner',
+      participants: [{ openId: 'ou_owner', isBot: false }],
+      participantsIncomplete: true,
+    });
+  });
+
+  it.each(['peer', 'bot', 'app'] as const)('keeps %s operator bot evidence through opening and identity-cache resolution', async (evidence) => {
+    const { daemon, registry, identities, types } = modules;
+    const appId = `app_join_bot_${evidence}`;
+    const chatId = `oc_join_bot_${evidence}`;
+    const operator = 'ou_peer_operator';
+    mocks.forkWorker.mockReturnValueOnce(true);
+    mocks.listChatMemberOpenIds.mockResolvedValue([operator]);
+    if (evidence === 'peer') {
+      writeFileSync(join(process.env.SESSION_DATA_DIR!, `bot-openids-${appId}.json`), JSON.stringify({ peer: operator }));
+      expect(identities.getIdentity(appId, operator)).toBeUndefined();
+    } else {
+      identities.recordIdentity(appId, { openId: operator, type: evidence, source: 'sender', name: 'Peer' });
+    }
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [operator], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir(`repo-bot-${evidence}`), regularGroupReplyMode: 'shared',
+    });
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [, input, options] = mocks.forkWorker.mock.calls[0]!;
+    expect(options.trustedCaller).toMatchObject({
+      requestLarkAppId: appId, requestUserOpenId: operator, senderType: 'bot',
+    });
+    expect(input.content).toContain(`<sender type="bot" open_id="${operator}"`);
+    expect(identities.getIdentity(appId, operator)?.type).toBe('bot');
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.activeInteractiveTurn?.caller.senderType).toBe('bot');
+    // A known app/bot operator is the turn caller, not a human owner or sender.
+    expect(ds?.activeInteractiveTurn?.controller).toBeUndefined();
+    expect(ds?.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.lastCallerOpenId).toBeUndefined();
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+    expect(modules.replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
+  });
+
+  it.each(['peer', 'bot', 'app'] as const)('does not record a %s operator as the human sender when the join gate is off', async (evidence) => {
+    const { daemon, registry, identities, types, replyTarget } = modules;
+    const appId = `app_join_legacy_bot_${evidence}`;
+    const chatId = `oc_join_legacy_bot_${evidence}`;
+    const operator = 'ou_legacy_bot_operator';
+    mocks.listChatMemberOpenIds.mockResolvedValue([operator]);
+    if (evidence === 'peer') {
+      writeFileSync(join(process.env.SESSION_DATA_DIR!, `bot-openids-${appId}.json`), JSON.stringify({ peer: operator }));
+    } else {
+      identities.recordIdentity(appId, { openId: operator, type: evidence, source: 'sender', name: 'Peer' });
+    }
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: [operator], autoStartOnGroupJoin: true,
+      defaultWorkingDir: tempDir(`repo-legacy-bot-${evidence}`), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, operator, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    const entry = ds?.session.replyTargets?.om_join_seed;
+    expect(entry).toBeDefined();
+    expect(entry?.senderOpenId).toBeUndefined();
+    expect(entry?.participants).toBeUndefined();
+    expect(replyTarget.registryEntryProvesHumanSender(entry)).toBe(false);
+    expect(ds?.ownerOpenId).toBeUndefined();
+    expect(ds?.session.ownerOpenId).toBeUndefined();
+    expect(ds?.session.lastCallerOpenId).toBeUndefined();
+    expect(ds?.activeInteractiveTurn).toBeUndefined();
+    // Legacy toggle still does not inject a sender tag or call the contact cache writer.
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]?.[1].content).not.toContain('<sender ');
+  });
+
+  it('starts without sender or caller authority when the join event has no operator', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_no_operator';
+    const chatId = 'oc_join_no_operator';
+    mocks.forkWorker.mockReturnValueOnce(true);
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir('repo-no-operator'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [, input, options] = mocks.forkWorker.mock.calls[0]!;
+    expect(input.content).toContain('<botmux_group_join ');
+    expect(input.content).not.toContain('<sender');
+    expect(input.content).not.toContain('<operator_open_id>');
+    expect(options.trustedCaller).toBeUndefined();
+    expect(ds?.pendingTrustedCaller).toBeUndefined();
+    expect(ds?.activeInteractiveTurn?.caller).toBeUndefined();
+  });
+
+  it('does not turn a cached display-user into verified human authority', async () => {
+    const { daemon, registry, identities } = modules;
+    const appId = 'app_join_cached_user';
+    identities.recordIdentity(appId, { openId: 'ou_owner', type: 'user', source: 'mention', name: 'Owner' });
+    const before = identities.getIdentity(appId, 'ou_owner');
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added', mode: 'sync', command: '/bin/true', onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
+    registry.registerBot({
+      larkAppId: appId, larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir('repo-cached-user'), regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded('oc_join_cached_user', 'ou_owner', appId);
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const [, input, options] = mocks.forkWorker.mock.calls[0]!;
+    expect(options.trustedCaller).not.toHaveProperty('senderType');
+    expect(input.content).toContain('<sender type="user" open_id="ou_owner" name="Owner"');
+    expect(identities.getIdentity(appId, 'ou_owner')).toEqual(before);
+  });
+
+  it('required lifecycle gate stays silent when no matching sync hook exists', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_gate_required';
+    const chatId = 'oc_join_gate_required';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir('repo-gate-required'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(modules.daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))).toBeUndefined();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('matching lifecycle gate allows the event and binds its operator as the live caller', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_gate_allowed';
+    const chatId = 'oc_join_gate_allowed';
+    process.env.BOTMUX_HOOKS_JSON = JSON.stringify([{
+      event: 'chat.bot_added',
+      mode: 'sync',
+      command: '/bin/true',
+      onError: 'deny',
+      filter: { larkAppId: appId },
+    }]);
+    mocks.forkWorker.mockReturnValueOnce(true);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir('repo-gate-allowed'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.activeInteractiveTurn).toMatchObject({
+      turnId: 'om_join_seed',
+      caller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: appId,
+      },
+    });
+    expect(mocks.forkWorker.mock.calls[0]?.[1].content).toContain(
+      '<botmux_group_join source="lark" trusted="true" event="chat.bot_added" gate_matched="true">',
+    );
+    expect(ds?.activeInteractiveTurn?.caller).not.toHaveProperty('senderType');
+    expect(mocks.sendMessage).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+  });
+
+  it('explicit forcePrompt bypasses the lifecycle gate and does not claim a join event', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_forced_issue_claim';
+    const chatId = 'oc_forced_issue_claim';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+      autoStartOnGroupJoinGateRequired: true,
+      defaultWorkingDir: tempDir('repo-forced-issue-claim'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, undefined, appId, { forcePrompt: '处理人工领取的问题' });
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    expect(mocks.forkWorker.mock.calls[0]?.[1].content).not.toContain('<botmux_group_join');
+  });
+
+  it('配置 autoStartOnGroupJoinSeed 时 shared 锚点发送自定义文案', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_join_shared_seed';
+    const chatId = 'oc_join_shared_seed';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinSeed: '👋 已到岗，开始排查群内线索',
+      defaultWorkingDir: tempDir('repo-shared-seed'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // daemon 侧取值咬合：自定义 seed 优先于内置 i18n 文案（防止取值逻辑被改坏而测试不报警）。
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      appId,
+      chatId,
+      '👋 已到岗，开始排查群内线索',
+      'text',
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalledWith(appId, chatId, '🚀 已加入本群，开始工作…', 'text');
+  });
+
+  it('尊重群级 shared 覆盖而不是只读取 bot 默认值', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_override';
+    const chatId = 'oc_join_override';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-override'),
+      regularGroupReplyMode: 'chat',
+      chatReplyModes: { [chatId]: 'shared' },
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(ds?.scope).toBe('chat');
+    expect(ds?.session.currentReplyTarget?.rootMessageId).toBe('om_join_seed');
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.anything(),
+      expect.objectContaining({ turnId: 'om_join_seed' }),
+      expect.any(Object),
+    );
+  });
+
+  it('群元数据读取失败时仍开工，并明确标记 unavailable', async () => {
+    const { daemon, registry } = modules;
+    const appId = 'app_join_context_unavailable';
+    const chatId = 'oc_join_context_unavailable';
+    mocks.getChatContext.mockResolvedValueOnce({
+      chatId,
+      name: null,
+      description: null,
+      mode: 'unknown',
+      fetchStatus: 'unavailable',
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-context-unavailable'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(mocks.forkWorker).toHaveBeenCalledOnce();
+    const firstTurn = mocks.forkWorker.mock.calls[0]?.[1];
+    expect(firstTurn.content).toContain('fetch_status="unavailable"');
+    expect(firstTurn.content).toContain('读取失败，不代表群内没有任务');
+  });
+
+  it('chat 模式保持群顶层平铺且不创建话题根', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat';
+    const chatId = 'oc_join_chat';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-chat'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(ds?.scope).toBe('chat');
+    expect(ds?.session.currentReplyTarget).toBeUndefined();
+    // 平铺 chat 没有用户消息可锚定，首轮携带 daemon-owned 合成 turn id（join_ 前缀），
+    // 而不是 false——否则 worker 发布的 managed_turn_origin 无 turnId，首轮
+    // `botmux send` 会被 origin_unproven 拒绝。
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.anything(),
+      expect.objectContaining({ turnId: expect.stringMatching(/^join_/) }),
+      expect.any(Object),
+    );
+  });
+
+  it('等待仓库选择时把卡片和延迟首轮留在同一个话题', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_pending_repo';
+    const chatId = 'oc_join_pending_repo';
+    const scanDir = tempDir('scan-pending-repo');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingTurnId).toBe('om_join_seed');
+    expect(ds?.pendingChatContext).toMatchObject({
+      chatId,
+      name: '【Pippit】【BUG】测试群',
+      description: '缺陷：https://example.test/issue/detail/123',
+      fetchStatus: 'ok',
+    });
+    expect(ds?.repoCardMessageId).toBe('om_reply');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      appId,
+      'om_join_seed',
+      expect.any(String),
+      'interactive',
+      true,
+      undefined,
+      expect.anything(),
+    );
+  });
+
+  // 卡片发不出去（飞书 230025 等）时不能停在 pendingRepo：入群自动开工没有任何
+  // 用户输入可再触发，会话会永久挂在一张不存在的卡片上。降级 = 走同一个「无可选
+  // 项目」分支，用默认目录直接开工，且共享 seed 仍归本轮所有。
+  it('repo 卡发送失败时改用默认目录直接开工，而不是挂在不存在的卡片上', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_pending_repo_card_fail';
+    const chatId = 'oc_join_pending_repo_card_fail';
+    const scanDir = tempDir('scan-pending-repo-card-fail');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // 卡片没发出去就没有可删的消息，别拿 undefined 去调删除接口。
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  // 默认工作目录不存在（被删、写错、配置自别的机器）：既不能在那里开工，也不能当成
+  // 「无可选项目 → 直接开工」——那条路同样落到这个目录，被 forkWorker 拒绝后首轮就挂在
+  // 会话上。改为发缺目录形态的选仓卡（没有「直接开启会话」），首轮挂在卡后，选好目录即开工。
+  it('默认工作目录不存在时发缺目录选仓卡等选目录，而不是在不存在的目录里开工', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_missing_default';
+    const chatId = 'oc_join_missing_default';
+    // Keep `_`: markdown escaping must differ from the visible path we assert.
+    const missing = join(tempRoot, 'gone_dir', 'botmux');
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: missing,
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.repoCardMessageId).toBe('om_reply');
+    const cardCall = mocks.replyMessage.mock.calls.find(call => (call as unknown[])[3] === 'interactive') as unknown[] | undefined;
+    // The card belongs under the shared join seed, like the ordinary picker.
+    expect(cardCall?.[1]).toBe('om_join_seed');
+    expect(cardVisibleText(String(cardCall?.[2]))).toContain(missing);
+    expect(String(cardCall?.[2])).toContain('repo_manual_submit');
+    expect(String(cardCall?.[2])).not.toContain('skip_repo');
+  });
+
+  it('losing registration leaves no shared seed message or orphaned first turn', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_race';
+    const chatId = 'oc_join_shared_race';
+    const key = types.sessionKey(chatId, appId);
+    const winner = {
+      session: {
+        sessionId: 'sess-race-winner',
+        chatId,
+        rootMessageId: chatId,
+        title: 'winner',
+        status: 'active',
+        createdAt: new Date().toISOString(),
+        larkAppId: appId,
+        scope: 'chat',
+      },
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: appId,
+      chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.now(),
+      cliVersion: 'test',
+      lastMessageAt: Date.now(),
+      hasHistory: true,
+    } as any;
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-race'),
+      regularGroupReplyMode: 'shared',
+    });
+    mocks.ensureDefaultOncallBound.mockImplementationOnce(async () => {
+      daemon.__testOnly_activeSessions.set(key, winner);
+      return undefined;
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(winner);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('rolls back the registered session when the post-CAS shared seed fails', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_seed_failure';
+    const chatId = 'oc_join_shared_seed_failure';
+    const key = types.sessionKey(chatId, appId);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-seed-failure'),
+      regularGroupReplyMode: 'shared',
+    });
+    mocks.sendMessage.mockRejectedValueOnce(new Error('Lark unavailable'));
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes a chat turn behind the registered join session initialization', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_race';
+    const chatId = 'oc_join_shared_inbound_race';
+    const userMessageId = 'om_user_during_join';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-race'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '加入期间的用户消息' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseSeed('om_join_seed');
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+    expect(ds?.session.currentReplyTarget).toMatchObject({
+      rootMessageId: userMessageId,
+      turnId: userMessageId,
+    });
+  });
+
+  it('also covers the non-shared post-registration fork window', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_inbound_race';
+    const chatId = 'oc_join_chat_inbound_race';
+    const userMessageId = 'om_user_during_chat_join';
+    const key = types.sessionKey(chatId, appId);
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-chat-inbound-race'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '普通 chat 模式并发消息' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseAvailableBots();
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+  });
+
+  it('yields without re-forking when a non-message entry starts the registered session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_external_fork_race';
+    const chatId = 'oc_join_external_fork_race';
+    const key = types.sessionKey(chatId, appId);
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-external-fork-race'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    const ds = daemon.__testOnly_activeSessions.get(key)!;
+    const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
+    ds.worker = externalWorker;
+
+    releaseAvailableBots();
+    await joinPromise;
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.worker).toBe(externalWorker);
+  });
+
+  it('releases a waiting chat turn when shared seed setup rolls back', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_seed_failure';
+    const chatId = 'oc_join_shared_inbound_seed_failure';
+    const userMessageId = 'om_user_after_join_seed_failure';
+    const key = types.sessionKey(chatId, appId);
+    let rejectSeed!: (error: Error) => void;
+    const seedPending = new Promise<string>((_resolve, reject) => {
+      rejectSeed = reject;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-seed-failure'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const rejectedJoinSessionId = daemon.__testOnly_activeSessions.get(key)?.session.sessionId;
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'seed 失败后仍需处理' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    rejectSeed(new Error('Lark unavailable during join'));
+    await Promise.all([joinPromise, replyPromise]);
+
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.session.sessionId).not.toBe(rejectedJoinSessionId);
+    expect(ds?.session.status).toBe('active');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
+      expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
+    );
+    expect(ds?.session.currentReplyTarget).toMatchObject({
+      rootMessageId: userMessageId,
+      turnId: userMessageId,
+    });
+  });
+
+  it('cancels a hung bootstrap so the waiting turn can create the authoritative session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_inbound_timeout';
+    const chatId = 'oc_join_shared_inbound_timeout';
+    const userMessageId = 'om_user_after_join_timeout';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-inbound-timeout'),
+      regularGroupReplyMode: 'shared',
+    });
+    daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs(20);
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const timedOutJoinDs = daemon.__testOnly_activeSessions.get(key)!;
+    const timedOutJoinSessionId = timedOutJoinDs.session.sessionId;
+
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'bootstrap 超时后接管' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(timedOutJoinDs.session.status).toBe('closed');
+    expect(ds?.session.sessionId).not.toBe(timedOutJoinSessionId);
+    expect(ds?.session.status).toBe('active');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds,
+      expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
+      expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
+    );
+
+    releaseSeed('om_late_join_seed');
+    await joinPromise;
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(appId, 'om_late_join_seed');
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+  });
+
+  it('does not close a live worker that took over before bootstrap timeout', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_shared_timeout_takeover';
+    const chatId = 'oc_join_shared_timeout_takeover';
+    const userMessageId = 'om_user_after_external_takeover';
+    const key = types.sessionKey(chatId, appId);
+    let releaseSeed!: (messageId: string) => void;
+    const seedPending = new Promise<string>((resolve) => {
+      releaseSeed = resolve;
+    });
+    let seedStarted!: () => void;
+    const seedStartedPromise = new Promise<void>((resolve) => {
+      seedStarted = resolve;
+    });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      seedStarted();
+      return await seedPending;
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-shared-timeout-takeover'),
+      regularGroupReplyMode: 'shared',
+    });
+    daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs(20);
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await seedStartedPromise;
+    const ds = daemon.__testOnly_activeSessions.get(key)!;
+    const externalWorker = { killed: false, send: vi.fn(), pid: 4321 } as any;
+    ds.worker = externalWorker;
+
+    await daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: '接管后仍要保留 worker' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'chat',
+        anchor: chatId,
+        replyRootId: userMessageId,
+        larkAppId: appId,
+      },
+    );
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.session.status).toBe('active');
+    expect(ds.worker).toBe(externalWorker);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(externalWorker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+
+    releaseSeed('om_late_join_seed_after_takeover');
+    await joinPromise;
+
+    expect(daemon.__testOnly_activeSessions.get(key)).toBe(ds);
+    expect(ds.session.status).toBe('active');
+    expect(ds.worker).toBe(externalWorker);
+    expect(mocks.deleteMessage).toHaveBeenCalledWith(appId, 'om_late_join_seed_after_takeover');
+  });
+
+  it('serializes replies to a topic-group join seed by the exact session key', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_inbound_race';
+    const chatId = 'oc_join_topic_inbound_race';
+    const seedId = 'om_join_seed';
+    const userMessageId = 'om_user_during_topic_join';
+    const key = types.sessionKey(seedId, appId);
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    let releaseAvailableBots!: () => void;
+    const availableBotsPending = new Promise<void>((resolve) => {
+      releaseAvailableBots = resolve;
+    });
+    let availableBotsStarted!: () => void;
+    const availableBotsStartedPromise = new Promise<void>((resolve) => {
+      availableBotsStarted = resolve;
+    });
+    mocks.getAvailableBots.mockImplementationOnce(async () => {
+      availableBotsStarted();
+      await availableBotsPending;
+      return [];
+    });
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-topic-inbound-race'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    const joinPromise = daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    await availableBotsStartedPromise;
+    expect(daemon.__testOnly_activeSessions.get(key)?.worker).toBeNull();
+
+    const replyPromise = daemon.__testOnly_handleThreadReply(
+      {
+        sender: { sender_id: { open_id: 'ou_owner' }, sender_type: 'user' },
+        message: {
+          message_id: userMessageId,
+          root_id: seedId,
+          thread_id: 'omt_join_topic',
+          chat_id: chatId,
+          chat_type: 'group',
+          message_type: 'text',
+          content: JSON.stringify({ text: 'seed 话题内的并发回复' }),
+          create_time: String(Date.now()),
+        },
+      },
+      {
+        chatId,
+        messageId: userMessageId,
+        chatType: 'group',
+        scope: 'thread',
+        anchor: seedId,
+        replyRootId: seedId,
+        larkAppId: appId,
+      },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+
+    releaseAvailableBots();
+    await Promise.all([joinPromise, replyPromise]);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const ds = daemon.__testOnly_activeSessions.get(key);
+    expect(ds?.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: userMessageId,
+    }));
+  });
+
+  it('话题群继续使用 seed 锚定的 thread-scope session', async () => {
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_group';
+    const chatId = 'oc_join_topic_group';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-topic-group'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.rootMessageId).toBe('om_join_seed');
+    expect(ds?.session.currentReplyTarget).toBeUndefined();
+    // 话题群自动开工：seed 消息 id 即首轮权威 turnId（修复前为 false，首轮回复
+    // 发不回飞书）。
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds, expect.anything(), expect.objectContaining({ turnId: 'om_join_seed' }), expect.any(Object),
+    );
+  });
+
+  it('话题群配置自定义 seed 时锚点消息用自定义文案', async () => {
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    const { daemon, registry } = modules;
+    const appId = 'app_join_topic_seed';
+    const chatId = 'oc_join_topic_seed';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinSeed: '🔍 已接入，正在读取群内缺陷线索',
+      defaultWorkingDir: tempDir('repo-topic-seed'),
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // thread 锚点发送点同样咬合：话题群路径的自定义 seed 优先于内置文案。
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      appId,
+      chatId,
+      '🔍 已接入，正在读取群内缺陷线索',
+      'text',
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalledWith(appId, chatId, '🚀 已加入本群，开始工作…', 'text');
+  });
+
+  it('普通群 new-topic 模式开话题并锚定独立 thread-scope session', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_new_topic';
+    const chatId = 'oc_join_new_topic';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-new-topic'),
+      regularGroupReplyMode: 'new-topic',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 普通群（mode='group'）但 reply mode 是 new-topic：应像话题群一样开一个
+    // 独立话题（seed + thread-scope），而不是平铺进群顶层 chat-scope。
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(ds?.scope).toBe('thread');
+    expect(ds?.session.rootMessageId).toBe('om_join_seed');
+    // new-topic 是独立会话（非 shared 复用），不 arm shared reply target。
+    expect(ds?.session.currentReplyTarget).toBeUndefined();
+    // 同话题群：seed 消息 id 即首轮权威 turnId。
+    expect(mocks.forkWorker).toHaveBeenCalledWith(
+      ds, expect.anything(), expect.objectContaining({ turnId: 'om_join_seed' }), expect.any(Object),
+    );
+  });
+});
+
+describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () => {
+  // 回归：bot.added 没有用户 message_id，非 shared 自动开工曾以
+  // pendingTurnId=undefined fork，worker 发布的 managed_turn_origin 不含
+  // turnId，CLI 首轮 `botmux send` 的 managed-origin attestation 被 daemon 以
+  // origin_unproven 拒绝（首轮回复发不回飞书）。
+  const forkedTurnId = (): string | undefined => {
+    const arg = mocks.forkWorker.mock.calls[0]?.[2];
+    if (arg && typeof arg === 'object') return (arg as { turnId?: string }).turnId;
+    return undefined;
+  };
+
+  it('话题群自动开工：seed 即首轮 turnId 且持久化匹配的 turn provenance', async () => {
+    mocks.getChatContext.mockImplementationOnce(async (_appId: string, targetChatId: string) => ({
+      chatId: targetChatId,
+      name: '话题群',
+      description: null,
+      mode: 'topic',
+      fetchStatus: 'ok',
+    }));
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_topic_turn_id';
+    const chatId = 'oc_join_topic_turn_id';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-topic-turn-id'),
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const forkTurnId = forkedTurnId();
+    expect(forkTurnId).toBe('om_join_seed');
+    // 持久化了匹配的 turn provenance：per-turn 回复目标 + 冻结的 dispatch 上下文。
+    expect(ds?.session.replyTargets?.[forkTurnId!]).toBeDefined();
+    expect(ds?.session.turnReplyContexts?.[forkTurnId!]).toMatchObject({
+      target: { mode: 'thread', rootMessageId: 'om_join_seed' },
+    });
+    // 模拟 worker 发布 managed_turn_origin（worker-pool 收到 IPC 后的写入）：
+    // 修复前 fork 不带 turnId → managedTurnOrigin.turnId 缺失 → attest 403。
+    ds!.managedTurnOrigin = { capability: 'cap-test', turnId: forkTurnId };
+    expect(ds?.managedTurnOrigin?.turnId).toBe(forkTurnId);
+  });
+
+  it('普通群 new-topic 自动开工：seed 即首轮 turnId 且 provenance 落 thread', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_new_topic_turn_id';
+    const chatId = 'oc_join_new_topic_turn_id';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-new-topic-turn-id'),
+      regularGroupReplyMode: 'new-topic',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const forkTurnId = forkedTurnId();
+    expect(forkTurnId).toBe('om_join_seed');
+    expect(ds?.session.replyTargets?.[forkTurnId!]).toBeDefined();
+    expect(ds?.session.turnReplyContexts?.[forkTurnId!]).toMatchObject({
+      target: { mode: 'thread', rootMessageId: 'om_join_seed' },
+    });
+    ds!.managedTurnOrigin = { capability: 'cap-test', turnId: forkTurnId };
+    expect(ds?.managedTurnOrigin?.turnId).toBe(forkTurnId);
+  });
+
+  it('平铺 chat 自动开工：合成 join_ turnId 且 provenance 落 plain chat', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_chat_turn_id';
+    const chatId = 'oc_join_chat_turn_id';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-chat-turn-id'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    const forkTurnId = forkedTurnId();
+    // 平铺 chat 没有用户消息可锚定：铸造 daemon-owned 合成 turn id（join_ 前缀 +
+    // UUID），不冒充 om_ 用户消息 id。
+    expect(forkTurnId).toMatch(/^join_[a-f0-9-]{36}$/);
+    expect(forkTurnId!.startsWith('om_')).toBe(false);
+    expect(ds?.session.replyTargets?.[forkTurnId!]).toBeDefined();
+    expect(ds?.session.turnReplyContexts?.[forkTurnId!]).toMatchObject({
+      target: { mode: 'plain', chatId },
+    });
+    // 合成 turn 不写 currentReplyTarget（无 reply root）。
+    expect(ds?.session.currentReplyTarget).toBeUndefined();
+    ds!.managedTurnOrigin = { capability: 'cap-test', turnId: forkTurnId };
+    expect(ds?.managedTurnOrigin?.turnId).toBe(forkTurnId);
+  });
+
+  it('无默认目录走 repo 选择卡：thread scope 延迟首轮仍携带 seed turnId', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_picker_thread_turn_id';
+    const chatId = 'oc_join_picker_thread_turn_id';
+    const scanDir = tempDir('scan-picker-thread-turn-id');
+    mocks.getProjectScanDirs.mockReturnValueOnce([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValueOnce([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'new-topic',
+      // 关闭对等继承：本文件前序用例在持久化 session store 里留下了同锚点
+      // (om_join_seed) 且带 workingDir 的会话，否则会被 findInheritablePeer
+      // 继承成 pinned dir，绕过 repo 选择卡路径。
+      botToBotSameDir: false,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 延迟启动：不立即 fork，首轮 turn 身份同时落在 pendingTurnId 与持久化的
+    // pendingRepoSetup.turnId 上——commitRepoSelection 的 deferred fork 二选一
+    // 都必须拿到 seed id（修复前 staged 的是 anchor=seed 但 pendingTurnId 为
+    // undefined，且 chat scope 下 anchor 是 oc_ chatId，会被当成 turnId 发出去）。
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey('om_join_seed', appId));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.pendingTurnId).toBe('om_join_seed');
+    expect(ds?.session.pendingRepoSetup?.turnId).toBe('om_join_seed');
+    expect(ds?.session.replyTargets?.['om_join_seed']).toBeDefined();
+    expect(ds?.session.turnReplyContexts?.['om_join_seed']).toMatchObject({
+      target: { mode: 'thread', rootMessageId: 'om_join_seed' },
+    });
+  });
+
+  it('无默认目录走 repo 选择卡：chat scope 延迟首轮携带 join_ turnId 而非 oc_ chatId', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_picker_chat_turn_id';
+    const chatId = 'oc_join_picker_chat_turn_id';
+    const scanDir = tempDir('scan-picker-chat-turn-id');
+    mocks.getProjectScanDirs.mockReturnValueOnce([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValueOnce([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'chat',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ds?.pendingRepo).toBe(true);
+    // 修复前 staged turnId 是 anchor=oc_ chatId（把 chatId 当 turnId 发出）；
+    // 修复后两处都是 daemon-owned 合成 id。
+    expect(ds?.pendingTurnId).toMatch(/^join_[a-f0-9-]{36}$/);
+    expect(ds?.session.pendingRepoSetup?.turnId).toBe(ds?.pendingTurnId);
+    const joinTurnId = ds!.pendingTurnId!;
+    expect(ds?.session.replyTargets?.[joinTurnId]).toBeDefined();
+    expect(ds?.session.turnReplyContexts?.[joinTurnId]).toMatchObject({
+      target: { mode: 'plain', chatId },
+    });
+  });
+
+  it('provenance 持久化失败时回滚会话注册，下次 bot.added 不被去重', async () => {
+    // 回归：首轮 turn provenance 的 sessionStore.updateSession 若抛错（文件系统/
+    // 数据库瞬态失败），会话已发布到 activeSessions 且 groupJoinAnchorByChat 已
+    // 登记。修复前 finally 只 settle barrier/释放 in-flight 锁，留下 active 但
+    // worker-null 的会话，后续 bot.added 被无限去重，自动开工无法重试。
+    const { daemon, registry, types } = modules;
+    const sessionStore = await import('../src/services/session-store.js');
+    const appId = 'app_join_provenance_persist_failure';
+    const chatId = 'oc_join_provenance_persist_failure';
+    const key = types.sessionKey(chatId, appId);
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      defaultWorkingDir: tempDir('repo-provenance-persist-failure'),
+      regularGroupReplyMode: 'chat',
+    });
+
+    // 只在「带 turn provenance 的那次落盘」上注入一次瞬态失败（ENOSPC 替身）：
+    // 注册前的初始字段落盘不带 replyTargets，照常透传。
+    const realUpdateSession = sessionStore.updateSession;
+    let failedOnce = false;
+    let failedSessionId: string | undefined;
+    const updateSpy = vi.spyOn(sessionStore, 'updateSession').mockImplementation((s) => {
+      if (!failedOnce && s.replyTargets && Object.keys(s.replyTargets).length > 0) {
+        failedOnce = true;
+        failedSessionId = s.sessionId;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      return realUpdateSession(s);
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    // 回滚：会话从 activeSessions 移除、store 记录被 close、没有 fork——
+    // 不留下 worker-null 的 active 会话。
+    expect(failedOnce).toBe(true);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeUndefined();
+    expect(sessionStore.getSession(failedSessionId!)?.status).toBe('closed');
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    updateSpy.mockRestore();
+
+    // 重试：下一次 bot.added 不被去重，正常注册并 fork。
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+    expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Use the real join, talk gate, delivery envelope and durable interruption driver.
+async function collaborativeSession() {
+  const { daemon, registry, types } = modules;
+  const appId = 'app_collaborative';
+  const chatId = 'oc_collaborative';
+  const workingDir = tempDir('collaborative-repo');
+  mocks.forkWorker.mockImplementation((ds: any) => { ds.worker = { killed: false, send: vi.fn() }; });
+  registry.registerBot({ larkAppId: appId, larkAppSecret: 's', cliId: 'codex',
+    allowedUsers: ['ou_owner', 'ou_other'], autoStartOnGroupJoin: true,
+    autoStartOnGroupJoinPrompt: 'Investigate the shared incident',
+    defaultWorkingDir: workingDir, regularGroupReplyMode: 'shared',
+    groupSerialInput: { [chatId]: true } });
+  await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+  const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))!;
+  const owner = { requestUserOpenId: 'ou_owner', requestLarkAppId: appId, senderType: 'user' as const };
+  ds.activeInteractiveTurn = { turnId: 'om_owner_active', caller: owner };
+  return { ds, owner, other: { ...owner, requestUserOpenId: 'ou_other' } };
+}
+
+describe('configured serial group input', () => {
+  it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
+    vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
+    const { ds, other } = await collaborativeSession();
+    for (const [id, text] of [['om_supplement', 'Additional evidence'], ['om_continue', 'Continue investigating']]) {
+      await modules.daemon.__testOnly_handleThreadReply({
+        sender: { sender_id: { open_id: other.requestUserOpenId }, sender_type: 'user' },
+        message: { message_id: id, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+          content: JSON.stringify({ text }), create_time: String(Date.now()) },
+      }, { chatId: ds.chatId, messageId: id, chatType: 'group', scope: 'chat',
+        anchor: ds.chatId, replyRootId: id, larkAppId: ds.larkAppId });
+    }
+    const inputs = vi.mocked(ds.worker!.send).mock.calls.map(c => c[0]).filter((m: any) => m.type === 'message');
+    expect(inputs).toMatchObject([
+      { turnId: 'om_supplement', queueAfterActiveTurn: true, trustedCaller: other },
+      { turnId: 'om_continue', queueAfterActiveTurn: true, trustedCaller: other },
+    ]);
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(mocks.registerHostAsk).not.toHaveBeenCalled();
+  });
+
+  it('uses only explicit group configuration while retaining authenticated managed-session boundaries', async () => {
+    const { ds, other } = await collaborativeSession();
+    const allows = modules.policy.isSerialGroupInput;
+    expect(allows(ds, other)).toBe(true);
+    expect(allows(ds)).toBe(false);
+    expect(allows(ds, { ...other, requestLarkAppId: 'foreign' })).toBe(false);
+    expect(allows(ds, { ...other, source: 'schedule_creator', taskId: 'schedule' })).toBe(false);
+    expect(allows({ ...ds, chatType: 'p2p' }, other)).toBe(false);
+    expect(allows({ ...ds, chatId: 'oc_unconfigured' }, other)).toBe(false);
+    expect(allows({ ...ds, adoptedFrom: 'existing-pane' } as typeof ds, other)).toBe(false);
+    // The same configured group works for manually created topics without join provenance.
+    ds.session.turnReplyContexts = {};
+    expect(allows(ds, other)).toBe(true);
+    const cfg = modules.registry.getBot(ds.larkAppId).config;
+    cfg.oncallChats = [{ chatId: ds.chatId, workingDir: '/tmp' }];
+    cfg.groupSerialInput = undefined;
+    expect(allows(ds, other)).toBe(false);
+    cfg.groupSerialInput = { [ds.chatId]: false };
+    expect(allows(ds, other)).toBe(false);
+    cfg.groupSerialInput[ds.chatId] = true;
+    expect(allows(ds, other)).toBe(true);
+  });
+});
+
+describe('confirmation delivery failure', () => {
+  // #1456 made the durable XPI driver run only while the XPI switch is on
+  // (OFF sweeps staged records); these helper-retry cases exercise that driver.
+  beforeEach(() => { vi.stubEnv('BOTMUX_XPI_ENABLED', 'true'); });
+  for (const stage of ['classification', 'owner', 'wait'] as const) {
+    it(`retains ${stage} input durably, backs off, and retries with a new ask identity`, async () => {
+      const { ds, owner, other } = await collaborativeSession();
+      const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+        session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+        message: { turnId: 'om_pending', text: 'original evidence', userPrompt: 'original evidence', createdAt: new Date().toISOString() },
+      });
+      if (stage !== 'classification') record.phase = 'awaiting_owner';
+      if (stage === 'owner') ds.activeInteractiveTurn = undefined;
+      if (stage === 'wait') record.ownerWaitDeadlineAt = Date.now() - 1;
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const failure = { kind: 'invalidated', reason: 'card dispatch failed', selected: null, by: null, comment: null, timedOut: false };
+      mocks.registerHostAsk.mockReset().mockResolvedValue(failure);
+      const drive = modules.daemon.__testOnly_driveCrossPrincipalInterruptions;
+      await drive(ds);
+      const firstRequest = mocks.registerHostAsk.mock.calls[0][0].requestId;
+      expect(record.confirmationRetryCount).toBe(1);
+      expect(record.messages[0].text).toBe('original evidence');
+      expect(modules.sessionStore.getSession(ds.session.sessionId)?.crossPrincipalInterruptions?.[0])
+        .toMatchObject({ id: record.id, confirmationRetryCount: 1, confirmationRetryAt: record.confirmationRetryAt });
+      await drive(ds);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(2);
+      expect(mocks.registerHostAsk.mock.calls[1][0].requestId).toBe(`${firstRequest}:retry:1`);
+      expect(ds.session.crossPrincipalInterruptions).toHaveLength(1);
+      expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryCount).toBe(2);
+      const replies = JSON.stringify([...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]);
+      expect(replies).toContain('消息仍保留');
+      expect(replies).not.toContain('未选择处理方式');
+      expect(replies.match(/消息仍保留/g)).toHaveLength(1);
+      // A real delivered-card timeout is still a user decision window expiry.
+      mocks.registerHostAsk.mockResolvedValue({ kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    });
+  }
+});
+
+it('recovers a thrown dispatcher failure and accepts the displayed suggestion label', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
+  const { ds, owner, other } = await collaborativeSession();
+  const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_retry_text', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  mocks.registerHostAsk.mockReset().mockRejectedValueOnce(new Error('dispatcher unavailable'));
+  await modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, 'test-app');
+  expect(persisted?.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, confirmationRetryCount: 1 });
+  // Simulate restoring the queue from disk, then let its retry deadline fire.
+  ds.session.crossPrincipalInterruptions = persisted!.crossPrincipalInterruptions;
+  mocks.registerHostAsk.mockResolvedValue({ kind: 'answered', answers: [], by: other.requestUserOpenId,
+    comment: '对当前任务的建议', timedOut: false });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, phase: 'awaiting_owner' });
+  expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryAt).toBeUndefined();
+});
+
+it('does not resurrect a removed input when its outstanding card fails', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
+  const { ds, owner, other } = await collaborativeSession();
+  modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_removed', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  let fail!: (result: any) => void;
+  mocks.registerHostAsk.mockReset().mockImplementation(() => new Promise(resolve => { fail = resolve; }));
+  const pending = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  // Let the driver reach the (mocked) outstanding ask before the record is
+  // removed externally; the ask call itself stays pending.
+  await vi.waitFor(() => expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1));
+  expect(typeof fail).toBe('function');
+  ds.session.crossPrincipalInterruptions = undefined;
+  fail({ kind: 'invalidated', reason: 'closed', selected: null, by: null, comment: null, timedOut: false });
+  await pending;
+  expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+  expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+});

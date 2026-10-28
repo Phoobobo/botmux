@@ -16,6 +16,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 
 // Stub sessionStore writes so transferSession's persist call is a no-op.
 vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSession: vi.fn(),
   getSession: vi.fn(),
   listSessions: vi.fn(() => []),
@@ -28,6 +31,8 @@ vi.mock('../src/bot-registry.js', () => ({
     { config: { larkAppId: 'cli_peer' } } as any,
   ]),
   getBot: vi.fn(),
+  getBotOpenId: vi.fn(),
+  getOwnerOpenId: vi.fn(),
 }));
 
 // The endpoint identifies legitimate requesters via the cross-process
@@ -52,6 +57,8 @@ vi.mock('../src/im/lark/client.js', () => ({
   replyMessage: vi.fn(),
   sendMessage: vi.fn(),
   resolveUnionIdFromOpenId: vi.fn(async () => null),
+  listCurrentChatBotMembers: vi.fn(async () => []),
+  resolveCurrentChatBotOpenIdsByLarkAppIds: vi.fn(async () => ({ ok: true, mappings: [] })),
 }));
 
 vi.mock('../src/core/dashboard-events.js', () => ({
@@ -189,7 +196,7 @@ describe('POST /api/sessions/migrate-to-chat', () => {
   // doesn't intercept the internal closure). Exercising forkWorker means
   // actually spawning a child process and attaching tmux — explicitly out
   // of scope for unit tests. transferSession's behaviour is covered in
-  // `transfer-session.test.ts` (via its forkWorkerImpl / killWorkerImpl DI
+  // `transfer-session.test.ts` (via its forkWorkerImpl / detachWorkerImpl DI
   // overrides), and the integration of the two layers is covered at E2E.
 
   it('404 when sourceAnchor matches a session owned by a different daemon', async () => {

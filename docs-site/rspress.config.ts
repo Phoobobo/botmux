@@ -1,0 +1,252 @@
+import { defineConfig } from '@rspress/core';
+import { pluginLlms } from '@rspress/plugin-llms';
+
+const docsBase = process.env.BOTMUX_DOCS_BASE || '/';
+// Rspress resolves public assets against `base` when emitting HTML. Keeping
+// the favicon root-relative avoids a duplicated docs/public/botmux lookup;
+// the navbar logo itself needs the public base included in its emitted URL.
+const faviconPath = '/botmux-logo.png';
+const productLogoPath = `${docsBase.replace(/\/+$/, '')}/botmux-logo.png`;
+const socialLogoUrl = 'https://deepcoldy.github.io/botmux/botmux-logo.png';
+
+const zhSidebar = [
+  {
+    text: '开始',
+    collapsed: false,
+    items: [
+      { text: '介绍', link: '/' },
+      { text: '5 分钟快速接入', link: '/quickstart' },
+      { text: '前置要求', link: '/prerequisites' },
+    ],
+  },
+  {
+    text: '核心概念',
+    collapsed: false,
+    items: [
+      { text: '架构总览', link: '/architecture' },
+      { text: '会话与话题模型', link: '/session-model' },
+    ],
+  },
+  {
+    text: '功能详解',
+    collapsed: false,
+    items: [
+      { text: '实时流式卡片', link: '/cards' },
+      { text: '原话题不可用策略', link: '/topic-unavailable-policy' },
+      { text: 'Web 终端', link: '/web-terminal' },
+      { text: '多机器人协作', link: '/multi-bot' },
+      { text: '多话题协作模式', link: '/multi-topic' },
+      { text: '@ 策略', link: '/mention-mode' },
+      { text: '本地白板', link: '/whiteboard' },
+      { text: '决策看板与管家', link: '/decision-board' },
+      { text: '角色与团队', link: '/roles' },
+      { text: 'tmux 会话常驻', link: '/tmux' },
+      { text: 'ZMX 会话后端', link: '/zmx' },
+      { text: '会话接入 Adopt', link: '/adopt' },
+      { text: '会话接力 Relay', link: '/relay' },
+      { text: '一键建会话群', link: '/group' },
+      { text: '飞书文档评论入口', link: '/doc-comment' },
+      { text: '定时任务', link: '/schedule' },
+      { text: 'Oncall 模式', link: '/oncall' },
+      { text: '权限与授权', link: '/permissions' },
+      { text: '文件沙盒', link: '/sandbox' },
+      { text: '语音总结', link: '/voice' },
+      { text: 'Dashboard 管控面', link: '/dashboard' },
+      { text: '接入点（Webhook）', link: '/webhook' },
+      { text: 'API 编程式触发任务', link: '/api-task-trigger' },
+      { text: '通用单轮结果', link: '/turn-results' },
+      { text: 'Core-only API 控制', link: '/api-core-only' },
+      { text: 'Workflow（实验性）', link: '/workflow' },
+      { text: '生命周期 Hooks', link: '/hooks' },
+      { text: 'Skill + CLI 交互', link: '/skill-cli' },
+    ],
+  },
+  {
+    text: '开发与扩展',
+    collapsed: false,
+    items: [
+      { text: 'Plugin 开发与市场注册', link: '/plugins' },
+    ],
+  },
+  {
+    text: '命令参考',
+    collapsed: false,
+    items: [
+      { text: '斜杠命令', link: '/slash-commands' },
+      { text: 'CLI 命令', link: '/cli-commands' },
+    ],
+  },
+  {
+    text: '配置',
+    collapsed: false,
+    items: [
+      { text: 'bots.json 配置', link: '/bots-json' },
+      { text: '环境变量与文件位置', link: '/env' },
+      { text: '本地 Companion API', link: '/companion-api' },
+      { text: '多 CLI 适配器', link: '/adapters' },
+    ],
+  },
+  {
+    text: '实践与排错',
+    collapsed: false,
+    items: [
+      { text: '最佳实践', link: '/best-practices' },
+      { text: '常见踩坑', link: '/pitfalls' },
+      { text: 'FAQ / 排错', link: '/faq' },
+      { text: '关于 & 资源', link: '/about' },
+    ],
+  },
+];
+
+const enSidebar = [
+  {
+    text: 'Getting Started',
+    collapsed: false,
+    items: [
+      { text: 'Introduction', link: '/en/' },
+      { text: '5-Minute Quickstart', link: '/en/quickstart' },
+      { text: 'Prerequisites', link: '/en/prerequisites' },
+    ],
+  },
+  {
+    text: 'Core Concepts',
+    collapsed: false,
+    items: [
+      { text: 'Architecture', link: '/en/architecture' },
+      { text: 'Session & Topic Model', link: '/en/session-model' },
+    ],
+  },
+  {
+    text: 'Features',
+    collapsed: false,
+    items: [
+      { text: 'Streaming Cards', link: '/en/cards' },
+      { text: 'Unavailable Topic Policy', link: '/en/topic-unavailable-policy' },
+      { text: 'Web Terminal', link: '/en/web-terminal' },
+      { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },
+      { text: 'Multi-Topic Orchestration', link: '/en/multi-topic' },
+      { text: 'Mention Policy', link: '/en/mention-mode' },
+      { text: 'Local Whiteboard', link: '/en/whiteboard' },
+      { text: 'Decision Board & Steward', link: '/en/decision-board' },
+      { text: 'Roles & Teams', link: '/en/roles' },
+      { text: 'tmux Session Persistence', link: '/en/tmux' },
+      { text: 'ZMX Session Backend', link: '/en/zmx' },
+      { text: 'Adopt a Session', link: '/en/adopt' },
+      { text: 'Relay a Session', link: '/en/relay' },
+      { text: 'One-Click Session Groups', link: '/en/group' },
+      { text: 'Feishu Doc Comment Entry', link: '/en/doc-comment' },
+      { text: 'Scheduled Tasks', link: '/en/schedule' },
+      { text: 'On-Call Mode', link: '/en/oncall' },
+      { text: 'Permissions & Access', link: '/en/permissions' },
+      { text: 'File Sandbox', link: '/en/sandbox' },
+      { text: 'Voice Summary', link: '/en/voice' },
+      { text: 'Dashboard', link: '/en/dashboard' },
+      { text: 'Webhook Ingress', link: '/en/webhook' },
+      { text: 'Programmatic Task Trigger API', link: '/en/api-task-trigger' },
+      { text: 'Turn Results', link: '/en/turn-results' },
+      { text: 'Core-only API Control', link: '/en/api-core-only' },
+      { text: 'Workflow (Experimental)', link: '/en/workflow' },
+      { text: 'Lifecycle Hooks', link: '/en/hooks' },
+      { text: 'Skill + CLI Interaction', link: '/en/skill-cli' },
+    ],
+  },
+  {
+    text: 'Development & Extensions',
+    collapsed: false,
+    items: [
+      { text: 'Plugin Development & Market', link: '/en/plugins' },
+    ],
+  },
+  {
+    text: 'Command Reference',
+    collapsed: false,
+    items: [
+      { text: 'Slash Commands', link: '/en/slash-commands' },
+      { text: 'CLI Commands', link: '/en/cli-commands' },
+    ],
+  },
+  {
+    text: 'Configuration',
+    collapsed: false,
+    items: [
+      { text: 'bots.json', link: '/en/bots-json' },
+      { text: 'Environment & File Locations', link: '/en/env' },
+      { text: 'Local Companion API', link: '/en/companion-api' },
+      { text: 'CLI Adapters', link: '/en/adapters' },
+    ],
+  },
+  {
+    text: 'Practices & Troubleshooting',
+    collapsed: false,
+    items: [
+      { text: 'Best Practices', link: '/en/best-practices' },
+      { text: 'Common Pitfalls', link: '/en/pitfalls' },
+      { text: 'FAQ / Troubleshooting', link: '/en/faq' },
+      { text: 'About & Resources', link: '/en/about' },
+    ],
+  },
+];
+
+export default defineConfig({
+  root: 'docs',
+  base: docsBase,
+  lang: 'zh',
+  title: 'botmux 文档',
+  description: '飞书话题群 ↔ AI 编程 CLI 桥接',
+  icon: faviconPath,
+  logo: productLogoPath,
+  logoText: 'botmux 文档',
+  // llms.txt 支持：产出 /llms.txt（索引）+ /llms-full.txt（全文），并为每篇文档
+  // 生成 .md 纯文本版，方便 AI / LLM 抓取本站内容（AI 友好）。
+  plugins: [pluginLlms()],
+  // 多语言：zh 为默认语（无前缀），en 走 /en/ 前缀
+  locales: [
+    { lang: 'zh', label: '简体中文', title: 'botmux 文档', description: '飞书话题群 ↔ AI 编程 CLI 桥接' },
+    { lang: 'en', label: 'English', title: 'botmux Docs', description: 'Bridge Lark topic groups to AI coding CLIs' },
+  ],
+  // og:title / og:description 由 rspress 按页自动生成，这里只补它不处理的
+  head: [
+    ['meta', { property: 'og:type', content: 'website' }],
+    ['meta', { property: 'og:url', content: 'https://deepcoldy.github.io/botmux/' }],
+    ['meta', { property: 'og:image', content: socialLogoUrl }],
+    ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
+    ['meta', { name: 'twitter:image', content: socialLogoUrl }],
+    ['meta', { name: 'theme-color', content: '#646CEA' }],
+  ],
+  search: { codeBlocks: true },
+  markdown: { link: { checkDeadLinks: true } },
+  builderConfig: {
+    // 默认（妙搭发布）：static 走 jsDelivr CDN。GitHub Pages 发布时用 BOTMUX_DOCS_ASSET_PREFIX
+    // 覆盖成同源子路径（Pages 原生服务 static，无需 CDN）。
+    output: { assetPrefix: process.env.BOTMUX_DOCS_ASSET_PREFIX || "https://cdn.jsdelivr.net/gh/deepcoldy/botmux@docs-assets-v29/" },
+  },
+  themeConfig: {
+    editLink: {
+      docRepoBaseUrl: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs',
+    },
+    socialLinks: [
+      { icon: 'github', mode: 'link', content: 'https://github.com/deepcoldy/botmux' },
+    ],
+    lastUpdated: true,
+    locales: [
+      {
+        lang: 'zh',
+        label: '简体中文',
+        outlineTitle: '本页目录',
+        lastUpdatedText: '最后更新于',
+        prevPageText: '上一页',
+        nextPageText: '下一页',
+        sidebar: { '/': zhSidebar },
+      },
+      {
+        lang: 'en',
+        label: 'English',
+        outlineTitle: 'On This Page',
+        lastUpdatedText: 'Last Updated',
+        prevPageText: 'Previous',
+        nextPageText: 'Next',
+        sidebar: { '/en/': enSidebar },
+      },
+    ],
+  },
+});

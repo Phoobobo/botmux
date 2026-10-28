@@ -4,6 +4,8 @@ import {
   extractResources,
   createImgNumberer,
   unwrapUserDslContent,
+  cardContentHasUpgradeFallback,
+  isPureCardUpgradeFallback,
   type MessageResource,
 } from './message-parser.js';
 import { renderForwardedXml, type ForwardedNode } from './forwarded-renderer.js';
@@ -35,25 +37,57 @@ export async function buildForwardedTree(
   rootMessageId: string,
   numberer: ReturnType<typeof createImgNumberer>,
   maxDepth: number,
+  initialDetail?: { items?: any[] },
 ): Promise<{ nodes: ForwardedNode[]; extraResources: MessageResource[] }> {
   // Pass userCardContent:true so interactive sub-cards return their real v2
   // body (schema/body/elements) instead of the simplified "请升级至最新版本"
-  // fallback. Lark previously 500'd on this combo (see fd0f688 — Apr 2026);
-  // they've since fixed it for the cases we care about, but other shapes may
-  // still regress, so fall back to userCardContent:false on any error rather
-  // than dropping the whole forward tree. Per-sub refetch isn't an option
-  // here: forwarded cards from another tenant return 232010 ("Operator and
-  // chat can NOT be in different tenants") on the single-message endpoint
-  // even when the parent merge_forward is readable.
-  let detail: any;
-  try {
+  // fallback. This combo 500s (Lark code 2200) on many merge_forward parents —
+  // still does as of Jun 2026 — so fall back to userCardContent:false on any
+  // error rather than dropping the whole forward tree. The false path returns
+  // rich cards as the placeholder shell; the per-sub recovery pass below then
+  // restores their real bodies for same-tenant subs (cross-tenant subs 232010
+  // and stay as the placeholder).
+  let detail: any = Array.isArray(initialDetail?.items)
+    && initialDetail.items.some(item => item?.message_id === rootMessageId) ? initialDetail : undefined;
+  if (!detail) try {
     detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: true });
   } catch (err) {
     logger.debug(`[merge_forward] userCardContent:true failed for ${rootMessageId}, falling back to false: ${describeAxiosErr(err)}`);
     detail = await getMessageDetail(larkAppId, rootMessageId, { userCardContent: false });
   }
-  const allItems: any[] = detail?.items ?? [];
+  // Card recovery/DSL unwrapping modifies items during this render. Do not
+  // mutate the caller's prefetched response or another consumer's render.
+  const allItems: any[] = (detail?.items ?? []).map((item: any) => ({ ...item,
+    ...(item.body ? { body: { ...item.body } } : {}) }));
   const extraResources: MessageResource[] = [];
+
+  // Recover degraded interactive sub-cards. The parent fetch with
+  // userCardContent:true above 500s on many merge_forward parents (Lark
+  // server-side, code 2200) — we fall back to userCardContent:false, which
+  // returns RICH reply cards (long agent answers) as a bare "请升级至最新版本
+  // 客户端" placeholder + a single img. A PER-SUB refetch with
+  // userCardContent:true on the sub-message's OWN message_id recovers the full
+  // v2 body for SAME-tenant forwards (the common case — verified live: the bulk
+  // false call returns a 173-byte fallback shell, the per-sub true call returns
+  // the 6KB real body, code=0). Cross-tenant subs throw 232010 on the
+  // single-message endpoint — caught per-sub so we keep the simplified shape
+  // instead of dropping the card. Only subs that actually carry the fallback are
+  // refetched, so a successful true-first parent fetch costs zero extra calls.
+  await Promise.all(
+    allItems
+      .filter(m => m?.msg_type === 'interactive' && cardContentHasUpgradeFallback(m.body?.content ?? ''))
+      .map(async m => {
+        try {
+          const real = await getMessageDetail(larkAppId, m.message_id, { userCardContent: true });
+          const content = real?.items?.[0]?.body?.content;
+          if (content && !isPureCardUpgradeFallback(content)) {
+            m.body = { ...(m.body ?? {}), content };
+          }
+        } catch (err) {
+          logger.debug(`[merge_forward] per-sub card refetch failed for ${m.message_id}: ${describeAxiosErr(err)}`);
+        }
+      }),
+  );
 
   // Index children by upper_message_id for O(1) lookup during the walk.
   const childrenByParent = new Map<string, any[]>();
@@ -74,6 +108,11 @@ export async function buildForwardedTree(
         : msg.sender?.sender_type === 'user' ? 'user'
         : 'unknown';
       const senderOpenId = msg.sender?.id ?? '';
+      // Server-side name from with_sender_name=true on the parent fetch — the
+      // only name source for forwarded senders (they may not be in this chat).
+      const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+        ? msg.sender.sender_name.trim()
+        : undefined;
 
       // userCardContent:true above usually delivers the real card. Fallback
       // path (false) leaves the simplified shape; we still try user_dsl
@@ -94,10 +133,10 @@ export async function buildForwardedTree(
 
       if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
         const inner = walk(msg.message_id, depth + 1);
-        nodes.push({ senderOpenId, senderType, children: inner });
+        nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), children: inner });
       } else {
         const sub = parseApiMessage(msg, numberer);
-        nodes.push({ senderOpenId, senderType, content: sub.content });
+        nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), content: sub.content });
       }
     }
     return nodes;
@@ -114,10 +153,11 @@ export async function buildForwardedTree(
 export async function expandMergeForward(
   larkAppId: string, messageId: string, parsed: LarkMessage,
   numberer = createImgNumberer(),
+  initialDetail?: { items?: any[] },
 ): Promise<{ extraResources: MessageResource[] }> {
   const MAX_DEPTH = 5;
   try {
-    const { nodes, extraResources } = await buildForwardedTree(larkAppId, messageId, numberer, MAX_DEPTH);
+    const { nodes, extraResources } = await buildForwardedTree(larkAppId, messageId, numberer, MAX_DEPTH, initialDetail);
     if (nodes.length === 0) return { extraResources };
     parsed.content = renderForwardedXml(nodes);
     parsed.msgType = 'merge_forward_expanded';

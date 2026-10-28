@@ -3,7 +3,7 @@
 > 目标：让**独立的多套 botmux 部署**（同一飞书租户、各自单 owner）组成一个共享协作团队——
 > 互相发现对方的 bot + 能力，并最终把跨部署的 bot 拉进同一个飞书群协作。
 >
-> 三方共识（申晗 / Claude / Codex）。本文是 [[platform-design]] 的跨部署扩展。
+> 三方共识（示例用户 / Claude / Codex）。本文是 [[platform-design]] 的跨部署扩展。
 
 ## 前提（已确认）
 
@@ -27,11 +27,11 @@
 - 团队相关的数据走 hub 的联邦 API；各方在**自己的 dashboard**「团队」板块里读写。
 
 ```
-  申晗 dashboard ──(本机IPC)── 申晗的 daemon/bot
+  Owner dashboard ──(本机IPC)── owner daemon/bot
        │
        │  /api/federation/*  (注册/同步/拉聚合花名册)
        ▼
-  ┌─────────── Hub（申晗这套）持有 team + 联邦 bot ───────────┐
+  ┌─────────── Hub（示例用户这套）持有 team + 联邦 bot ───────────┐
        ▲
        │  /api/federation/*  (spoke 主动 → hub)
        │
@@ -142,7 +142,7 @@ Hub 的团队花名册 = 本地 bot（[[team-roster]]，按 bots.json 顺序）+
 
 # v2 设计：对称花名册 + 操作者身份拉群（待评审 → 实现）
 
-申晗实测暴露三问，本节是修复方案（先 Codex review 设计，再实现）：
+实测暴露三问，本节是修复方案（先 Codex review 设计，再实现）：
 - #1 spoke 看不到 hub 的机器人、不能操作它们拉群（当前 hub-centric、不对称）
 - #2 「我的 bot + 对方 bot 一起拉群」：对方 **bot 进群了、人没进**（→ app_id 加 bot 是 OK 的；问题是 owner 没被邀请）
 - #3 「只拉对方 bot」：对方和我（操作者）都没进群（→ 联邦丢了 /pair 身份，系统不知道 owner / 操作者是谁）

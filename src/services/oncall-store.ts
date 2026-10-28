@@ -14,15 +14,24 @@
  * write race. The lock is also re-acquired around the read so the modify
  * step always works against the latest on-disk snapshot.
  */
-import { readFileSync } from 'node:fs';
-import { getBot, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
+import { readFileSync, statSync } from 'node:fs';
+import { findOncallChat, getBot, listOncallChats, type BotDefaultOncall, type OncallChat } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { logger } from '../utils/logger.js';
+import { expandHomePath } from '../utils/working-dir.js';
 
 // ─── Manual binding ───────────────────────────────────────────────────────
 
 /**
  * Upsert an oncall binding. Returns whether it was newly created.
+ *
+ * A manual bind is an explicit opt-IN, so it clears any tombstone in
+ * `defaultOncallAutoboundChats` — the tombstone means "auto-bind must not
+ * touch this chat again" (written by unbind and by auto-bind itself), and it
+ * doubles as the provenance list for the leave-oncall release in
+ * {@link setWorkingDirMode}. Clearing it here keeps both consumers honest: a
+ * manually (re-)bound chat is neither auto-bind territory nor releasable as
+ * "auto-bound". A later unbind re-tombstones as before.
  */
 export async function bindOncall(
   larkAppId: string,
@@ -40,6 +49,9 @@ export async function bindOncall(
     if (created) cur.push(next);
     else cur[curIdx] = next; // wholesale replace strips legacy keys
     entry.oncallChats = cur;
+    if (Array.isArray(entry.defaultOncallAutoboundChats) && entry.defaultOncallAutoboundChats.includes(chatId)) {
+      entry.defaultOncallAutoboundChats = entry.defaultOncallAutoboundChats.filter((c: string) => c !== chatId);
+    }
     return { write: true, result: { created } };
   });
   if (!r.ok) return { ok: false, reason: r.reason };
@@ -48,6 +60,9 @@ export async function bindOncall(
   const inMem = (bot.config.oncallChats ??= []);
   const memIdx = inMem.findIndex(c => c.chatId === chatId);
   if (memIdx >= 0) inMem[memIdx] = next; else inMem.push(next);
+  if (bot.config.defaultOncallAutoboundChats?.includes(chatId)) {
+    bot.config.defaultOncallAutoboundChats = bot.config.defaultOncallAutoboundChats.filter(c => c !== chatId);
+  }
 
   logger.info(`[oncall:${larkAppId}] bind chat=${chatId} dir=${workingDir}`);
   return { ok: true, entry: next, created: r.result.created };
@@ -102,28 +117,37 @@ export function getOncallStatus(larkAppId: string, chatId: string): OncallChat |
   // registered yet (boot races, or tests exercising the IPC layer without
   // a full registry). Treat "no such bot" as "no oncall binding" — this
   // is best-effort enrichment, not a critical path.
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return undefined; }
-  return bot.config.oncallChats?.find(c => c.chatId === chatId);
+  try { getBot(larkAppId); } catch { return undefined; }
+  return findOncallChat(larkAppId, chatId);
 }
 
 // ─── Per-bot defaultOncall ───────────────────────────────────────────────
 
-/** Read the current defaultOncall config + autobound list for a bot. Used by
- *  the dashboard GET route and by the daemon's auto-bind judge. Sync because
- *  it only reads the in-memory snapshot — file-level consistency comes from
- *  the daemon never racing with itself on reads. */
+/** Read the current defaultOncall config + autobound list for a bot, for the
+ *  dashboard GET route (auto-bind itself reads bot.config directly, see
+ *  {@link ensureDefaultOncallBound}). Sync because it only reads the in-memory
+ *  snapshot — file-level consistency comes from the daemon never racing with
+ *  itself on reads. (The binding count re-reads bots.json only when its mtime
+ *  changed, same as findOncallChat.)
+ *
+ *  `autoboundChats` is the tombstone list ("auto-bind's one shot is spent"),
+ *  NOT the live bindings: it keeps chats that were unbound or released on
+ *  leaving oncall mode (a manual bind removes the chat again).
+ *  `oncallChatCount` is the live binding count, so the dashboard can show both
+ *  instead of passing the tombstone size off as "currently bound". */
 export function getBotDefaultOncall(larkAppId: string): {
   defaultOncall: BotDefaultOncall | undefined;
   autoboundChats: string[];
+  oncallChatCount: number;
 } {
   let bot;
   try { bot = getBot(larkAppId); } catch {
-    return { defaultOncall: undefined, autoboundChats: [] };
+    return { defaultOncall: undefined, autoboundChats: [], oncallChatCount: 0 };
   }
   return {
     defaultOncall: bot.config.defaultOncall,
     autoboundChats: [...(bot.config.defaultOncallAutoboundChats ?? [])],
+    oncallChatCount: listOncallChats(larkAppId).length,
   };
 }
 
@@ -175,6 +199,114 @@ export async function updateBotDefaultOncall(
     `(workingDir=${next!.workingDir || '∅'}, since=${next!.since})`,
   );
   return { ok: true, defaultOncall: next! };
+}
+
+/**
+ * Atomically set the per-bot「默认工作目录模式」(dashboard 三选一). The two underlying
+ * fields — `defaultWorkingDir` and `defaultOncall` — are mutually exclusive, so BOTH
+ * are written inside a SINGLE `rmwBotEntry` lock. Doing them as two separate locked
+ * writes (applyConfigField + updateBotDefaultOncall) lets two concurrent saves for
+ * different modes interleave and leave `defaultOncall.enabled` AND `defaultWorkingDir`
+ * both set — an inconsistent state where the UI shows oncall (derived from
+ * `defaultOncall.enabled`) but runtime pins `defaultWorkingDir` (see
+ * `effectiveDefaultWorkingDir`). PR #311 Codex review.
+ *
+ *   • 'off'     → clear defaultWorkingDir; disable defaultOncall (keep its prior dir
+ *                 so a later toggle back to oncall round-trips without retyping).
+ *   • 'default' → set defaultWorkingDir=dir; disable defaultOncall (keep prior dir).
+ *   • 'oncall'  → enable defaultOncall(dir) + re-stamp `since`; clear defaultWorkingDir.
+ *
+ * `autoWorktree` only applies to 'default' mode (每个新会话自动建 worktree)：写入其中，
+ * 其余模式一律清掉（该开关脱离 defaultWorkingDir 无意义，避免残留脏态）。
+ *
+ * Caller validates `workingDir` (dir existence) first; it is ignored for 'off'.
+ */
+export async function setWorkingDirMode(
+  larkAppId: string,
+  mode: 'off' | 'default' | 'oncall',
+  workingDir: string,
+  autoWorktree = false,
+): Promise<
+  | { ok: true; defaultOncall: BotDefaultOncall; defaultWorkingDir: string | null; defaultWorkingDirAutoWorktree: boolean }
+  | { ok: false; reason: string }
+> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+
+  const dir = (workingDir ?? '').trim();
+  // The toggle only rides along with 'default' mode; force it off otherwise.
+  const nextAutoWorktree = mode === 'default' && autoWorktree === true;
+  let nextOncall: BotDefaultOncall | null = null;
+  let nextWorkingDir: string | null = null;
+
+  const r = await rmwBotEntry<{
+    nextOncall: BotDefaultOncall;
+    nextWorkingDir: string | null;
+    removedAutoboundChats: string[];
+  }>(larkAppId, (entry) => {
+    const prior: BotDefaultOncall | undefined = entry.defaultOncall;
+    if (mode === 'oncall') {
+      nextOncall = { enabled: true, workingDir: dir, since: Date.now() };
+      nextWorkingDir = null;
+    } else {
+      // off / default → disable defaultOncall, keep its prior workingDir for round-trip.
+      nextOncall = { enabled: false, workingDir: prior?.workingDir ?? '', since: prior?.since ?? 0 };
+      nextWorkingDir = mode === 'default' ? dir : null;
+    }
+
+    // Leaving an ENABLED oncall mode: chats that were auto-bound by the
+    // defaultOncall flow must be released so they fall back to the bot-level
+    // defaultWorkingDir (or the repo-select card) instead of staying pinned to
+    // the old oncall dir. `defaultOncallAutoboundChats` is a tombstone list
+    // ("auto-bind's one shot is spent") — manual unbinds land there too and a
+    // manual re-bind does NOT remove the entry — so tombstone membership alone
+    // cannot distinguish a live auto-bind from a manual re-bind. Release only
+    // chats that ALSO still point at the outgoing oncall dir: a manual re-bind
+    // to a different dir is the user's explicit choice and is kept.
+    const autobound: string[] = Array.isArray(entry.defaultOncallAutoboundChats)
+      ? entry.defaultOncallAutoboundChats : [];
+    let removedAutoboundChats: string[] = [];
+    if (mode !== 'oncall' && prior?.enabled === true && autobound.length > 0) {
+      const cur: OncallChat[] = Array.isArray(entry.oncallChats) ? entry.oncallChats : [];
+      const kept: OncallChat[] = [];
+      for (const c of cur) {
+        if (c && autobound.includes(c.chatId) && c.workingDir === prior.workingDir) {
+          removedAutoboundChats.push(c.chatId);
+        } else {
+          kept.push(c);
+        }
+      }
+      entry.oncallChats = kept;
+    }
+
+    entry.defaultOncall = nextOncall;
+    if (nextWorkingDir === null) delete entry.defaultWorkingDir;
+    else entry.defaultWorkingDir = nextWorkingDir;
+    if (nextAutoWorktree) entry.defaultWorkingDirAutoWorktree = true;
+    else delete entry.defaultWorkingDirAutoWorktree;
+    return { write: true, result: { nextOncall, nextWorkingDir, removedAutoboundChats } };
+  });
+  if (!r.ok) return { ok: false, reason: r.reason };
+
+  // Sync in-memory config (runtime reads bot.config directly — no restart needed).
+  bot.config.defaultOncall = nextOncall!;
+  bot.config.defaultWorkingDir = nextWorkingDir ?? undefined;
+  bot.config.defaultWorkingDirAutoWorktree = nextAutoWorktree || undefined;
+  const removedAutoboundChats = r.result.removedAutoboundChats;
+  if (removedAutoboundChats.length > 0 && bot.config.oncallChats) {
+    bot.config.oncallChats = bot.config.oncallChats.filter(
+      c => !removedAutoboundChats.includes(c.chatId),
+    );
+  }
+  logger.info(
+    `[oncall:${larkAppId}] working-dir mode=${mode} ` +
+    `(defaultWorkingDir=${nextWorkingDir ?? '∅'}, autoWorktree=${nextAutoWorktree}, ` +
+    `oncall.enabled=${nextOncall!.enabled}, oncall.dir=${nextOncall!.workingDir || '∅'}` +
+    (removedAutoboundChats.length > 0
+      ? `, released autobound chats=[${removedAutoboundChats.join(', ')}]`
+      : ''),
+  );
+  return { ok: true, defaultOncall: nextOncall!, defaultWorkingDir: nextWorkingDir, defaultWorkingDirAutoWorktree: nextAutoWorktree };
 }
 
 /**
@@ -248,6 +380,39 @@ export async function autoBindOncallFromDefault(
 
   logger.info(`[oncall:${larkAppId}] auto-bind (default) chat=${chatId} dir=${workingDir}`);
   return { ok: true, entry: next, created: r.result.created };
+}
+
+/**
+ * 前置 auto-bind：dispatcher 在权限判断前调用，保证 oncall 群的首条 @bot 消息
+ * 不被误判为"无权限"弹授权申请卡。
+ *
+ * 做了与 daemon 侧一致的快速短路：非群聊 / defaultOncall 未开 / 已在 tombstone 列表
+ * / chat 已有显式 oncall 绑定 → 立刻 return；否则调 autoBindOncallFromDefault
+ * （内部会在锁内做权威二次校验）。idempotent，daemon spawn 路径二次调用安全。
+ */
+export async function ensureDefaultOncallBound(
+  larkAppId: string,
+  chatId: string,
+  chatType: 'group' | 'p2p',
+): Promise<OncallChat | undefined> {
+  if (chatType !== 'group') return undefined;
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return undefined; }
+  const def = bot.config.defaultOncall;
+  if (!def?.enabled || !def.workingDir) return undefined;
+  // fast-path: tombstone 或已显式绑定 —— 跳过磁盘写
+  if ((bot.config.defaultOncallAutoboundChats ?? []).includes(chatId)) return undefined;
+  if (bot.config.oncallChats?.some(c => c.chatId === chatId)) return undefined;
+  const resolved = expandHomePath(def.workingDir);
+  let isDir = false;
+  try { isDir = statSync(resolved).isDirectory(); } catch { /* not a dir */ }
+  if (!isDir) {
+    logger.warn(`[oncall:${larkAppId}] defaultOncall workingDir invalid (${resolved}); skipping auto-bind chat=${chatId}`);
+    return undefined;
+  }
+  const r = await autoBindOncallFromDefault(larkAppId, chatId, def.workingDir);
+  if (!r.ok || r.skipped) return undefined;
+  return r.entry;
 }
 
 // Test helper — read raw bots.json synchronously. Not for production use.

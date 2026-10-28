@@ -1,0 +1,674 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import {
+  clearWorkerConfig,
+  GROUP_NAME_PREFIX_MAX_LENGTH,
+  globalVcMeetingAgentListenerBotAppId,
+  globalConfigPath,
+  isGlobalVcMeetingAgentEnabled,
+  invalidateGlobalConfigCache,
+  isMultiTopicOrchestrationEnabled,
+  isWorkflowFeatureEnabled,
+  mergeDashboardConfig,
+  mergeGlobalConfig,
+  mergeWorkerConfig,
+  readGlobalConfig,
+  writeCodexNotifierConfig,
+  writeHostOverloadAlertConfig,
+} from '../src/global-config.js';
+import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
+
+describe('global dashboard config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  it.each([
+    [{ volcengine: null }, { volcengine: null }],
+    [{ volcengine: { mode: 'typo' }, asr: { enabled: true } }, { volcengine: null, asr: { enabled: true } }],
+    [{ engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: ' P ' } },
+      { engine: 'volcengine', volcengine: { mode: 'agent-plan', apiKey: 'P' } }],
+    [{ volcengine: { apiKey: '' } }, { volcengine: { apiKey: '' } }],
+    [{ rate: 1.2 }, { rate: 1.2 }],
+    [{ speaker: 'custom' }, { speaker: 'custom' }],
+  ])('retains Volcengine denial and scalar overrides on disk, row %#', (voice, expected) => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ voice }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().voice).toEqual(expected);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false, listenerPolicy: { rawMessages: false, finalSummary: false, allowSummarySharing: false } });
+  });
+
+  it('round-trips global meeting listener defaults without changing consumer selection', () => {
+    const listenerPolicy = { rawMessages: false, finalSummary: true, allowSummarySharing: true };
+    writeFileSync(globalConfigPath(), JSON.stringify({ vcMeetingAgent: { enabled: true, listenerPolicy } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerPolicy });
+  });
+
+  it('reads only boolean dashboard settings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        publicReadOnly: 'yes',
+        openTerminalInFeishu: true,
+        enableLocalCliOpen: true,
+        localCliOpenMode: 'resume',
+      },
+    }));
+
+    expect(readGlobalConfig().dashboard).toEqual({
+      openTerminalInFeishu: true,
+      enableLocalCliOpen: true,
+      localCliOpenMode: 'resume',
+    });
+  });
+
+  it('uses an absolute operator-provided global config path', () => {
+    const shared = join(home, 'control', 'config.json');
+    mkdirSync(dirname(shared), { recursive: true });
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', shared);
+    writeFileSync(shared, JSON.stringify({ repoPickerMode: 'repos' }));
+    invalidateGlobalConfigCache();
+    expect(globalConfigPath()).toBe(shared);
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('rejects a relative operator-provided global config path', () => {
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
+    expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('rejects an uncoordinated global config write in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    expect(() => mergeGlobalConfig({ repoPickerMode: 'repos' }))
+      .toThrow('durable_config_coordinator_required');
+  });
+
+  it('drops invalid dashboard.localCliOpenMode values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        enableLocalCliOpen: true,
+        localCliOpenMode: 'tmux',
+      },
+    }));
+
+    expect(readGlobalConfig().dashboard).toEqual({ enableLocalCliOpen: true });
+  });
+
+  it('reads dashboard.chatBotDiscovery as a boolean (off)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { chatBotDiscovery: false },
+    }));
+
+    expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
+  });
+
+  it('reads a MiniMax voice engine configuration', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: {
+        engine: 'minimax',
+        speaker: 'voice-id',
+        minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+
+  it('sanitizes a mistyped MiniMax region instead of routing on it', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: { engine: 'minimax', minimax: { apiKey: 'key', region: 'cnn' } },
+    }));
+    invalidateGlobalConfigCache();
+
+    // 'cnn' 既不是 'cn' 也不是 'global'：丢弃该字段（适配器兜底 global），
+    // 而不是把脏值原样保留、静默打到海外端点。
+    expect(readGlobalConfig().voice?.minimax).toEqual({ apiKey: 'key' });
+    expect(readGlobalConfig().voice?.minimax?.region).toBeUndefined();
+  });
+
+  it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: true },
+    }));
+    expect(readGlobalConfig().dashboard).toEqual({ noVisibleOutputHint: true });
+  });
+
+  it('drops non-boolean dashboard.noVisibleOutputHint', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { noVisibleOutputHint: 'yes' },
+    }));
+    expect(readGlobalConfig().dashboard).toBeUndefined();
+  });
+
+  it('reads pinned plugin dashboards as a sanitized machine-wide preference', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { pinnedPlugins: ['demo-addon', 'bad/id', 'demo-addon', 'agent-chrome'] },
+    }));
+
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['demo-addon', 'agent-chrome']);
+    mergeDashboardConfig({ pinnedPlugins: ['agent-chrome'] });
+    expect(readGlobalConfig().dashboard?.pinnedPlugins).toEqual(['agent-chrome']);
+  });
+
+  it('reads dashboard.herdrTraexPlugin opt-in with trimmed source/ref', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { herdrTraexPlugin: { enabled: true, source: ' owner/repo/subdir ', ref: ' reviewed-sha ' } },
+    }));
+
+    expect(readGlobalConfig().dashboard?.herdrTraexPlugin).toEqual({
+      enabled: true,
+      source: 'owner/repo/subdir',
+      ref: 'reviewed-sha',
+    });
+  });
+
+  it('reads repoPickerMode as a top-level global enum', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      repoPickerMode: 'repos',
+      dashboard: {
+        openTerminalInFeishu: true,
+      },
+    }));
+
+    expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('preserves separator whitespace in groupNamePrefix', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  [AI] ' }));
+    expect(readGlobalConfig().groupNamePrefix).toBe('  [AI] ');
+  });
+
+  it('ignores invalid groupNamePrefix values on the forgiving read path', () => {
+    for (const groupNamePrefix of [
+      42,
+      '   ',
+      'AI\n讨论·',
+      'AI\u0080讨论·',
+      'AI\u0085讨论·',
+      'AI\u009f讨论·',
+      'x'.repeat(GROUP_NAME_PREFIX_MAX_LENGTH + 1),
+    ]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    }
+  });
+
+  it('round-trips and clears groupNamePrefix without losing unknown keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ futureSetting: 'keep-me' }));
+    mergeGlobalConfig({ groupNamePrefix: 'AI讨论·' });
+    expect(readGlobalConfig().groupNamePrefix).toBe('AI讨论·');
+    expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).futureSetting).toBe('keep-me');
+
+    mergeGlobalConfig({ groupNamePrefix: null });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
+    expect(raw).not.toHaveProperty('groupNamePrefix');
+    expect(raw.futureSetting).toBe('keep-me');
+  });
+
+  it('validates worker memory policy and preserves future sibling keys on update', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      worker: {
+        memoryAdmissionEnabled: false,
+        minAvailableMemoryBytes: 4 * 1024 ** 3,
+        maxMemoryFullAvg10: 15.5,
+        sessionMemoryMaxBytes: 8 * 1024 ** 3,
+        futurePolicy: { version: 2 },
+      },
+    }));
+    expect(readGlobalConfig().worker).toEqual({
+      memoryAdmissionEnabled: false,
+      minAvailableMemoryBytes: 4 * 1024 ** 3,
+      maxMemoryFullAvg10: 15.5,
+      sessionMemoryMaxBytes: 8 * 1024 ** 3,
+    });
+    mergeWorkerConfig({ maxMemoryFullAvg10: 25 });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(raw.worker.futurePolicy).toEqual({ version: 2 });
+    expect(readGlobalConfig().worker?.maxMemoryFullAvg10).toBe(25);
+    expect(readGlobalConfig().worker?.memoryAdmissionEnabled).toBe(false);
+
+    clearWorkerConfig();
+    const cleared = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(cleared.worker).toEqual({ futurePolicy: { version: 2 } });
+    expect(readGlobalConfig().worker).toBeUndefined();
+  });
+
+  it('drops invalid repoPickerMode values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ repoPickerMode: 'grouped' }));
+    expect(readGlobalConfig().repoPickerMode).toBeUndefined();
+  });
+
+  it('reads global skill project trust policy and delivery default', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      skills: {
+        trustProjectSkills: 'trusted',
+        delivery: 'prompt',
+      },
+    }));
+
+    expect(readGlobalConfig().skills).toEqual({
+      trustProjectSkills: 'trusted',
+      delivery: 'prompt',
+    });
+  });
+
+  it('reads vcMeetingAgent.enabled as a top-level global kill-switch', () => {
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(true);
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: false } });
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: false });
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(false);
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: true } });
+    expect(isGlobalVcMeetingAgentEnabled()).toBe(true);
+  });
+
+  it('reads vcMeetingAgent.listenerBotAppId as the global VC listener app', () => {
+    mergeGlobalConfig({ vcMeetingAgent: { enabled: true, listenerBotAppId: ' cli_listener ' } });
+    expect(readGlobalConfig().vcMeetingAgent).toEqual({ enabled: true, listenerBotAppId: 'cli_listener' });
+    expect(globalVcMeetingAgentListenerBotAppId()).toBe('cli_listener');
+  });
+
+  it('workflow feature defaults OFF and reads workflow.enabled as a top-level opt-in', () => {
+    // No config file / no env: OFF (disabled by default).
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    expect(readGlobalConfig().workflow).toBeUndefined();
+    // Explicit true enables; round-trips as a typed field.
+    mergeGlobalConfig({ workflow: { enabled: true } });
+    expect(readGlobalConfig().workflow).toEqual({ enabled: true });
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+    // Explicit false disables again.
+    mergeGlobalConfig({ workflow: { enabled: false } });
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+  });
+
+  it('ignores a non-boolean workflow.enabled (falls back to default OFF)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ workflow: { enabled: 'yes' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().workflow).toBeUndefined();
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+  });
+
+  it('BOTMUX_WORKFLOW_ENABLED env overrides the config file both ways', () => {
+    // Config says disabled, env forces it on.
+    mergeGlobalConfig({ workflow: { enabled: false } });
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'true');
+    expect(isWorkflowFeatureEnabled()).toBe(true);
+    // Config says enabled, env forces it off.
+    mergeGlobalConfig({ workflow: { enabled: true } });
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'false');
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    // Any non-truthy string ⇒ disabled; a blank env is ignored (config wins).
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', 'garbage');
+    expect(isWorkflowFeatureEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
+  });
+
+  it('multi-topic orchestration defaults ON and supports config/env opt-out', () => {
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+
+    mergeGlobalConfig({ multiTopic: { enabled: false } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false });
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'false');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+  });
+
+  it('ignores a non-boolean multiTopic.enabled and preserves the default ON', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ multiTopic: { enabled: 'no' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+  });
+
+  it('keeps codexNotifier strictly disabled by default', () => {
+    expect(readGlobalConfig().codexNotifier).toBeUndefined();
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: false,
+      notifyWhen: 'locked_only',
+    });
+  });
+
+  it('reads and sanitizes the machine-wide codexNotifier config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: ' cli_notify ',
+        notifyWhen: 'always',
+        futureSetting: 'keep-compatible',
+      },
+    }));
+
+    expect(readGlobalConfig().codexNotifier).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      notifyWhen: 'always',
+    });
+  });
+
+  it('writes known codexNotifier fields without dropping future sibling keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: true,
+        targetBotAppId: 'cli_old',
+        notifyWhen: 'locked_only',
+        futureSetting: { version: 2 },
+      },
+    }));
+
+    writeCodexNotifierConfig({
+      enabled: false,
+      notifyWhen: 'always',
+    });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+
+    expect(raw.codexNotifier).toEqual({
+      enabled: false,
+      notifyWhen: 'always',
+      futureSetting: { version: 2 },
+    });
+    expect(readGlobalConfig().codexNotifier).toEqual({
+      enabled: false,
+      notifyWhen: 'always',
+    });
+  });
+
+  it('drops invalid codexNotifier fields and keeps the safe notify default', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      codexNotifier: {
+        enabled: 'yes',
+        targetBotAppId: '   ',
+        notifyWhen: 'unlocked',
+      },
+    }));
+
+    expect(readGlobalConfig().codexNotifier).toBeUndefined();
+    expect(resolveCodexNotifierConfig()).toEqual({
+      enabled: false,
+      notifyWhen: 'locked_only',
+    });
+  });
+
+  it('keeps hostOverloadAlert absent by default (feature off)', () => {
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+  });
+
+  it('reads and sanitizes the machine-wide hostOverloadAlert config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        targetBotAppId: ' cli_notify ',
+        enterLoadRatio: 2.0,
+        enterMemUsedFrac: 0.8,
+        futureSetting: 'keep-compatible',
+      },
+    }));
+
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: true,
+      targetBotAppId: 'cli_notify',
+      enterLoadRatio: 2.0,
+      enterMemUsedFrac: 0.8,
+    });
+  });
+
+  it('drops invalid hostOverloadAlert fields (blank target, non-finite / out-of-range thresholds)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: 'yes',        // not a boolean → dropped
+        targetBotAppId: '   ',  // blank → dropped
+        enterLoadRatio: -1,     // not positive → dropped
+        enterMemUsedFrac: 1.5,  // > 1 → dropped
+      },
+    }));
+    // Every field was invalid → the whole object collapses to undefined.
+    expect(readGlobalConfig().hostOverloadAlert).toBeUndefined();
+  });
+
+  it('keeps only the valid subset of hostOverloadAlert fields', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        enterLoadRatio: 0,       // not > 0 → dropped
+        enterMemUsedFrac: 0.5,   // valid
+      },
+    }));
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: true,
+      enterMemUsedFrac: 0.5,
+    });
+  });
+
+  it('writes the full known hostOverloadAlert set (wiping omitted known keys) while keeping future siblings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      hostOverloadAlert: {
+        enabled: true,
+        targetBotAppId: 'cli_old',
+        enterLoadRatio: 1.5,
+        futureSetting: { version: 2 },
+      },
+    }));
+
+    // "Full known config" writer (mirrors writeCodexNotifierConfig): every known
+    // key is replaced by exactly what `config` carries — an omitted known key
+    // (here enterLoadRatio) is wiped, not preserved — while unknown siblings stay.
+    writeHostOverloadAlertConfig({
+      enabled: false,
+      targetBotAppId: 'cli_new',
+    });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+
+    expect(raw.hostOverloadAlert).toEqual({
+      enabled: false,
+      targetBotAppId: 'cli_new',
+      futureSetting: { version: 2 },
+    });
+    // The forgiving read exposes only the valid known subset.
+    expect(readGlobalConfig().hostOverloadAlert).toEqual({
+      enabled: false,
+      targetBotAppId: 'cli_new',
+    });
+  });
+
+  it('reads global plugin defaults as a sanitized id list', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      plugins: ['agent-chrome', 'bad/id', 'agent-chrome', 'gitlab'],
+    }));
+
+    expect(readGlobalConfig().plugins).toEqual(['agent-chrome', 'gitlab']);
+  });
+
+  it('reads a valid MCP Gateway timeout ceiling and drops unsafe values', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 900_000 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBe(900_000);
+    invalidateGlobalConfigCache();
+    writeFileSync(globalConfigPath(), JSON.stringify({ mcpGatewayMaxToolTimeoutMs: 2_147_483_648 }));
+    expect(readGlobalConfig().mcpGatewayMaxToolTimeoutMs).toBeUndefined();
+  });
+
+  it('readGlobalConfig sees fresh values immediately after a merge (cache invalidation)', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }));
+    expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(true); // primes the TTL cache
+    mergeDashboardConfig({ publicReadOnly: false });
+    // Same-process read-after-write must not serve the cached pre-merge value.
+    expect(readGlobalConfig().dashboard?.publicReadOnly).toBe(false);
+  });
+
+  it('httpProxy survives a merge→read roundtrip (binary self-update download proxy)', () => {
+    // Regression: readGlobalConfig() used to drop httpProxy, so a proxy persisted
+    // by mergeGlobalConfig was never read back by the downloader.
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    mergeGlobalConfig({ httpProxy: 'http://127.0.0.1:7890' });
+    expect(readGlobalConfig().httpProxy).toBe('http://127.0.0.1:7890');
+    // Clearing (null) removes it again.
+    mergeGlobalConfig({ httpProxy: null });
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
+      maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    });
+  });
+
+  it('ignores a non-string / blank httpProxy', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: 123 }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+    writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: '   ' }));
+    expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('merge writes atomically and leaves no tmp file behind', () => {
+    mergeDashboardConfig({ openTerminalInFeishu: true });
+    const dir = dirname(globalConfigPath());
+    const leftovers = readdirSync(dir).filter(f => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+    expect(JSON.parse(readFileSync(globalConfigPath(), 'utf8')).dashboard.openTerminalInFeishu).toBe(true);
+  });
+
+  it('atomic write keeps the file at 0600 (no perm widening via tmp+rename)', () => {
+    // The file can carry voice credentials. A pre-existing 0600 config must not
+    // come out of the rename with the tmp file's umask-default (0644) mode.
+    writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { publicReadOnly: true } }), { mode: 0o600 });
+    chmodSync(globalConfigPath(), 0o600);
+    mergeDashboardConfig({ openTerminalInFeishu: true });
+    expect(statSync(globalConfigPath()).mode & 0o777).toBe(0o600);
+    // Fresh file (no pre-existing config) is also created at 0600.
+    rmSync(globalConfigPath());
+    mergeDashboardConfig({ publicReadOnly: false });
+    expect(statSync(globalConfigPath()).mode & 0o777).toBe(0o600);
+  });
+
+  it('merges dashboard settings while preserving unknown nested keys', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      lang: 'zh',
+      dashboard: {
+        publicReadOnly: true,
+        futureSetting: 'keep-me',
+      },
+    }));
+
+    const typed = mergeDashboardConfig({ publicReadOnly: false, openTerminalInFeishu: true, localCliOpenMode: 'attach' });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+
+    expect(typed).toEqual({ publicReadOnly: false, openTerminalInFeishu: true, localCliOpenMode: 'attach' });
+    expect(raw.lang).toBe('zh');
+    expect(raw.dashboard.futureSetting).toBe('keep-me');
+    expect(raw.dashboard.publicReadOnly).toBe(false);
+    expect(raw.dashboard.openTerminalInFeishu).toBe(true);
+    expect(raw.dashboard.localCliOpenMode).toBe('attach');
+  });
+});
+
+describe('global sessionCleanup config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-session-cleanup-config-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('strictly reads the opt-in Codex archive flag', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ archiveCodex: true });
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: { archiveCodex: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('reads a full sessionCleanup block', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({
+      enabled: true, olderThanHours: 72, intervalMinutes: 30,
+    });
+  });
+
+  it('drops an unsupported olderThanHours but keeps the rest', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 12, intervalMinutes: 15 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 15 });
+  });
+
+  it('drops a sub-floor intervalMinutes and floors a fractional one', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 1 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 90.7 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 90 });
+  });
+
+  it('ignores a non-object sessionCleanup', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: 'nope' }));
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('drops a non-boolean enabled', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
+  });
+});

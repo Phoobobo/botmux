@@ -1,0 +1,135 @@
+# 隔离 bot 部署指南（macOS）
+
+在一台 macOS 机器上部署 botmux，并让指定 bot 跑在「本机读隔离」下——一个被授权使用某个 bot 的半可信飞书用户，无法借该 bot 的 agent 读到**其他 bot 的会话数据与凭证**。
+
+> **仅 macOS。** 读隔离用 macOS 的 `sandbox-exec`（Seatbelt）整进程包裹 CLI。非 darwin 平台会在 gate 处 **fail-closed 拒绝启动**隔离 bot（Linux 的 bwrap 包裹尚未实现）。非隔离 bot 不受影响。
+
+## 一分钟原理
+
+两层隔离，叠加：
+
+1. **飞书 app 权限隔离（平台侧）**：每个 bot 是独立飞书 app，token 天然按 app 隔离——多 app 架构的固有属性。
+2. **本机读隔离（这份文档）**：每个隔离 bot 的 CLI 数据（配置 / 对话记录 / 记忆 / 登录凭证）重定向进它自己的 **BOT_HOME**（`~/.botmux/bots/<appId>/`，经 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`），然后整个 CLI 进程被 `sandbox-exec` 关住，deny 掉所有兄弟 bot 的数据与系统凭证；自己的那份由 carve-out 放行（resume/记忆正常）。CLI 自身的内置沙箱被 bypass 关掉，**外层 Seatbelt 是唯一 enforcer**——主进程 + 所有 Bash 子进程一并覆盖，无逃逸。
+
+## 部署步骤
+
+```bash
+# 0. 环境:node >=22;包管理器用 bun
+npm i -g bun                          # 或见 https://bun.sh
+
+# 1. 克隆 + 构建(仓库 public,拉取无需 token)
+git clone https://github.com/xu4wang/botmux.git && cd botmux
+bun install --frozen-lockfile && bun run build
+
+# 2. 全局 wrapper 进 PATH(一次性写进 ~/.zshrc)
+echo 'export PATH="$HOME/.botmux/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+
+# 3. 配置飞书 app(按 README「5 分钟快速接入」)
+botmux setup
+
+# 4. 登录 CLI —— 隔离 bot 的凭证从这里自动 provision 进各自 BOT_HOME
+claude /login                         # 写 keychain / ~/.claude/.credentials.json
+# codex bot 则:codex login(写 ~/.codex/auth.json)
+
+# 5. 部署本 checkout 到 daemon
+pnpm switch:here && botmux restart
+```
+
+> **要在隔离会话里用 `lark-cli`，还得先做「按 bot 拆 lark-cli 配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。隔离整目录 deny 了 `~/.lark-cli` 与 `~/.lark-cli-bots`，只给本 bot 的 `~/.lark-cli-bots/<自己>` 开 carve-out；没配过的机器上，隔离会话里的 lark-cli 会以 `not configured` / `operation not permitted` 失败。注意密钥不在 per-bot 目录里（那里只有 `config.json`），跨 bot 的 secret 隔离靠的是 keystore 整目录 deny + 本 bot 自己两个文件的 carve-out，两平台落点不同，见那篇的「平台差异」。
+
+> 源码部署时 `package.json` 的 `version` 是 `0.0.0`，正常——版本号只有 CI 打 tag 发版时才写入，不影响功能。
+>
+> ⚠️ **同一个飞书 app 不能被两台机器的 daemon 同时监听**——两个 daemon 会争抢同一批飞书事件。新机器要么用**另一批飞书 app**，要么是**迁移**（起新的、停旧的）。
+
+## 开启隔离
+
+`readIsolation` **没有交互式配置项**（setup / dashboard 都不问），需手动编辑 `~/.botmux/bots.json`，给要隔离的 bot 加 `"readIsolation": true`，然后 `botmux restart`：
+
+```json
+[
+  { "larkAppId": "cli_admin", "cliId": "claude-code" },
+  { "larkAppId": "cli_teamA", "cliId": "claude-code", "readIsolation": true },
+  { "larkAppId": "cli_teamB", "cliId": "codex",       "readIsolation": true }
+]
+```
+
+- 没设 `readIsolation` 的 bot 即为**非隔离 admin bot**——照旧读全局 keychain / bots.json，留给运维。它是整套隔离的**旁路**，其 `allowedUsers` / `allowedChatGroups` 必须收紧到可信的人。
+- 可选：`"readDenyExtraPaths": ["/abs/path", ...]` 追加自定义 deny 路径（会在自己 BOT_HOME 的 allow 之后生效，能覆盖它）。
+
+**触发条件（全 AND，否则 fail-closed 拒启）**：`readIsolation===true` ＋ adapter 支持（claude-code / codex）＋ 未设 `wrapperCli` ＋ 平台是 macOS ＋ `SESSION_DATA_DIR` 已设。任一不满足，worker 拒绝启动该会话，绝不降级裸跑。
+
+## 验证
+
+发一条消息触发会话后，在部署机上：
+
+```bash
+SID=<会话 id 前 8 位>   # botmux list --plain 里能看到
+
+# 隔离 bot:应看到 sandbox-exec 包裹 + CLAUDE_CONFIG_DIR/CODEX_HOME 重定向
+# 新会话在独立的 botmux tmux server 上（升级前创建、还没重建的会话去掉 -L botmux）
+tmux -L botmux list-panes -t bmx-$SID -F '#{pane_start_command}' \
+  | grep -oE "sandbox-exec -f [^ ]+|CLAUDE_CONFIG_DIR=[^ ]+|CODEX_HOME=[^ ]+"
+
+# 非隔离 bot:两者都没有(裸 CLI)
+
+# 内核级读探测(用该会话线上的 profile 直接验)
+SB=~/.botmux/data/read-isolation/$SID*.sb
+sandbox-exec -f $SB cat ~/.botmux/bots.json          # → Operation not permitted
+sandbox-exec -f $SB cat ~/.botmux/bots.json.bak      # → Operation not permitted(备份也挡)
+sandbox-exec -f $SB cat ~/.botmux/config.json        # → 正常(骨架可读)
+```
+
+## 凭证：自动同步，无需脚本
+
+隔离下 Seatbelt deny 了 `~/Library/Keychains`，隔离 bot 读不到系统 keychain，只能走**文件凭证**（各自 BOT_HOME 里的 `claude/.credentials.json` / `codex/auth.json`）。这份文件由 worker 在**每次冷 spawn 时自动同步**：
+
+- claude：比较 keychain 与 `~/.claude/.credentials.json` 的 `expiresAt`，取**最新有效**的那份写入；内容没变则不写。
+- codex：取 `~/.codex/auth.json`。
+
+所以 **token 过期 / 在别处重新 `/login` 轮换后，冷启动的会话自动自愈**。唯一要做的是把**已在跑**的会话冷重启一次（它们还持着旧 token）：
+
+```bash
+botmux suspend --isolated       # 挂起所有隔离 bot 的活跃会话(--dry-run 可预览)
+# 下条飞书消息即冷启动,provisioning 自动写入最新凭证
+```
+
+`botmux suspend` 也支持按单会话（`botmux suspend <id>`）或单 bot（`--bot <appId>`）挂起——挂起后会话保持 active，下条消息 `--resume` 续上下文，不丢对话。
+
+> `botmux send` 在隔离下从 BOT_HOME 里的 `send-cred.json`（`0600`）读本 bot 的凭证，secret 不经 env/argv（避免兄弟 bot 用 `ps eww` 窥探）。这个文件由 worker 自动写，别手动改。
+
+## 隔离覆盖面（deny 什么 / 留什么）
+
+| 类别 | deny |
+|---|---|
+| 全局 CLI 数据 | `~/.claude`、`~/.claude.json`、`~/.codex`（整目录；自己的已重定向到 BOT_HOME） |
+| 系统凭证库 | `~/.ssh ~/.aws ~/.azure ~/.gnupg ~/.netrc ~/.git-credentials ~/.npmrc ~/.pypirc ~/.docker/config.json ~/.kube`、`~/.config/{gh,glab-cli,gcloud,op,1Password}`、`~/.1password ~/.password-store`、`~/Library/Keychains` |
+| botmux 敏感（surgical，`~/.botmux` 整体不 deny） | `bots.json` **及其一切备份**（`bots.json.bak` / `.bak.*` / `.tmp`）、`logs`、`~/.lark-cli`、`feishu-session.json`（网页登录态，可开新 bot）、`.dashboard-secret`（loopback-HMAC 签名密钥，可给任意会话铸造可写终端 token）、`.dashboard-token`（dashboard bearer）；**整目录 wholesale-deny** `~/.botmux/bots` 和 `~/.lark-cli-bots`；所有 bot 的 `data/sessions-<appId>.json`、遗留共享扁平 `data/sessions.json`（≤1.12.x 直升级的一次性导入源，含历史对话 PII）、`data/identities-<appId>.json`（对话者姓名 PII）、遗留 `data/.send-cred-<appId>`（**文件名 regex 整类 deny**）；`data/{frozen-cards,turn-sends,crash-diagnostics,attachments,whiteboards,queues,read-isolation}`、`data/schedules.json`。<br>`.dashboard-port`（纯端口号，无凭证价值）留可读——`botmux dashboard`/`term-link` 是 owner 管理命令，隔离 agent 不该签 HMAC，deny secret 对 send/list/status 零影响 |
+
+**保留可读**：自己的 BOT_HOME `~/.botmux/bots/<自己>`、自己的 `~/.lark-cli-bots/<自己>`、自己的会话库目录 `data/session-stores/<自己>/`（SQLite：`botmux send` 经 resolveSessionById 读 per-bot `.db` 快照；目录整体 bind 以兼容 SQLite 重启后重建的 `-wal/-shm`。冻结的 `sessions-<自己>.json` 与遗留扁平 `sessions.json` 只供 daemon 首启一次性导入，**不向沙箱开放**）、**自己的附件桶 `data/attachments/<自己appId>/`**（飞书里用户上传的文件按 appId 分桶落盘，spawn 时静态的 Seatbelt 规则才有锚点可开洞；兄弟桶与旧扁平布局仍 deny）、`~/.botmux` 其余骨架（config/registry/pm2——`botmux send/list/status` 要广读），以及 BOT_HOME 外的代码 / 仓库（agent 照常干活）。
+
+> 全部用**整类规则**（整目录 wholesale + 文件名 regex），不枚举任何兄弟 appId——**新增 bot 天然被覆盖，无需冷重启已在跑的隔离 bot**。所有 carve-out 都锚在**不可变的 appId**（不是用户可控的 cwd），防 `/cd` 打洞。
+
+## 已知限制
+
+- **仅 macOS**：非 darwin 平台隔离 bot fail-closed 拒启。
+- **读隔离 ≠ 防外传**：agent 在 bypass 下有完整网络 / shell，隔离只挡「读到兄弟 bot 的本机文件」，不挡它把自己会话里能读到的东西联网发出去。要防外传需另配网络策略。
+- **同一 OS 用户下**：强度 = 沙箱配置完整性 + Seatbelt 内核实现；不防内核漏洞、不防 root。要更强隔离用不同 OS 用户 / 容器。
+- **非隔离 admin bot 是旁路**：它能读整机，收紧其 `allowedUsers` / `allowedChatGroups`。推荐只保留一个非隔离 admin、其余全隔离。
+
+## 排错
+
+| 症状 | 排查 |
+|---|---|
+| 隔离 bot 拒启（日志 `refusing to start`） | 确认 macOS、未设 `wrapperCli`、`SESSION_DATA_DIR` 已设、adapter 支持（claude-code / codex） |
+| `botmux send` 报 "Bot not registered" | 确认 `~/.botmux/bin` 在 PATH 最前（用本 build 的 send-cred reader）；确认 BOT_HOME 里有 `send-cred.json` |
+| bot 卡 `401 / run /login` | 凭证过期 → `botmux suspend --isolated`，下条消息冷启动自动同步最新凭证 |
+| 隔离 bot 读不到自己该读的项目文件 | 确认它在 BOT_HOME 外；`readDenyExtraPaths` 没误伤 |
+| `lark-cli` 报 `not configured` / `config_file: operation not permitted` | 没做「按 bot 拆 lark-cli 配置」→ lark-cli 落回被 deny 的 `~/.lark-cli`。见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。**给 node / codex 开完全磁盘访问权限对此无效**——TCC 与 Seatbelt 是两套独立的强制访问控制 |
+
+## 回滚
+
+```bash
+# 关某个 bot 的隔离:删掉它 bots.json 里的 "readIsolation": true,然后 botmux restart
+```
+
+关掉后该 bot 下次冷启动即恢复为非隔离（读全局 keychain / bots.json）。BOT_HOME 目录留着无害。

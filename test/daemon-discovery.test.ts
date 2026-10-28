@@ -1,0 +1,126 @@
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  listOnlineDaemons,
+  parseDaemonIpcPort,
+  resolveDaemonIpcPort,
+} from '../src/utils/daemon-discovery.js';
+
+describe('daemon IPC port fallback', () => {
+  it('prefers a discovered port and otherwise accepts a valid injected port', () => {
+    expect(resolveDaemonIpcPort(4310, '9999')).toBe(4310);
+    expect(resolveDaemonIpcPort(undefined, '9999')).toBe(9999);
+  });
+
+  it.each([undefined, '', '0', '-1', '65536', '12.5', 'not-a-port'])(
+    'rejects invalid injected port %s',
+    (raw) => {
+      expect(parseDaemonIpcPort(raw)).toBeUndefined();
+    },
+  );
+});
+
+describe('daemon discovery', () => {
+  let dir: string;
+  let priorDataDir: string | undefined;
+  let priorHome: string | undefined;
+
+  beforeEach(() => {
+    priorDataDir = process.env.SESSION_DATA_DIR;
+    priorHome = process.env.HOME;
+    dir = join(tmpdir(), `botmux-daemon-discovery-${process.pid}-${Date.now()}`);
+    mkdirSync(join(dir, 'dashboard-daemons'), { recursive: true });
+    process.env.SESSION_DATA_DIR = dir;
+  });
+
+  afterEach(() => {
+    if (priorDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = priorDataDir;
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('keeps friendly bot labels from daemon descriptors', () => {
+    const bootInstanceId = 'A'.repeat(43);
+    writeFileSync(join(dir, 'dashboard-daemons', 'cli_agent.json'), JSON.stringify({
+      larkAppId: 'cli_agent',
+      ipcPort: 7956,
+      bootInstanceId,
+      workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
+      botName: 'codex-loopy',
+      cliId: 'codex',
+      pid: 123,
+      lastHeartbeat: Date.now(),
+    }));
+
+    expect(listOnlineDaemons()).toEqual([expect.objectContaining({
+      larkAppId: 'cli_agent',
+      ipcPort: 7956,
+      bootInstanceId,
+      workflowIpcProtocol: 'v1',
+      dispatchLaunchIpcProtocol: 'v1',
+      botName: 'codex-loopy',
+      cliId: 'codex',
+    })]);
+  });
+
+  it('does not invent a Workflow IPC boot identity for an old descriptor', () => {
+    writeFileSync(join(dir, 'dashboard-daemons', 'legacy.json'), JSON.stringify({
+      larkAppId: 'legacy',
+      ipcPort: 7957,
+      lastHeartbeat: Date.now(),
+    }));
+
+    expect(listOnlineDaemons()).toEqual([expect.objectContaining({
+      larkAppId: 'legacy',
+      ipcPort: 7957,
+    })]);
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('bootInstanceId');
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('workflowIpcProtocol');
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('sessionStoreProtocol');
+    expect(listOnlineDaemons()[0]).not.toHaveProperty('botmuxVersion');
+  });
+
+  it('passes through sessionStoreProtocol and botmuxVersion without inventing them', () => {
+    writeFileSync(join(dir, 'dashboard-daemons', 'new.json'), JSON.stringify({
+      larkAppId: 'new',
+      ipcPort: 7959,
+      sessionStoreProtocol: 'occupancy-v1',
+      botmuxVersion: '3.20.0',
+      lastHeartbeat: Date.now(),
+    }));
+
+    expect(listOnlineDaemons()).toEqual([expect.objectContaining({
+      larkAppId: 'new',
+      ipcPort: 7959,
+      sessionStoreProtocol: 'occupancy-v1',
+      botmuxVersion: '3.20.0',
+    })]);
+  });
+
+  it('follows the canonical data-dir breadcrumb when SESSION_DATA_DIR is absent', () => {
+    const home = join(dir, 'home');
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    writeFileSync(join(home, '.botmux', '.data-dir'), dir);
+    process.env.HOME = home;
+    delete process.env.SESSION_DATA_DIR;
+
+    writeFileSync(join(dir, 'dashboard-daemons', 'breadcrumb.json'), JSON.stringify({
+      larkAppId: 'breadcrumb',
+      ipcPort: 7958,
+      bootInstanceId: 'B'.repeat(43),
+      workflowIpcProtocol: 'v1',
+      lastHeartbeat: Date.now(),
+    }));
+
+    expect(listOnlineDaemons()).toEqual([expect.objectContaining({
+      larkAppId: 'breadcrumb',
+      ipcPort: 7958,
+      workflowIpcProtocol: 'v1',
+    })]);
+  });
+});

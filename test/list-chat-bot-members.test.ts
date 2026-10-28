@@ -3,12 +3,71 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const state = vi.hoisted(() => ({ dataDir: '' }));
+const hoisted = vi.hoisted(() => {
+  const state = {
+    dataDir: '',
+    listBotsApiEnabled: false,
+    listBotsApiTimeoutMs: 3000,
+    listBotsApiItems: undefined as Array<{ bot_id: string; bot_name: string }> | undefined,
+    listBotsApiError: undefined as Error | undefined,
+    listBotsApiCode: 0,
+    listBotsApiCalls: 0,
+    botConfigs: [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+    ],
+    inChatByAppId: {} as Record<string, boolean>,
+    inChatErrorByAppId: {} as Record<string, Error>,
+    inChatCodeByAppId: {} as Record<string, number>,
+    inChatCalls: [] as string[],
+  };
+
+  class MockClient {
+    appId: string;
+    im: any;
+
+    constructor(opts: { appId: string }) {
+      this.appId = opts.appId;
+      this.im = { v1: {} };
+    }
+
+    // isInChat and members/bots now route through client.request().
+    async request({ url }: { url: string }) {
+      if (url.includes('/members/bots')) {
+        state.listBotsApiCalls++;
+        if (state.listBotsApiError) throw state.listBotsApiError;
+        return {
+          code: state.listBotsApiCode,
+          msg: state.listBotsApiCode === 0 ? 'success' : 'business error',
+          data: { items: state.listBotsApiItems ?? [] },
+        };
+      }
+      if (url.includes('/members/is_in_chat')) {
+        state.inChatCalls.push(this.appId);
+        if (state.inChatErrorByAppId[this.appId]) throw state.inChatErrorByAppId[this.appId];
+        const code = state.inChatCodeByAppId[this.appId] ?? 0;
+        return {
+          code,
+          msg: code === 0 ? 'success' : 'business error',
+          data: { is_in_chat: state.inChatByAppId[this.appId] ?? true },
+        };
+      }
+      throw new Error(`unexpected GET url in mock: ${url}`);
+    }
+  }
+
+  return { state, MockClient };
+});
+const { state, MockClient } = hoisted;
 
 vi.mock('../src/config.js', () => ({
   config: {
     session: {
       get dataDir() { return state.dataDir; },
+    },
+    chatBotDiscovery: {
+      get listBotsApiEnabled() { return state.listBotsApiEnabled; },
+      get listBotsApiTimeoutMs() { return state.listBotsApiTimeoutMs; },
     },
   },
 }));
@@ -22,39 +81,311 @@ vi.mock('../src/utils/user-token.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
-  loadBotConfigs: vi.fn(() => [
-    { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
-    { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
-  ]),
+  loadBotConfigs: vi.fn(() => state.botConfigs),
+  getBotClient: vi.fn((appId: string) => new MockClient({ appId })),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { error: 4 },
-  Client: class MockClient {
-    appId: string;
-    im: any;
-
-    constructor(opts: { appId: string }) {
-      this.appId = opts.appId;
-      this.im = { v1: {} };
-    }
-
-    // isInChat now routes through client.request() (empty-GET-body 411 guard).
-    async request({ url }: { url: string }) {
-      if (url.includes('/members/is_in_chat')) {
-        return { code: 0, data: { is_in_chat: true } };
-      }
-      throw new Error(`unexpected GET url in mock: ${url}`);
-    }
-  },
+  Client: MockClient,
 }));
 
 describe('listChatBotMembers', () => {
-  afterEach(() => {
+  afterEach(async () => {
+    vi.useRealTimers();
     if (state.dataDir) {
       rmSync(state.dataDir, { recursive: true, force: true });
       state.dataDir = '';
     }
+    state.listBotsApiEnabled = false;
+    state.listBotsApiTimeoutMs = 3000;
+    state.listBotsApiItems = undefined;
+    state.listBotsApiError = undefined;
+    state.listBotsApiCode = 0;
+    state.listBotsApiCalls = 0;
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+    ];
+    state.inChatByAppId = {};
+    state.inChatErrorByAppId = {};
+    state.inChatCodeByAppId = {};
+    state.inChatCalls = [];
+    const { __testOnly_resetAllBotClients } = await import('../src/im/lark/client.js');
+    __testOnly_resetAllBotClients();
+  });
+
+  it('does not call /members/bots when the experimental flag is disabled', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(0);
+    expect(bots.some(b => b.larkAppId === 'cli_self')).toBe(true);
+  });
+
+  it('strict current-members helper calls live /members/bots even when discovery fallback is disabled', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = false;
+    state.listBotsApiItems = [
+      { bot_id: 'ou_live_peer', bot_name: 'Live Peer' },
+    ];
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_stale_peer: { name: 'Stale Peer', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listCurrentChatBotMembers } = await import('../src/im/lark/client.js');
+    await expect(listCurrentChatBotMembers('cli_self', 'oc_chat')).resolves.toEqual([
+      { openId: 'ou_live_peer', displayName: 'Live Peer' },
+    ]);
+    expect(state.listBotsApiCalls).toBe(1);
+  });
+
+  it('strict current-members helper fails closed and never returns observed fallback rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiError = new Error('gateway unavailable');
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_stale_peer: { name: 'Stale Peer', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listCurrentChatBotMembers } = await import('../src/im/lark/client.js');
+    await expect(listCurrentChatBotMembers('cli_self', 'oc_chat'))
+      .rejects.toThrow('live_chat_bot_members_unavailable');
+    expect(state.listBotsApiCalls).toBe(1);
+  });
+
+  it('resolves a stable app id to the receiver-scoped live open_id without cross-ref guessing', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiItems = [
+      { bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' },
+    ];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self_seen_by_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_seen_by_peer', botName: 'BotPeer' },
+    ]));
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({
+      BotPeer: 'ou_stale_cross_ref',
+    }));
+
+    const { resolveCurrentChatBotOpenIdsByLarkAppIds } = await import('../src/im/lark/client.js');
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds(
+      'cli_self',
+      'oc_chat',
+      ['cli_peer'],
+    )).resolves.toEqual({
+      ok: true,
+      mappings: [{ larkAppId: 'cli_peer', subjectOpenId: 'ou_peer_seen_by_receiver' }],
+    });
+    expect(state.listBotsApiCalls).toBe(1);
+    expect(state.inChatCalls).toEqual(['cli_peer']);
+  });
+
+  it('fresh-loads a bot appended after the client cache was prewarmed without restarting the source daemon', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+    ];
+    state.listBotsApiItems = [];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+    ]));
+
+    const { resolveCurrentChatBotOpenIdsByLarkAppIds } = await import('../src/im/lark/client.js');
+    // Prewarm the process cache while the target App does not exist.
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_missing']))
+      .resolves.toMatchObject({ ok: false, error: 'subject_lark_app_not_configured' });
+
+    // Provisioning appends the target config and bot identity while the source
+    // daemon remains alive. The next authorization-grade lookup must see it.
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_target', larkAppSecret: 's2', cliId: 'codex' },
+    ];
+    state.listBotsApiItems = [{ bot_id: 'ou_target_seen_by_self', bot_name: 'BotTarget' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_target', botOpenId: 'ou_target_self', botName: 'BotTarget' },
+    ]));
+
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_target']))
+      .resolves.toEqual({
+        ok: true,
+        mappings: [{ larkAppId: 'cli_target', subjectOpenId: 'ou_target_seen_by_self' }],
+      });
+    expect(state.inChatCalls).toEqual(['cli_target']);
+  });
+
+  it('rejects a same-name live row when the configured subject app is not in chat', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_untrusted_same_name', bot_name: 'BotPeer' }];
+    state.inChatByAppId.cli_peer = false;
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self', botName: 'BotPeer' },
+    ]));
+
+    const { resolveCurrentChatBotOpenIdsByLarkAppIds } = await import('../src/im/lark/client.js');
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_peer']))
+      .resolves.toMatchObject({
+        ok: false,
+        error: 'subject_lark_app_not_in_chat',
+        invalidSubjectLarkAppIds: ['cli_peer'],
+      });
+  });
+
+  it('fails closed when a strict bot_name has duplicate live rows or configured in-chat claimants', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiItems = [
+      { bot_id: 'ou_peer_one', bot_name: 'BotPeer' },
+      { bot_id: 'ou_peer_two', bot_name: 'BotPeer' },
+    ];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self', botName: 'BotPeer' },
+    ]));
+
+    const { resolveCurrentChatBotOpenIdsByLarkAppIds, __testOnly_resetAllBotClients } = await import('../src/im/lark/client.js');
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_peer']))
+      .resolves.toMatchObject({ ok: false, error: 'subject_lark_app_ambiguous' });
+
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+      { larkAppId: 'cli_peer_clone', larkAppSecret: 's3', cliId: 'codex' },
+    ];
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_one', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self', botName: 'BotPeer' },
+      { larkAppId: 'cli_peer_clone', botOpenId: 'ou_clone_self', botName: 'BotPeer' },
+    ]));
+    __testOnly_resetAllBotClients();
+
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_peer']))
+      .resolves.toMatchObject({ ok: false, error: 'subject_lark_app_ambiguous' });
+    expect(state.inChatCalls.slice(-2).sort()).toEqual(['cli_peer', 'cli_peer_clone']);
+  });
+
+  it('fails closed when the configured app is_in_chat probe errors', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    state.inChatErrorByAppId.cli_peer = new Error('subject API down');
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self', botName: 'BotPeer' },
+    ]));
+
+    const { resolveCurrentChatBotOpenIdsByLarkAppIds } = await import('../src/im/lark/client.js');
+    await expect(resolveCurrentChatBotOpenIdsByLarkAppIds('cli_self', 'oc_chat', ['cli_peer']))
+      .resolves.toMatchObject({ ok: false, error: 'live_membership_unavailable' });
+  });
+
+  it('uses /members/bots as current-chat truth when enabled and does not resurrect stale observed rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiItems = [
+      { bot_id: 'ou_self_from_api', bot_name: 'BotSelf' },
+      { bot_id: 'ou_peer_from_api', bot_name: 'BotPeer' },
+    ];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self_self_view', botName: 'BotSelf', cliId: 'codex' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_self_view', botName: 'BotPeer', cliId: 'codex' },
+    ]));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_stale_peer: { name: 'StalePeer', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    expect(bots.map(b => b.openId)).toEqual(['ou_self_from_api', 'ou_peer_from_api']);
+    expect(bots.find(b => b.openId === 'ou_stale_peer')).toBeUndefined();
+    expect(bots.find(b => b.openId === 'ou_peer_from_api')).toMatchObject({
+      larkAppId: 'cli_peer',
+      source: 'configured',
+      mentionable: true,
+      mentionSource: 'observed',
+    });
+  });
+
+  it('binds self by open_id when /members/bots display name drifts from bots-info, so self is not surfaced as a peer', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    // /members/bots returns self under a drifted display name, but its
+    // observer-scoped bot_id is self's self-view open_id (observer == self).
+    state.listBotsApiItems = [
+      { bot_id: 'ou_self', bot_name: 'BotSelf Renamed' },
+    ];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    // Bound to self via open_id despite the name mismatch → caller can exclude
+    // self by larkAppId instead of leaking it into <available_bots>.
+    expect(bots.find(b => b.openId === 'ou_self')).toMatchObject({
+      larkAppId: 'cli_self',
+      source: 'configured',
+      mentionSource: 'self',
+    });
+  });
+
+  it('treats /members/bots items: [] as authoritative and does not fall back to observed rows', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiItems = [];
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      ou_external: { name: 'External', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    expect(bots).toEqual([]);
+  });
+
+  it('caches /members/bots failures for 3 minutes before retrying and falls back to legacy discovery', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-30T00:00:00Z'));
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiError = new Error('gateway unavailable');
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    await listChatBotMembers('cli_self', 'oc_chat');
+    await listChatBotMembers('cli_self', 'oc_chat');
+
+    expect(state.listBotsApiCalls).toBe(1);
+    vi.setSystemTime(new Date('2026-06-30T00:03:01Z'));
+    await listChatBotMembers('cli_self', 'oc_chat');
+    expect(state.listBotsApiCalls).toBe(2);
+  });
+
+  it('does not cache non-zero /members/bots business errors as capability failures', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    state.listBotsApiEnabled = true;
+    state.listBotsApiCode = 99992356;
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf', cliId: 'codex' },
+    ]));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    await listChatBotMembers('cli_self', 'oc_bad');
+    await listChatBotMembers('cli_self', 'oc_bad');
+
+    expect(state.listBotsApiCalls).toBe(2);
   });
 
   it('returns larkAppId + source="configured" so callers can identify self and provenance', async () => {
@@ -245,5 +576,202 @@ describe('listChatBotMembers', () => {
     expect(fromSelf.find(b => b.openId === 'ou_B_as_seen_by_peer')).toBeUndefined();
     expect(fromPeer.find(b => b.openId === 'ou_B_as_seen_by_peer')).toBeDefined();
     expect(fromPeer.find(b => b.openId === 'ou_B_as_seen_by_self')).toBeUndefined();
+  });
+
+  it('deduplicates same-name observed entries and keeps only the latest mentionable openId', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), '[]');
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_stale': { name: 'NasCodex', source: 'introduce', firstSeenAt: now - 10_000, lastSeenAt: now - 10_000 },
+      'ou_current': { name: 'NasCodex', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    const nasEntries = bots.filter(b => b.displayName === 'NasCodex');
+    expect(nasEntries).toHaveLength(1);
+    expect(nasEntries[0]).toMatchObject({
+      openId: 'ou_current',
+      mentionable: true,
+      mentionSource: 'observed',
+    });
+    expect(bots.find(b => b.openId === 'ou_stale')).toBeUndefined();
+  });
+
+  it('prefers a same-name bot-openids cross-ref over a stale observed external handle', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), '[]');
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({
+      NasCodex: 'ou_current_cross_ref',
+    }));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_stale_observed': { name: 'NasCodex', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    const nasEntries = bots.filter(b => b.displayName === 'NasCodex');
+    expect(nasEntries).toHaveLength(1);
+    expect(nasEntries[0]).toMatchObject({
+      larkAppId: '',
+      openId: 'ou_current_cross_ref',
+      source: 'introduce',
+      mentionable: true,
+      mentionSource: 'cross-ref',
+    });
+    expect(bots.find(b => b.openId === 'ou_stale_observed')).toBeUndefined();
+  });
+
+  it('cross-ref name matching trims whitespace but stays case-sensitive', async () => {
+    // The unified name-key normalizer is trim-only. A cross-ref key with stray
+    // surrounding whitespace still matches an observed name (trim), but a
+    // case-only difference does NOT — "Claude" and "claude" stay distinct bots.
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-list-chat-bots-'));
+    writeFileSync(join(state.dataDir, 'bots-info.json'), '[]');
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({
+      '  NasCodex  ': 'ou_cross_ref_padded', // whitespace-padded → must still match
+      'Claude': 'ou_cross_ref_claude',       // capital C → must NOT match observed "claude"
+    }));
+    const now = Date.now();
+    writeFileSync(join(state.dataDir, 'observed-bots-cli_self-oc_chat.json'), JSON.stringify({
+      'ou_obs_nas': { name: 'NasCodex', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+      'ou_obs_claude': { name: 'claude', source: 'introduce', firstSeenAt: now, lastSeenAt: now },
+    }));
+
+    const { listChatBotMembers } = await import('../src/im/lark/client.js');
+    const bots = await listChatBotMembers('cli_self', 'oc_chat');
+
+    // Trim: padded cross-ref key matched the observed "NasCodex" → cross-ref openId wins.
+    const nas = bots.find(b => b.displayName === 'NasCodex')!;
+    expect(nas).toMatchObject({ openId: 'ou_cross_ref_padded', mentionSource: 'cross-ref' });
+
+    // Case-sensitive: observed "claude" must NOT pick up the "Claude" cross-ref id;
+    // it stays an observed external row with its own observed open_id.
+    const claude = bots.find(b => b.displayName === 'claude')!;
+    expect(claude).toMatchObject({ openId: 'ou_obs_claude', mentionSource: 'observed' });
+  });
+});
+
+describe('resolveSiblingBotBySenderOpenId', () => {
+  afterEach(async () => {
+    if (state.dataDir) {
+      rmSync(state.dataDir, { recursive: true, force: true });
+      state.dataDir = '';
+    }
+    state.listBotsApiItems = undefined;
+    state.listBotsApiError = undefined;
+    state.listBotsApiCode = 0;
+    state.listBotsApiCalls = 0;
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+    ];
+    state.inChatByAppId = {};
+    state.inChatErrorByAppId = {};
+    state.inChatCodeByAppId = {};
+    state.inChatCalls = [];
+    const { __testOnly_resetAllBotClients } = await import('../src/im/lark/client.js');
+    __testOnly_resetAllBotClients();
+  });
+
+  it('resolves a cold sibling by its receiver-scoped sender open_id (unique name + is_in_chat)', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer_seen_by_peer', botName: 'BotPeer' },
+    ]));
+    // Cross-ref cold on purpose (not consulted by the resolver).
+    writeFileSync(join(state.dataDir, 'bot-openids-cli_self.json'), JSON.stringify({}));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    await expect(resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver'))
+      .resolves.toEqual({ ok: true, larkAppId: 'cli_peer', botName: 'BotPeer', senderOpenId: 'ou_peer_seen_by_receiver' });
+    expect(state.inChatCalls).toEqual(['cli_peer']);
+  });
+
+  it('fails closed for a genuine external sender not backed by any local sibling of that name', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    // Live roster shows a stranger bot whose name matches no configured sibling.
+    state.listBotsApiItems = [{ bot_id: 'ou_stranger', bot_name: 'StrangerBot' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_stranger');
+    expect(res.ok).toBe(false);
+  });
+
+  it('fails closed when the sender open_id is absent from the live roster', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_not_in_roster');
+    expect(res).toEqual({ ok: false, reason: 'sender_not_in_live_roster' });
+  });
+
+  it('fails closed when two configured siblings share the roster name (anti-impersonation)', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.botConfigs = [
+      { larkAppId: 'cli_self', larkAppSecret: 's1', cliId: 'codex' },
+      { larkAppId: 'cli_peer', larkAppSecret: 's2', cliId: 'codex' },
+      { larkAppId: 'cli_peer2', larkAppSecret: 's3', cliId: 'codex' },
+    ];
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+      { larkAppId: 'cli_peer2', botOpenId: 'ou_peer2', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res).toEqual({ ok: false, reason: 'ambiguous_sibling_name' });
+  });
+
+  it('fails closed when the live /members/bots call errors', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiError = new Error('gateway unavailable');
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toContain('live_membership_unavailable');
+  });
+
+  it('returns no_sender_open_id when the sender open_id is missing', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    await expect(resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', undefined))
+      .resolves.toEqual({ ok: false, reason: 'no_sender_open_id' });
+    expect(state.listBotsApiCalls).toBe(0);
+  });
+
+  it('fails closed when the matched sibling is not actually in the chat', async () => {
+    state.dataDir = mkdtempSync(join(tmpdir(), 'botmux-sibling-'));
+    state.listBotsApiItems = [{ bot_id: 'ou_peer_seen_by_receiver', bot_name: 'BotPeer' }];
+    state.inChatByAppId = { cli_peer: false };
+    writeFileSync(join(state.dataDir, 'bots-info.json'), JSON.stringify([
+      { larkAppId: 'cli_self', botOpenId: 'ou_self', botName: 'BotSelf' },
+      { larkAppId: 'cli_peer', botOpenId: 'ou_peer', botName: 'BotPeer' },
+    ]));
+
+    const { resolveSiblingBotBySenderOpenId } = await import('../src/im/lark/client.js');
+    const res = await resolveSiblingBotBySenderOpenId('cli_self', 'oc_chat', 'ou_peer_seen_by_receiver');
+    expect(res.ok).toBe(false);
   });
 });

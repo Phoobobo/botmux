@@ -10,13 +10,27 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
-import { canTalk, canOperate } from '../src/im/lark/event-dispatcher.js';
+import { canTalk, canOperate, evaluateTalk, grantCommandRestriction } from '../src/im/lark/event-dispatcher.js';
 
 describe('grant gates', () => {
   beforeEach(() => {
     const bot = registerBot({ larkAppId: 'g1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] });
     bot.resolvedAllowedUsers = ['ou_owner'];
-    bot.config.chatGrants = { oc_1: ['ou_guest'] };
+    bot.config.allowedChatGroups = ['oc_team'];
+    bot.config.chatGrants = { oc_1: ['ou_guest', 'ou_both'], oc_team: ['ou_guest'] };
+    bot.config.globalGrants = ['ou_global', 'ou_both'];
+  });
+
+  it.each([true, false])('email hiding preserves permission decisions with senderTag=%s', senderTag => {
+    const bot = getBot('g1');
+    bot.config.senderTag = senderTag;
+    const decisions = () => ['ou_owner', 'ou_guest', 'ou_stranger'].map(user => ({
+      talk: canTalk('g1', 'oc_1', user), operate: canOperate('g1', 'oc_1', user),
+    }));
+    const before = decisions();
+    bot.config.senderTagHideEmail = true;
+    expect(decisions()).toEqual(before);
+    expect(bot.resolvedAllowedUsers).toEqual(['ou_owner']);
   });
 
   it('chatGrant grants canTalk in that chat only', () => {
@@ -32,5 +46,107 @@ describe('grant gates', () => {
   it('allowed user still talks & operates everywhere', () => {
     expect(canTalk('g1', 'oc_9', 'ou_owner')).toBe(true);
     expect(canOperate('g1', 'oc_9', 'ou_owner')).toBe(true);
+  });
+
+  it('evaluateTalk exempts allowedUsers before quota-bearing grants', () => {
+    getBot('g1').config.chatGrants = { oc_1: ['ou_owner'] };
+    expect(evaluateTalk('g1', 'oc_1', 'ou_owner')).toEqual({ allowed: true, reason: 'allowedUser' });
+  });
+
+  it('evaluateTalk prefers allowedChatGroup over per-user grants', () => {
+    expect(evaluateTalk('g1', 'oc_team', 'ou_guest')).toEqual({ allowed: true, reason: 'allowedChatGroup' });
+  });
+
+  it('evaluateTalk prefers oncall over per-user grants', () => {
+    const bot = getBot('g1');
+    bot.config.oncallChats = [{ chatId: 'oc_oncall_quota', workingDir: '/tmp' }];
+    bot.config.chatGrants = { oc_oncall_quota: ['ou_guest'] };
+    expect(evaluateTalk('g1', 'oc_oncall_quota', 'ou_guest')).toEqual({ allowed: true, reason: 'oncall' });
+  });
+
+  /**
+   * 语义边界回归：`messageQuota.defaultLimit` 是**访客**额度（授权卡 / 自助申请），
+   * oncall 群不读它。历史病史见 event-dispatcher 的 oncallTalk 注释——它曾被一个讲
+   * 「授权卡继承 defaultLimit」的 commit 顺手接上，后果是同团队 peer bot 在 oncall 群
+   * 被访客额度连带计量（oncall 腿排在 peer/teamBot 之前 → 那两条腿结构上不可达），
+   * 耗尽后每条消息重发一张「额度已用尽」卡，而裸 /grant 清不掉计数器 = 群被锁死。
+   * 这条用例把「oncall 恒不挂 quotaKey」钉住：任何人把 defaultLimit 重新接回 oncall
+   * 都会在这里变红。
+   */
+  it('oncall never carries a quotaKey even with messageQuota.defaultLimit configured', () => {
+    const bot = getBot('g1');
+    bot.config.oncallChats = [{ chatId: 'oc_oncall_unmetered', workingDir: '/tmp' }];
+    bot.config.messageQuota = { defaultLimit: 30 };
+    try {
+      // 访客、以及同群持有 chatGrant 的人，在 oncall 群里一律不计量。
+      expect(evaluateTalk('g1', 'oc_oncall_unmetered', 'ou_visitor'))
+        .toEqual({ allowed: true, reason: 'oncall' });
+      bot.config.chatGrants = { oc_oncall_unmetered: ['ou_holder'] };
+      expect(evaluateTalk('g1', 'oc_oncall_unmetered', 'ou_holder'))
+        .toEqual({ allowed: true, reason: 'oncall' });
+      // 阴性对照：同一个 defaultLimit 对**非 oncall** 群的 chatGrant 仍然挂 quotaKey，
+      // 证明这条用例测的是「oncall 不读」，而不是「额度整体失效」。
+      bot.config.chatGrants = { ...bot.config.chatGrants, oc_plain: ['ou_holder'] };
+      expect(evaluateTalk('g1', 'oc_plain', 'ou_holder')).toEqual({
+        allowed: true, reason: 'chatGrant', quotaKey: 'chat:oc_plain:ou_holder',
+      });
+    } finally {
+      delete bot.config.messageQuota;
+    }
+  });
+
+  it('scopes oncall talk access to the bot that owns the binding', () => {
+    const botA = registerBot({
+      larkAppId: 'oncall_scope_a',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner_a'],
+      oncallChats: [{ chatId: 'oc_shared_oncall', workingDir: '/repo/a' }],
+    });
+    botA.resolvedAllowedUsers = ['ou_owner_a'];
+
+    const botB = registerBot({
+      larkAppId: 'oncall_scope_b',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner_b'],
+    });
+    botB.resolvedAllowedUsers = ['ou_owner_b'];
+
+    expect(canTalk('oncall_scope_a', 'oc_shared_oncall', 'ou_external')).toBe(true);
+    expect(canTalk('oncall_scope_b', 'oc_shared_oncall', 'ou_external')).toBe(false);
+    expect(canTalk('oncall_scope_b', 'oc_shared_oncall', 'ou_owner_b')).toBe(true);
+  });
+
+  it('evaluateTalk prefers chat grant over global grant and emits a chat quota key', () => {
+    expect(evaluateTalk('g1', 'oc_1', 'ou_both')).toEqual({
+      allowed: true,
+      reason: 'chatGrant',
+      quotaKey: 'chat:oc_1:ou_both',
+    });
+  });
+
+  it('evaluateTalk emits a global quota key for global grants', () => {
+    expect(evaluateTalk('g1', 'oc_9', 'ou_global')).toEqual({
+      allowed: true,
+      reason: 'globalGrant',
+      quotaKey: 'global:ou_global',
+    });
+  });
+
+  it('evaluateTalk keeps legacy open mode ahead of chat grants when no allowlist exists', () => {
+    const bot = registerBot({ larkAppId: 'g_open', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [] });
+    bot.resolvedAllowedUsers = [];
+    bot.config.chatGrants = { oc_open: ['ou_guest'] };
+    expect(evaluateTalk('g_open', 'oc_open', 'ou_guest')).toEqual({ allowed: true, reason: 'open' });
+  });
+
+  it('grantCommandRestriction only blocks chat/global grantees when the bot switch is on', () => {
+    expect(grantCommandRestriction('g1', 'oc_1', 'ou_guest')).toEqual({ blocked: false });
+    getBot('g1').config.restrictGrantCommands = true;
+    expect(grantCommandRestriction('g1', 'oc_1', 'ou_guest')).toEqual({ blocked: true, reason: 'chatGrant' });
+    expect(grantCommandRestriction('g1', 'oc_9', 'ou_global')).toEqual({ blocked: true, reason: 'globalGrant' });
+    expect(grantCommandRestriction('g1', 'oc_1', 'ou_owner')).toEqual({ blocked: false });
+    expect(grantCommandRestriction('g1', 'oc_team', 'ou_guest')).toEqual({ blocked: false });
   });
 });

@@ -1,0 +1,310 @@
+import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { resolveCommand } from './registry.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
+import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { piTurnBoundaryExtensionPath } from './pi.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
+
+import { findLatestJsonl } from '../../services/claude-transcript.js';
+import { drainOmpTranscript, type OmpTranscriptState } from '../../services/omp-transcript.js';
+import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
+
+export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
+
+const OMP_INPUT_CHUNK_CHARS = 512;
+const OMP_INPUT_CHUNK_NEWLINES = 9;
+const OMP_INPUT_THROTTLE_MS = 20;
+
+export function ompSessionDir(sessionId: string): string {
+  if (!sessionId || sessionId === '.' || sessionId === '..' || /[/\\]/.test(sessionId)) {
+    throw new Error(`Invalid Botmux session id for OMP: ${sessionId}`);
+  }
+  const lexicalHome = homedir();
+  let canonicalHome = lexicalHome;
+  try { canonicalHome = realpathSync(lexicalHome); } catch { /* lexical fallback */ }
+  return join(canonicalHome, '.omp', 'agent', 'sessions', 'botmux', sessionId);
+}
+
+export function ompTranscriptPath(sessionId: string): string | null {
+  return findLatestJsonl(ompSessionDir(sessionId));
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Match OMP's paste semantics before putting content on a key-event path. */
+function normalizeOmpInput(text: string): string {
+  return text
+    // Strip ANSI/VT sequences as whole units so removing ESC does not leave
+    // printable tails such as `[31m` in pasted terminal logs.
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[ -/]*[@-~]/g, '')
+    .replace(/\r\n?/g, '\n')
+    .normalize('NFC')
+    .replace(/\t/g, '   ')
+    // Literal terminal input would interpret these as keys (Backspace, DEL,
+    // Escape, etc.). Newlines are preserved and delivered inside paste mode.
+    .replace(/[\x00-\x09\x0B-\x1F\x7F-\x9F]/g, '');
+}
+
+/** Keep every paste below OMP's `[Paste #N]` thresholds (>1000 chars or >10 lines). */
+function chunkOmpInput(text: string): string[] {
+  const chunks: string[] = [];
+  let current = '';
+  let newlines = 0;
+  for (const ch of text) {
+    if (
+      current &&
+      (current.length + ch.length > OMP_INPUT_CHUNK_CHARS ||
+        (ch === '\n' && newlines >= OMP_INPUT_CHUNK_NEWLINES))
+    ) {
+      chunks.push(current);
+      current = '';
+      newlines = 0;
+    }
+    current += ch;
+    if (ch === '\n') newlines++;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function sendLiteral(pty: PtyHandle, text: string): boolean {
+  try {
+    if (pty.sendText) return pty.sendText(text) !== false;
+    pty.write(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pasteTextInSafeChunks(pty: PtyHandle, content: string): Promise<boolean> {
+  const chunks = chunkOmpInput(content);
+  for (const chunk of chunks) {
+    // Emit the markers ourselves instead of relying on backend pasteText():
+    // tmux/zellij implement bracketed paste, while herdr's pasteText is only a
+    // literal write. One explicit wire format keeps every backend equivalent.
+    if (!sendLiteral(pty, wrapBracketedPaste(chunk))) return false;
+    await delay(OMP_INPUT_THROTTLE_MS);
+  }
+  return true;
+}
+
+function submitEnter(pty: PtyHandle, attempts = 3): boolean {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      if (pty.sendSpecialKeys) {
+        if (pty.sendSpecialKeys('Enter') !== false) return true;
+      } else {
+        pty.write('\r');
+        return true;
+      }
+    } catch {
+      // retry below
+    }
+  }
+  return false;
+}
+
+/** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
+/** OMP isolated-session JSONL, addressed only by the botmux adapter session id (no pid
+ *  or cwd discovery). Holds a provisional terminal in driver state until a decisive
+ *  record or a quiet tick proves no plugin continuation follows. */
+export const ompBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainOmpTranscript(
+    path,
+    offset,
+    (ctx.state as OmpTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'drain',
+  locate: {
+    bySessionId: sessionId => ompTranscriptPath(sessionId) ?? undefined,
+  },
+  spawn: { sessionId: 'cli-or-adapter', baseline: 'resume-aware' },
+};
+
+export function createOhMyPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
+  const bin = resolveCommand(pathOverride ?? 'omp');
+  let composerDirty = false;
+  let lastClearAttemptAt = 0;
+
+  const clearComposer = async (pty: PtyHandle): Promise<boolean> => {
+    // OMP treats a second Ctrl+C within 500 ms as exit. Keep recovery clears
+    // outside that window even when the backend already injected the first one
+    // while recovering an ambiguous ZMX frame.
+    const mostRecentCancelAt = Math.max(
+      lastClearAttemptAt,
+      pty.lastInjectedCancelAt ?? 0,
+    );
+    const waitMs = TERMINAL_CANCEL_COOLDOWN_MS - (Date.now() - mostRecentCancelAt);
+    if (waitMs > 0) await delay(waitMs);
+    lastClearAttemptAt = Date.now();
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('C-c') !== false;
+      pty.write('\x03');
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  return {
+    id: 'oh-my-pi',
+    bridgeSpec: ompBridgeSpec,
+    authPaths: ['~/.omp/agent'],
+    resolvedBin: bin,
+
+    // oh-my-pi has no --session-id. Keep each Botmux session in its own OMP
+    // directory and resume only an exact transcript from that directory.
+    // Do NOT pass Lark prompts
+    // as positional launch args: OMP deposits those in the TUI composer but
+    // does not auto-submit them. Route prompts through writeInput, where botmux
+    // controls the final submit key.
+    buildArgs({
+      sessionId,
+      resume,
+      model,
+      workingDir,
+      disableCliBypass,
+      locale,
+      botName,
+      botOpenId,
+      replyDelivery,
+      triggerUserAuth,
+      larkToolAppId,
+      noTransport,
+      solo,
+      skillPluginDir,
+      env,
+      promptInjection,
+    }) {
+      const sessionDir = ompSessionDir(sessionId);
+      const args = ['--no-title'];
+      if (resume) {
+        const transcript = ompTranscriptPath(sessionId);
+        if (transcript) args.push('--resume', transcript);
+      }
+      args.push('--session-dir', sessionDir);
+      if (!disableCliBypass) {
+        args.push('--approval-mode', 'yolo');
+      }
+      if (model?.trim()) args.push('--model', model.trim());
+      if (workingDir) args.push('--cwd', workingDir);
+      if (promptInjection !== 'none') {
+        args.push('--plugin-dir', OMP_PLUGIN_DIR);
+        if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      }
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        larkToolAppId,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // the extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: OMP's CLI
+      // disables native automatic discovery of project/user/foreign APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict complex profile/project/overlay Settings precedence. Appending
+      // via the extension after native discovery completes preserves 100% faithful
+      // native Settings resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension for OMP; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+      args.push('--extension', turnBoundaryExt);
+
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
+      return args;
+    },
+
+    injectsSessionContext: true,
+    pluginDir: OMP_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
+
+    // OMP positional prompts are not an auto-submit channel; stdin injection is
+    // the reliable path.
+    passesInitialPromptViaArgs: false,
+
+    buildResumeCommand({ sessionId }) {
+      const transcript = ompTranscriptPath(sessionId);
+      if (!transcript) return null;
+      return `omp --resume ${shellQuote(transcript)} --session-dir ${shellQuote(ompSessionDir(sessionId))}`;
+    },
+
+    checkResumeTargetExists({ sessionId }) {
+      return ompTranscriptPath(sessionId) !== null;
+    },
+
+    async writeInput(pty: PtyHandle, content: string) {
+      const normalized = normalizeOmpInput(content);
+      if (!normalized) {
+        return {
+          submitted: false,
+          failureReason: 'OMP 输入清理控制字符后为空，未发送空消息。',
+        };
+      }
+
+      // A previous best-effort clear may itself have been dropped. Never append
+      // a new message to that unknown buffer: clear it successfully first.
+      if (composerDirty) {
+        if (!(await clearComposer(pty))) {
+          return {
+            submitted: false,
+            failureReason: 'OMP 输入框可能残留未完整消息，自动清理失败；请在终端按 Ctrl+C 清空后重试。',
+          };
+        }
+        composerDirty = false;
+      }
+
+      // OMP collapses a single large bracketed paste into `[Paste #N]`, whose
+      // immediately-following programmatic Enter can be ignored. Preserve paste
+      // sanitization (so tabs/newlines/control bytes are text, not key events),
+      // but split below both placeholder thresholds before the final real Enter.
+      const pasted = await pasteTextInSafeChunks(pty, normalized);
+      if (!pasted) {
+        composerDirty = !(await clearComposer(pty));
+        return { submitted: false };
+      }
+      if (!submitEnter(pty)) {
+        composerDirty = !(await clearComposer(pty));
+        return { submitted: false };
+      }
+      composerDirty = false;
+      return { submitted: true };
+    },
+
+    completionPattern: undefined,
+    readyPattern: undefined,
+    busyPattern: /Working(?:\.\.\.|…)/,
+    supportsTypeAhead: true,
+    systemHints: [],
+    altScreen: true,
+    skillsDir: '~/.omp/agent/skills',
+  };
+}

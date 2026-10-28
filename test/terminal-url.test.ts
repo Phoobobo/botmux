@@ -1,15 +1,78 @@
 // test/terminal-url.test.ts
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { config } from '../src/config.js';
-import { setTerminalProxyPort, resetTerminalProxy, buildTerminalUrl } from '../src/core/terminal-url.js';
+import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+import { deriveTerminalCardViewToken } from '../src/core/terminal-write-auth.js';
 
-const ds = { session: { sessionId: 'sess-123' }, workerPort: 9090, workerToken: 'wtok' };
+vi.mock('../src/global-config.js', () => ({
+  isRemoteAccessEnabled: vi.fn(() => false),
+}));
+vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
+  devboxDashboardBaseUrl: vi.fn(() => null),
+}));
+
+// Partial mock: platformTerminalBaseUrl is stubbed (no real platform.json on the
+// test box should leak in), but publicReverseProxyBaseUrl stays REAL — the
+// BOTMUX_PUBLIC_URL suite below drives it through process.env per test.
+vi.mock('../src/platform/binding.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
+  return {
+    ...actual,
+    platformTerminalBaseUrl: vi.fn(() => null),
+  };
+});
+
+import { isRemoteAccessEnabled } from '../src/global-config.js';
+import { platformTerminalBaseUrl } from '../src/platform/binding.js';
+import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
+
+import {
+  setTerminalProxyPort,
+  setTerminalExternalPort,
+  getTerminalAdvertisedPort,
+  resetTerminalProxy,
+  buildTerminalUrl,
+} from '../src/core/terminal-url.js';
+
+const ds = {
+  session: { sessionId: 'sess-123' },
+  workerPort: 9090,
+  workerToken: 'wtok',
+  workerViewToken: 'vtok',
+  workerCardViewToken: 'card-vtok',
+};
+
+// Keep the whole file hermetic w.r.t. BOTMUX_PUBLIC_URL, which buildTerminalUrl
+// now reads live and may be set in the shell running the suite (in prod it IS).
+// Clear it before every test so the default (local proxy/worker port) suites are
+// deterministic; the public-url suite below opts in per test. Restore on exit.
+const ORIGINAL_PUBLIC_URL = process.env.BOTMUX_PUBLIC_URL;
+beforeEach(() => {
+  delete process.env.BOTMUX_PUBLIC_URL;
+});
+afterAll(() => {
+  if (ORIGINAL_PUBLIC_URL === undefined) delete process.env.BOTMUX_PUBLIC_URL;
+  else process.env.BOTMUX_PUBLIC_URL = ORIGINAL_PUBLIC_URL;
+});
 
 describe('buildTerminalUrl', () => {
-  beforeEach(() => setTerminalProxyPort(8801));
+  beforeEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
+    setTerminalProxyPort(8801);
+  });
 
   it('builds a read-only sub-path URL on the proxy port', () => {
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=card-vtok`);
+  });
+
+  it('can preserve the per-worker token for dashboard generation-bound grants', () => {
+    expect(buildTerminalUrl(ds, { viewScope: 'worker' })).toBe(
+      `http://${config.web.externalHost}:8801/s/sess-123?viewToken=vtok`,
+    );
   });
 
   it('appends the worker token for write access', () => {
@@ -26,7 +89,137 @@ describe('buildTerminalUrl', () => {
 
   it('reflects an updated proxy port', () => {
     setTerminalProxyPort(8899);
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8899/s/sess-123`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8899/s/sess-123?viewToken=card-vtok`);
+  });
+});
+
+describe('buildTerminalUrl — platform remote access', () => {
+  beforeEach(() => {
+    setTerminalProxyPort(8801);
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(true);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue('https://t-machine.botmux.example');
+  });
+
+  afterEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
+    resetTerminalProxy();
+  });
+
+  it('uses the platform terminal subdomain for public read-only links', () => {
+    expect(buildTerminalUrl(ds)).toBe('https://t-machine.botmux.example/s/sess-123?viewToken=card-vtok');
+  });
+
+  it('preserves the private write token on platform links', () => {
+    expect(buildTerminalUrl(ds, { write: true })).toBe(
+      'https://t-machine.botmux.example/s/sess-123?token=wtok',
+    );
+  });
+});
+
+describe('buildTerminalUrl — WEB_EXTERNAL_PORT override', () => {
+  beforeEach(() => setTerminalProxyPort(8801));
+  afterEach(() => resetTerminalProxy());
+
+  it('advertises the external port instead of the local proxy port', () => {
+    setTerminalExternalPort(9000);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9000/s/sess-123?viewToken=card-vtok`);
+  });
+
+  it('keeps the external port when appending the write token', () => {
+    setTerminalExternalPort(9000);
+    expect(buildTerminalUrl(ds, { write: true })).toBe(
+      `http://${config.web.externalHost}:9000/s/sess-123?token=wtok`,
+    );
+  });
+
+  it('advertises the local proxy port when the external port is 0 (unset)', () => {
+    setTerminalExternalPort(0);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=card-vtok`);
+  });
+
+  it('ignores the external port in direct fallback mode (per-session ports win)', () => {
+    resetTerminalProxy();          // proxy never bound → direct worker ports
+    setTerminalExternalPort(9000); // even with an external port configured...
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090?viewToken=card-vtok`); // ...the worker port is used
+  });
+});
+
+// The dashboard builds its own terminal link (dashboard-rows → sessions.ts
+// terminalHref) from the advertised port, NOT buildTerminalUrl — so the shared
+// getter must agree with the card links or the dashboard "open terminal" entry
+// points at the wrong port (e.g. local 8800 while the relay only listens on 9000).
+describe('getTerminalAdvertisedPort — shared port for card + dashboard links', () => {
+  beforeEach(() => setTerminalProxyPort(8801));
+  afterEach(() => resetTerminalProxy());
+
+  it('returns the external port when WEB_EXTERNAL_PORT is configured', () => {
+    setTerminalExternalPort(9000);
+    expect(getTerminalAdvertisedPort()).toBe(9000);
+  });
+
+  it('returns the bound proxy port when no external port is set', () => {
+    expect(getTerminalAdvertisedPort()).toBe(8801);
+  });
+
+  it('returns 0 when the proxy never bound, even with an external port set', () => {
+    resetTerminalProxy();
+    setTerminalExternalPort(9000);
+    expect(getTerminalAdvertisedPort()).toBe(0);
+  });
+});
+
+// Self-hosted reverse proxy (nginx etc.) in front of the dashboard, no central
+// platform binding. Setting BOTMUX_PUBLIC_URL makes card terminal links route
+// through the dashboard front door `<base>/s/<id>` — no per-bot proxy port, one
+// domain for every bot. Token is kept (no platform SSO to gate write access).
+describe('buildTerminalUrl — BOTMUX_PUBLIC_URL (self-hosted reverse proxy)', () => {
+  beforeEach(() => setTerminalProxyPort(8801));
+  afterEach(() => {
+    resetTerminalProxy();
+    delete process.env.BOTMUX_PUBLIC_URL;
+  });
+
+  it('routes read-only links through the front door with no port', () => {
+    process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com';
+    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123?viewToken=card-vtok');
+  });
+
+  it('keeps the write token on the front-door link (no platform SSO here)', () => {
+    process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com';
+    expect(buildTerminalUrl(ds, { write: true })).toBe(
+      'https://botmux.example.com/s/sess-123?token=wtok',
+    );
+  });
+
+  it('trims a trailing slash on the configured base', () => {
+    process.env.BOTMUX_PUBLIC_URL = 'https://botmux.example.com/';
+    expect(buildTerminalUrl(ds)).toBe('https://botmux.example.com/s/sess-123?viewToken=card-vtok');
+  });
+
+  it('overrides the local proxy-port form when set', () => {
+    process.env.BOTMUX_PUBLIC_URL = 'http://botmux.example.com';
+    // even with a proxy port bound, the public base wins over host:8801
+    expect(buildTerminalUrl(ds)).toBe('http://botmux.example.com/s/sess-123?viewToken=card-vtok');
+  });
+
+  it('falls back to the local proxy port when unset', () => {
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:8801/s/sess-123?viewToken=card-vtok`);
+  });
+});
+
+describe('buildTerminalUrl — Merlin Devbox export', () => {
+  beforeEach(() => setTerminalProxyPort(8801));
+  afterEach(() => {
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
+    resetTerminalProxy();
+  });
+
+  it('routes terminal links through the cached Devbox front door', () => {
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue('https://devbox.example.com');
+    expect(buildTerminalUrl(ds)).toBe(
+      'https://devbox.example.com/s/sess-123?viewToken=card-vtok',
+    );
   });
 });
 
@@ -34,7 +227,7 @@ describe('buildTerminalUrl — proxy unavailable fallback', () => {
   beforeEach(() => resetTerminalProxy());
 
   it('falls back to the direct worker port when the proxy never bound', () => {
-    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090`);
+    expect(buildTerminalUrl(ds)).toBe(`http://${config.web.externalHost}:9090?viewToken=card-vtok`);
   });
 
   it('falls back with the write token appended', () => {
@@ -46,5 +239,63 @@ describe('buildTerminalUrl — proxy unavailable fallback', () => {
   it('uses the persisted session.webPort when the worker port is null', () => {
     const restored = { session: { sessionId: 's3', webPort: 7070 }, workerPort: null, workerToken: null };
     expect(buildTerminalUrl(restored)).toBe(`http://${config.web.externalHost}:7070`);
+  });
+});
+
+// #2279：恢复后没有 worker 的会话，卡片被重建时链接仍要带 card 读能力。worker
+// 的 ready token 只在 daemon 内存里，恢复后为 null；读链接改由 daemon 按落盘的
+// terminalCardEpoch 派生同一枚 token（worker 侧 refreshTerminalCardViewToken 同源，
+// worker-terminal-read-auth 集成用例验证被唤醒的 worker 认它）。
+describe('buildTerminalUrl — restored session without a worker (#2279)', () => {
+  const secret = 'restored-card-secret';
+  const restored = {
+    session: { sessionId: 'sess-restored', terminalCardEpoch: 'card-epoch-1' },
+    workerPort: null,
+    workerToken: null,
+    workerViewToken: null,
+    workerCardViewToken: null,
+  };
+  const bare = () => `http://${config.web.externalHost}:8801/s/sess-restored`;
+
+  beforeEach(() => {
+    vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
+    vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
+    setTerminalProxyPort(8801);
+    // homedir() 在单测里被 unit-setup 围到本文件的临时 HOME。
+    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+  });
+  afterEach(() => {
+    rmSync(dashboardSecretPath(), { force: true });
+    resetTerminalProxy();
+  });
+
+  it('carries the card capability derived from the persisted epoch', () => {
+    expect(buildTerminalUrl(restored)).toBe(`${bare()}?viewToken=${
+      encodeURIComponent(deriveTerminalCardViewToken(secret, 'sess-restored', 'card-epoch-1'))
+    }`);
+  });
+
+  it('keeps a live worker\'s reported card token ahead of the derived one', () => {
+    expect(buildTerminalUrl({ ...restored, workerCardViewToken: 'live-card' }))
+      .toBe(`${bare()}?viewToken=live-card`);
+  });
+
+  it('keeps the dashboard worker-generation scope on the live boot token only', () => {
+    expect(buildTerminalUrl(restored, { viewScope: 'worker' })).toBe(bare());
+  });
+
+  it('never puts the read capability on a write link', () => {
+    expect(buildTerminalUrl(restored, { write: true })).toBe(bare());
+  });
+
+  it('leaves the link bare when the secret is unavailable', () => {
+    rmSync(dashboardSecretPath(), { force: true });
+    expect(buildTerminalUrl(restored)).toBe(bare());
+  });
+
+  it('leaves the link bare for a session that never got a card epoch', () => {
+    expect(buildTerminalUrl({ ...restored, session: { sessionId: 'sess-restored' } })).toBe(bare());
   });
 });

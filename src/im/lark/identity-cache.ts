@@ -2,15 +2,17 @@
  * User / bot identity cache for prompt injection.
  *
  * Lark events only carry the sender's open_id (no name). To inject a
- * `<sender name="张三" ... />` tag into the CLI prompt we need a name → open_id
- * dictionary. Three population sources, ordered by cost:
+ * `<sender name="张三" email="zhangsan@example.com" ... />` tag into the CLI
+ * prompt we need an identity dictionary keyed by open_id. Three population
+ * sources, ordered by cost:
  *
  *   1. mentions — free. Lark mention payloads carry (name, open_id) pairs,
  *      so every @ that flows through us teaches the cache.
  *   2. sender — free, but only learns open_id + type, not name.
- *   3. contact API — `contact.v3.user.get` for users; only used as fallback
- *      when 1+2 didn't give us a name. Requires `contact:user.base:readonly`
- *      (already in `BOTMUX_REQUIRED_SCOPES`).
+ *   3. contact API — `contact.v3.user.get` for users; used to fill a missing
+ *      name and email. Requires `contact:user.base:readonly` plus
+ *      `contact:user.email:readonly` for the email field (both are already in
+ *      the setup scope manifest).
  *
  * Scope: per Lark app. Open_id values are app-scoped on Lark's side, so the
  * cache file follows the same `identities-${larkAppId}.json` shape as the
@@ -23,7 +25,8 @@ import { join, dirname } from 'node:path';
 import { getBotClient } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { larkGet } from './client.js';
+import { larkGet, getMessageDetail, getLarkErrorCode } from './client.js';
+import { LARK_CODE_APP_SCOPE_MISSING, classifyContactErrorCode } from './lark-errors.js';
 
 export type IdentityType = 'user' | 'bot' | 'app' | 'unknown';
 
@@ -31,7 +34,10 @@ export interface IdentityRecord {
   openId: string;
   type: IdentityType;
   name?: string;
-  source: 'sender' | 'mention' | 'contact_api' | 'bot_cross_ref' | 'bot_info';
+  email?: string;
+  /** A successful contact API lookup, including a valid "no email" result. */
+  contactResolvedAt?: number;
+  source: 'sender' | 'mention' | 'contact_api' | 'message_api' | 'bot_cross_ref' | 'bot_info';
   updatedAt: number;
 }
 
@@ -109,14 +115,21 @@ export function flushIdentityCacheSync(): void {
 }
 
 /**
- * Merge a partial identity record into the cache. Existing `name` is preserved
- * unless the incoming record carries a real name (no clobbering). Existing
- * `type` is only overridden when the incoming value is more specific
- * (anything other than `unknown`).
+ * Merge a partial identity record into the cache. Existing `name` and `email`
+ * are preserved unless the incoming record carries a real value (no
+ * clobbering). Existing `type` is only overridden when the incoming value is
+ * more specific (anything other than `unknown`).
  */
 export function recordIdentity(
   larkAppId: string,
-  rec: { openId: string; type?: IdentityType; name?: string; source?: IdentityRecord['source'] },
+  rec: {
+    openId: string;
+    type?: IdentityType;
+    name?: string;
+    email?: string;
+    contactResolvedAt?: number;
+    source?: IdentityRecord['source'];
+  },
 ): void {
   if (!rec.openId) return;
   const store = getStore(larkAppId);
@@ -126,12 +139,20 @@ export function recordIdentity(
     openId: rec.openId,
     type: incomingType ?? existing?.type ?? 'unknown',
     name: rec.name ?? existing?.name,
+    email: rec.email ?? existing?.email,
+    contactResolvedAt: rec.contactResolvedAt ?? existing?.contactResolvedAt,
     source: rec.source ?? existing?.source ?? 'sender',
     updatedAt: Date.now(),
   };
   // Skip persist when nothing meaningful changed — avoids disk churn from
   // every sender event re-bumping updatedAt.
-  if (existing && existing.type === merged.type && existing.name === merged.name) {
+  if (
+    existing
+    && existing.type === merged.type
+    && existing.name === merged.name
+    && existing.email === merged.email
+    && existing.contactResolvedAt === merged.contactResolvedAt
+  ) {
     return;
   }
   store.set(rec.openId, merged);
@@ -173,13 +194,27 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
   if (!openId) return undefined;
   const cached = getIdentity(larkAppId, openId);
   if (cached?.name) return cached.name;
+  await ensureContactProfile(larkAppId, openId);
+  return getIdentity(larkAppId, openId)?.name;
+}
+
+/**
+ * Ensure a human identity has had one successful contact profile lookup.
+ * Unlike resolveName, this intentionally does not short-circuit on a cached
+ * display name: name may have come from a mention/message while email is still
+ * unknown. Successful empty profiles are negative-cached via contactResolvedAt.
+ */
+async function ensureContactProfile(larkAppId: string, openId: string): Promise<void> {
+  if (!openId) return;
+  const cached = getIdentity(larkAppId, openId);
+  if (cached?.contactResolvedAt) return;
   if (cached?.type === 'bot' || cached?.type === 'app') return undefined;
-  if (scopeUnavailable.has(larkAppId)) return undefined;
+  if (scopeUnavailable.has(larkAppId)) return;
 
   const key = `${larkAppId}:${openId}`;
   let pending = inflight.get(key);
   if (!pending) {
-    pending = fetchUserName(larkAppId, openId);
+    pending = fetchUserProfile(larkAppId, openId);
     inflight.set(key, pending);
     // Identity-guarded cleanup. A request that times out is evicted by the
     // catch below; if its underlying fetch later settles, we must NOT clobber
@@ -187,9 +222,9 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
     // newer caller. Comparing by reference catches both this race and the
     // simple "settled normally" case.
     //
-    // `.then(cleanup, cleanup)` (not `.finally`) so a future fetchUserName
+    // `.then(cleanup, cleanup)` (not `.finally`) so a future fetchUserProfile
     // refactor that rejects can't leave the returned cleanup promise as an
-    // unhandled rejection. Current fetchUserName swallows everything to
+    // unhandled rejection. Current fetchUserProfile swallows everything to
     // logger.debug, but that's an undocumented invariant we shouldn't rely on.
     const local = pending;
     const cleanup = () => { if (inflight.get(key) === local) inflight.delete(key); };
@@ -209,24 +244,35 @@ export async function resolveName(larkAppId: string, openId: string): Promise<st
     // rejection and this line.
     if (inflight.get(key) === pending) inflight.delete(key);
   }
-  return getIdentity(larkAppId, openId)?.name;
 }
 
-async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
+async function fetchUserProfile(larkAppId: string, openId: string): Promise<void> {
   try {
     const c = getBotClient(larkAppId);
     const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
       user_id_type: 'open_id',
     });
     if (res?.code === 0) {
-      const name: string | undefined = res.data?.user?.name;
-      if (name) {
-        recordIdentity(larkAppId, { openId, name, type: 'user', source: 'contact_api' });
-      }
+      const rawName: unknown = res.data?.user?.name;
+      const rawEmail: unknown = res.data?.user?.email;
+      const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+      const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+      // Mark a successful lookup even when email is absent. Without this
+      // negative cache, users who do not have an email would trigger a contact
+      // API request on every message. Failed/time-out lookups never set it, so
+      // a later turn can retry.
+      recordIdentity(larkAppId, {
+        openId,
+        name,
+        email,
+        contactResolvedAt: Date.now(),
+        type: 'user',
+        source: 'contact_api',
+      });
       return;
     }
     // 99991672 = app身份缺权限 (contact:user.base:readonly 没开)
-    if (res?.code === 99991672) {
+    if (res?.code === LARK_CODE_APP_SCOPE_MISSING) {
       if (!scopeUnavailable.has(larkAppId)) {
         scopeUnavailable.add(larkAppId);
         logger.warn(
@@ -245,6 +291,46 @@ async function fetchUserName(larkAppId: string, openId: string): Promise<void> {
   }
 }
 
+/**
+ * Best-effort name resolution via `im.v1.messages.get` with `with_sender_name=true`.
+ * Unlike the contact API this covers BOTH user and bot senders and does NOT
+ * require `contact:user.base:readonly` — the server returns the display name
+ * for whoever sent the given message. Used as a last-resort fallback in the
+ * live-event path, where the event itself carries only open_id.
+ *
+ * Best-effort: any failure (network, permission, message not found, name
+ * absent) degrades silently to `undefined`. Wrapped in the same short budget
+ * as the contact path so a slow API can't stall prompt injection. On success
+ * the name is written to the cache keyed by the resolved sender's open_id, so
+ * later messages from the same sender hit the cache without a re-fetch.
+ */
+export async function resolveNameViaMessage(
+  larkAppId: string,
+  openId: string,
+  messageId: string,
+  type: 'user' | 'bot',
+): Promise<string | undefined> {
+  if (!openId || !messageId) return undefined;
+  try {
+    const detail = await withTimeout(
+      getMessageDetail(larkAppId, messageId, { userCardContent: false }),
+      RESOLVE_BUDGET_MS,
+    );
+    const sender = detail?.items?.[0]?.sender;
+    const name: unknown = sender?.sender_name;
+    if (typeof name === 'string' && name.trim()) {
+      const trimmed = name.trim();
+      recordIdentity(larkAppId, { openId, name: trimmed, type, source: 'message_api' });
+      return trimmed;
+    }
+  } catch (err: any) {
+    logger.debug(
+      `[identity] message.get sender_name for ${openId.substring(0, 12)} via ${messageId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+  }
+  return undefined;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(() => reject(new Error('identity-resolve-timeout')), ms);
@@ -259,6 +345,255 @@ export interface ResolvedSender {
   openId: string;
   type: 'user' | 'bot';
   name?: string;
+  email?: string;
+}
+
+/**
+ * Resolve a human user from the authoritative contact API for a
+ * security-sensitive current-turn identity check. Unlike resolveSender(), this
+ * deliberately bypasses the persisted display cache: an old cached email must
+ * not authorize a new credential operation.
+ */
+export async function resolveVerifiedUserIdentity(
+  larkAppId: string,
+  openId: string,
+): Promise<{ openId: string; type: 'user'; name?: string; email?: string } | undefined> {
+  if (!openId) return undefined;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
+    });
+    const user = res?.code === 0 ? res?.data?.user : undefined;
+    if (!user) return undefined;
+    const rawName: unknown = user.name;
+    const rawEmail: unknown = user.enterprise_email ?? user.email;
+    const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+    const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+    recordIdentity(larkAppId, {
+      openId,
+      name,
+      email,
+      contactResolvedAt: Date.now(),
+      type: 'user',
+      source: 'contact_api',
+    });
+    return { openId, type: 'user', name, email };
+  } catch (err: any) {
+    logger.debug(
+      `[identity] strict contact lookup for ${openId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
+}
+
+interface VerifiedUnionIdentity {
+  openId: string;
+  unionId: string;
+  type: 'user';
+  name?: string;
+  email?: string;
+}
+
+/**
+ * HTTP budget for the strict bot-owner lookup. This runs on the inbound
+ * admission path (every recognised team-bot turn), so it must be far tighter
+ * than the SDK-wide 15s fallback while still giving a healthy Contact API
+ * time to answer.
+ */
+const STRICT_OWNER_RESOLVE_BUDGET_MS = 3_000;
+/**
+ * How long a DETERMINISTIC negative (the contact API answered but the person
+ * cannot mint an owner: invisible / no open_id / union_id mismatch / no
+ * email, or a definitive contact error code) suppresses repeat lookups.
+ * Transient failures are never cached. Roster membership already propagates
+ * with delay, so a sub-minute staleness bound here does not change when an
+ * owner can take effect.
+ */
+const OWNER_NEGATIVE_CACHE_TTL_MS = 60_000;
+/** Bound on remembered negatives. The real key space is app × roster owners
+ *  and stays tiny; this only guards an unbounded roster. Mirrors
+ *  userProfileCache's cap in client.ts. */
+const OWNER_NEGATIVE_CACHE_MAX = 1_000;
+const ownerInflightUnions = new Map<string, Promise<VerifiedUnionIdentity | undefined>>();
+const ownerNegativeUnions = new Map<string, number>();
+/**
+ * Attempt identity per key: every NEW fetch (only created after the previous
+ * attempt was evicted) gets a fresh token. A budget-expired fetch is NOT
+ * cancelled — the SDK's token POST cannot be aborted and its business request
+ * may already be in flight — so it can settle AFTER a newer attempt started.
+ * Its verdict must not then overwrite the newer attempt's conclusions (a stale
+ * 41050 would otherwise suppress a just-verified owner for a full TTL; a stale
+ * 99991672 would trip the scope breaker under a recovering app). Every
+ * credential-affecting side write compares against this token first.
+ */
+const ownerAttemptTokens = new Map<string, number>();
+let ownerAttemptSeq = 0;
+
+export const __testOnly_ownerNegativeCacheSize = (): number => ownerNegativeUnions.size;
+
+function rememberOwnerNegative(key: string, attemptToken: number): void {
+  if (ownerAttemptTokens.get(key) !== attemptToken) return;
+  if (ownerNegativeUnions.size >= OWNER_NEGATIVE_CACHE_MAX) ownerNegativeUnions.clear();
+  ownerNegativeUnions.set(key, Date.now());
+}
+
+/** Trip the SHARED per-app scope breaker (also used by sender name resolution)
+ *  when contact:user.base:readonly is missing. This SDK is axios-based, so
+ *  99991672 arrives both as an HTTP-200 body code and as a thrown AxiosError —
+ *  callers from either shape must land here. Gated by the attempt token: a
+ *  stale fetch from an evicted attempt must not flip the breaker while a newer
+ *  attempt for the same app is already succeeding. */
+function tripOwnerScopeBreaker(larkAppId: string, negativeKey: string, attemptToken: number): void {
+  if (ownerAttemptTokens.get(negativeKey) !== attemptToken) return;
+  if (scopeUnavailable.has(larkAppId)) return;
+  scopeUnavailable.add(larkAppId);
+  logger.warn(
+    `[identity] [${larkAppId}] contact:user.base:readonly 未开通，bot owner 解析将跳过 Contact API (code=99991672)`,
+  );
+}
+
+/**
+ * Resolve a deployment-configured Owner union_id through the receiving bot app.
+ *
+ * Admission-path protections (mirroring ensureContactProfile's shape):
+ * - a strict wall-clock budget over the WHOLE SDK call, INCLUDING the SDK's
+ *   await on tenant-token acquisition — that token POST carries no per-request
+ *   timeout, so without this race a cold start / token refresh could add the
+ *   SDK-wide 15s default before the business request's own timeout starts;
+ * - a per-app scope breaker (99991672, body OR thrown shape) so a bot missing
+ *   `contact:user.base:readonly` does not fire a doomed request every turn;
+ * - in-flight de-duplication for concurrent turns of the same owner;
+ * - a short negative cache for deterministic "cannot mint an owner" answers:
+ *   a code-0 unusable payload AND definitive error codes (41050 not-visible /
+ *   41012 / 40001 / 99992361), in both body and thrown shapes;
+ * - attempt-token fencing: a fetch whose budget expired keeps running (it
+ *   cannot be aborted mid-flight), but its late verdict is discarded unless it
+ *   is still the current attempt — stale negatives never override a newer
+ *   conclusion.
+ * Successful results are intentionally NOT cached: botOwner is credential
+ * material and, like resolveVerifiedUserIdentity, must be read fresh on every
+ * turn (a stale email/open_id must never authorize a new credential choice).
+ * Transient errors (timeout/network/other API codes) stay retryable.
+ */
+export async function resolveVerifiedUserIdentityByUnionId(
+  larkAppId: string,
+  unionId: string,
+): Promise<VerifiedUnionIdentity | undefined> {
+  if (!unionId.startsWith('on_')) return undefined;
+  if (scopeUnavailable.has(larkAppId)) return undefined;
+  const key = `${larkAppId}:${unionId}`;
+  const negativeAt = ownerNegativeUnions.get(key);
+  if (negativeAt !== undefined) {
+    if (Date.now() - negativeAt < OWNER_NEGATIVE_CACHE_TTL_MS) return undefined;
+    ownerNegativeUnions.delete(key);
+  }
+  let pending = ownerInflightUnions.get(key);
+  if (!pending) {
+    const attemptToken = ++ownerAttemptSeq;
+    ownerAttemptTokens.set(key, attemptToken);
+    pending = fetchVerifiedUnionIdentity(larkAppId, unionId, key, attemptToken);
+    ownerInflightUnions.set(key, pending);
+  }
+  try {
+    // Each waiter races the SAME shared fetch against its own budget, so a
+    // stall BEFORE the axios request (token fetch) is covered as well.
+    return await withTimeout(pending, STRICT_OWNER_RESOLVE_BUDGET_MS);
+  } catch {
+    // Budget elapsed: fail closed to undefined. The fetch is NOT cancelled —
+    // the SDK token POST takes no abort signal and the business request may be
+    // in flight — so it can settle AFTER eviction, potentially after a newer
+    // attempt already concluded. Its side writes (negative cache, scope
+    // breaker) are attempt-token gated inside fetchVerifiedUnionIdentity, and
+    // its late return value reaches only waiters that all already resolved
+    // undefined. Eviction lets the next turn start a fresh attempt.
+    return undefined;
+  } finally {
+    // Identity guard: a caller whose budget expired must not evict a newer
+    // attempt that already replaced this map entry.
+    if (ownerInflightUnions.get(key) === pending) ownerInflightUnions.delete(key);
+  }
+}
+
+async function fetchVerifiedUnionIdentity(
+  larkAppId: string,
+  unionId: string,
+  negativeKey: string,
+  attemptToken: number,
+): Promise<VerifiedUnionIdentity | undefined> {
+  try {
+    const c = getBotClient(larkAppId);
+    // timeoutMs caps the business HTTP request at the transport layer; the
+    // caller's withTimeout wraps the whole call and covers token acquisition.
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(unionId)}`, {
+      user_id_type: 'union_id',
+    }, { timeoutMs: STRICT_OWNER_RESOLVE_BUDGET_MS });
+    if (res?.code === 0) {
+      const user = res?.data?.user;
+      const openId = typeof user?.open_id === 'string' ? user.open_id.trim() : '';
+      const returnedUnionId = typeof user?.union_id === 'string' ? user.union_id.trim() : unionId;
+      const rawName: unknown = user?.name;
+      const rawEmail: unknown = user?.enterprise_email ?? user?.email;
+      const name = typeof rawName === 'string' && rawName.trim() ? rawName.trim() : undefined;
+      const email = typeof rawEmail === 'string' && rawEmail.trim() ? rawEmail.trim() : undefined;
+      const usable = openId.startsWith('ou_')
+        && returnedUnionId === unionId
+        && !!email && email.includes('@');
+      if (!usable) {
+        // Deterministic negative: suppress for one TTL instead of hitting the
+        // Contact API on every bot turn for a roster row that can never mint.
+        // Token-gated: a code-0 unusable answer arriving from an evicted
+        // attempt must not override a newer attempt that already succeeded.
+        rememberOwnerNegative(negativeKey, attemptToken);
+        return undefined;
+      }
+      recordIdentity(larkAppId, {
+        openId,
+        name,
+        email,
+        contactResolvedAt: Date.now(),
+        type: 'user',
+        source: 'contact_api',
+      });
+      return { openId, unionId: returnedUnionId, type: 'user', name, email };
+    }
+    if (res?.code === LARK_CODE_APP_SCOPE_MISSING) {
+      tripOwnerScopeBreaker(larkAppId, negativeKey, attemptToken);
+      return undefined;
+    }
+    // Definitive per-owner codes arriving in a non-zero body get the same TTL
+    // suppression as a code-0 unusable payload (41050 not-visible / 41012 /
+    // 40001 / 99992361). Without this, an owner the app can never see costs a
+    // Contact API call on every bot turn.
+    if (classifyContactErrorCode(res?.code)) {
+      rememberOwnerNegative(negativeKey, attemptToken);
+      return undefined;
+    }
+    // Other API codes may be transient — do not negative-cache, let the next
+    // turn retry (fail closed in the meantime).
+    logger.debug(
+      `[identity] strict union contact lookup for ${unionId.substring(0, 12)} code=${res?.code} msg=${res?.msg ?? ''}`,
+    );
+    return undefined;
+  } catch (err: any) {
+    // This SDK is axios-based: non-2xx responses THROW and the business code
+    // lives in err.response.data.code. Classify the SAME two shapes here —
+    // otherwise neither the scope breaker nor the negative cache ever trips in
+    // deployments/gateways where these errors arrive as exceptions.
+    const code = getLarkErrorCode(err);
+    if (code === LARK_CODE_APP_SCOPE_MISSING) {
+      tripOwnerScopeBreaker(larkAppId, negativeKey, attemptToken);
+      return undefined;
+    }
+    if (classifyContactErrorCode(code)) {
+      rememberOwnerNegative(negativeKey, attemptToken);
+      return undefined;
+    }
+    logger.debug(
+      `[identity] strict contact lookup for ${unionId.substring(0, 12)} failed: ${err?.message ?? err}`,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -270,12 +605,23 @@ export interface ResolvedSender {
  * lookups, and best-effort resolve the display name. Caller-supplied hints
  * (e.g. a known foreign-bot display name from `bot-openids-${appId}.json`)
  * win over cache.
+ *
+ * Identity resolution order:
+ *   1. hint / cache — free, in-memory.
+ *   2. contact API — users only; fills missing name/email and needs
+ *      `contact:user.base:readonly` plus `contact:user.email:readonly` for
+ *      email. A successful no-email result is negatively cached.
+ *   3. message.get(`with_sender_name=true`) — fallback when `messageId` is
+ *      supplied and steps 1–2 came up empty. Covers users AND bots, and works
+ *      without the contact scope (the server names whoever sent that message).
+ *      This is what lets the live-event `<sender>` tag carry a name even when
+ *      contact is unavailable / out of visible range / the sender is a bot.
  */
 export async function resolveSender(
   larkAppId: string,
   openId: string | undefined,
   senderType: string | undefined,
-  hint?: { name?: string; type?: 'user' | 'bot' },
+  hint?: { name?: string; type?: 'user' | 'bot'; messageId?: string },
 ): Promise<ResolvedSender | undefined> {
   if (!openId) return undefined;
 
@@ -290,9 +636,22 @@ export async function resolveSender(
 
   recordIdentity(larkAppId, { openId, type, source: 'sender' });
 
-  let name = hint?.name ?? getIdentity(larkAppId, openId)?.name;
-  if (!name && type === 'user') {
-    name = await resolveName(larkAppId, openId);
+  let identity = getIdentity(larkAppId, openId);
+  let name = hint?.name ?? identity?.name;
+  if (type === 'user' && (!name || !identity?.contactResolvedAt)) {
+    // Call even when a mention already supplied name if this cache record has
+    // never been contact-enriched: old name-only caches must get one chance to
+    // learn email.
+    await ensureContactProfile(larkAppId, openId);
+    identity = getIdentity(larkAppId, openId);
+    name ??= identity?.name;
   }
-  return { openId, type, name };
+  // Last-resort fallback: server-side sender_name via message.get. Covers the
+  // gap the contact API can't (bots, missing scope, out-of-range users) but
+  // only when the caller knows which message this sender is attached to.
+  if (!name && hint?.messageId) {
+    name = await resolveNameViaMessage(larkAppId, openId, hint.messageId, type);
+  }
+  const email = type === 'user' ? identity?.email : undefined;
+  return { openId, type, name, email };
 }

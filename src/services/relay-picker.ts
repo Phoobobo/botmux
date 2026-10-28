@@ -7,7 +7,10 @@
  * Selection rules:
  *   • same bot (this larkAppId — only this daemon's sessions are visible)
  *   • NOT in the current chat (can't relay into the chat it already lives in)
- *   • operator is the session owner (owner-only access)
+ *   • operator is the session owner (owner-only access) — ownerless
+ *     sessions (ownerOpenId unset, e.g. alert-listener spawned) are
+ *     visible to every operator, matching the relay_confirm / /relay
+ *     --create owner gates
  *   • not an adopt session (those wrap a user-attached tmux pane, refused
  *     by transferSession anyway)
  *
@@ -20,18 +23,23 @@ import type { DaemonSession } from '../core/types.js';
 import type { RelayPickerEntry } from '../im/lark/card-builder.js';
 import { getChatNameAndMode } from '../im/lark/client.js';
 import { isRelayableRealSession } from '../core/worker-pool.js';
+import { sessionAnchorId } from '../core/types.js';
 
 export async function collectRelayPickerEntries(
   activeSessions: Map<string, DaemonSession>,
   myAppId: string,
-  currentChatId: string,
+  /** The relay TARGET anchor (chatId for chat-scope, rootMessageId for a 话题).
+   *  We exclude only the session sitting AT this anchor (can't relay onto
+   *  itself); same-chat other-topic sessions have a different anchor and stay
+   *  in the candidate list — that's what enables 同群话题间搬运. */
+  currentAnchor: string,
   operatorOpenId: string,
 ): Promise<RelayPickerEntry[]> {
   const candidates: DaemonSession[] = [];
   for (const c of activeSessions.values()) {
     if (c.larkAppId !== myAppId) continue;
-    if (c.chatId === currentChatId) continue;
-    if (c.session.ownerOpenId !== operatorOpenId) continue;
+    if (sessionAnchorId(c) === currentAnchor) continue;
+    if (c.session.ownerOpenId && c.session.ownerOpenId !== operatorOpenId) continue;
     if (c.session.adoptedFrom) continue;
     // Daemon-command scratches (worker:null + no persisted CLI markers)
     // are placeholder records for /help / unfinished /relay etc. — they

@@ -1,0 +1,168 @@
+// `botmux bind <blob>` —— 把这台机器绑定到中心化平台。
+// <blob> 是平台网页生成的自包含凭证（内含平台地址 + 绑定 token），
+// 因此本仓库源码里不出现任何平台域名。
+import { randomBytes } from 'node:crypto';
+import { hostname, homedir } from 'node:os';
+import { join } from 'node:path';
+import { readPlatformBinding, writePlatformBinding } from './binding.js';
+import { postJson, type PostJsonResult } from './platform-http.js';
+import { callDashboard } from '../cli/dashboard-endpoint.js';
+import { formatDashboardSuccessLines } from '../cli/dashboard-command.js';
+import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
+import { isManagedAgentHostCommandContext } from './host-command-context.js';
+
+export interface BindCommandDependencies {
+  isAgentContext?: () => boolean;
+}
+
+/** 解码平台生成的 bind blob：base64url(JSON{u:平台地址, t:绑定token})。 */
+function decodeBindBlob(blob: string): { platformUrl: string; token: string } | null {
+  try {
+    const obj = JSON.parse(Buffer.from(blob, 'base64url').toString('utf8'));
+    if (obj && typeof obj.u === 'string' && typeof obj.t === 'string') {
+      return { platformUrl: obj.u.replace(/\/$/, ''), token: obj.t };
+    }
+  } catch {
+    /* not a blob */
+  }
+  return null;
+}
+
+export async function cmdBind(
+  args: string[],
+  dependencies: BindCommandDependencies = {},
+): Promise<void> {
+  // Refuse before parsing/decoding the one-time bind credential or touching the
+  // network. The OS mask is the security boundary; this guard prevents a user
+  // from accidentally handing a reusable host-authority command to an agent.
+  if ((dependencies.isAgentContext ?? isManagedAgentHostCommandContext)()) {
+    console.error('❌ botmux bind 只能在宿主终端执行；AI CLI 会话不能消费绑定凭证或修改机器归属。');
+    process.exitCode = 2;
+    return;
+  }
+  let arg = '';
+  let platformOverride = '';
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--platform' || a === '-p') platformOverride = args[++i] || '';
+    else if (a.startsWith('--platform=')) platformOverride = a.slice('--platform='.length);
+    else if (!a.startsWith('-') && !arg) arg = a;
+  }
+  if (!arg) {
+    console.error('用法: botmux bind <绑定凭证>');
+    console.error('  到平台网页「绑定新机器」复制完整命令执行即可。');
+    process.exit(1);
+    return;
+  }
+
+  // 优先把参数当自包含 blob 解（内含平台地址）；否则回退「裸 token + 显式平台地址」
+  const decoded = decodeBindBlob(arg);
+  let platformUrl: string;
+  let code: string;
+  if (decoded) {
+    platformUrl = decoded.platformUrl;
+    code = decoded.token;
+  } else {
+    platformUrl = (platformOverride || process.env.BOTMUX_PLATFORM_URL || '').replace(/\/$/, '');
+    code = arg;
+    if (!platformUrl) {
+      console.error('绑定凭证无法解析；请用平台网页给出的完整 `botmux bind <凭证>` 命令。');
+      process.exit(1);
+      return;
+    }
+  }
+
+  // 复用已有 machineId（重绑保持机器身份不变）
+  const existing = readPlatformBinding();
+  const machineId = existing?.machineId || randomBytes(8).toString('hex');
+  const name = existing?.name || hostname();
+
+  // 连平台：先走系统默认解析（happy-eyeballs 自动选路）；不通再依次用 IPv6 / IPv4 单协议族兜底
+  // （有的机器 IPv4 路由是坏的、但 IPv6 通，反之亦然）。隧道连接始终不传 family，让 Node
+  // 内置 happy-eyeballs 自动选最优路径，不把单族偏好固化到绑定文件里。
+  const bindUrl = `${platformUrl}/api/bind`;
+  const bindPayload = { code, machineId };
+  const attempts: Array<{ family?: 4 | 6; label: string }> = [
+    { label: '默认' },
+    { family: 6, label: 'IPv6' },
+    { family: 4, label: 'IPv4' },
+  ];
+  let res: PostJsonResult | null = null;
+  const failures: string[] = [];
+  for (const attempt of attempts) {
+    try {
+      res = await postJson(bindUrl, bindPayload, { family: attempt.family });
+      break;
+    } catch (e) {
+      const err = (e as { code?: string; message?: string });
+      failures.push(`${attempt.label}: ${err.code || err.message || String(e)}`);
+    }
+  }
+  if (!res) {
+    console.error(`连接平台失败（${platformUrl}）:`);
+    for (const f of failures) console.error(`  ${f}`);
+    console.error('  多为临时网络抖动或平台正在发布；请确认本机能访问平台域名后重试 `botmux bind`（重绑安全、幂等，机器身份不变）。');
+    process.exit(1);
+    return;
+  }
+
+  const body = res.json as { machineId?: string; machineToken?: string; error?: string };
+  if (res.status < 200 || res.status >= 300 || !body.machineToken) {
+    const reason = body.error || `HTTP ${res.status}`;
+    console.error(`绑定失败: ${reason}`);
+    if (reason.includes('invalid') || reason.includes('expired')) console.error('  绑定凭证无效或已过期，请回平台重新生成。');
+    process.exit(1);
+    return;
+  }
+
+  writePlatformBinding({
+    platformUrl,
+    machineId: body.machineId || machineId,
+    machineToken: body.machineToken,
+    name,
+  });
+
+  // 绑定平台即「默认打开远程访问开关」：之后 dashboard / 终端 / webhook 链接都走中心化平台
+  // 机器子域，而非本机 host:port。只在用户从未显式设置过时写入——已显式开/关的尊重用户选择
+  // （重绑不覆盖）。开关本身仍可在 dashboard 设置里随时改。
+  if (readGlobalConfig().remoteAccess === undefined) {
+    mergeGlobalConfig({ remoteAccess: true });
+  }
+
+  console.log(`✓ 已绑定到平台 ${platformUrl}`);
+  console.log(`  机器名: ${name}`);
+
+  // 事件驱动：写完绑定后直接「捅一下」正在运行的 daemon（走其本地 /__cli HMAC 接口，
+  // 复用端口自发现），立即重连平台，无需重启、不轮询。没 daemon 在跑则跳过——下次启动自然读到绑定。
+  const configDir = join(homedir(), '.botmux');
+  const poke = await callDashboard({
+    configDir,
+    defaultPort: 7891,
+    envPort: process.env.BOTMUX_DASHBOARD_PORT,
+    path: '/__cli/reload-binding',
+  });
+  if (poke.ok) {
+    console.log('  已通知运行中的 botmux 连接平台 ✓（无需重启）');
+    // reload-binding 已让 dashboard 进程刷新配置缓存，此处读到的就是中心化平台 dashboard 链接。
+    const cur = await callDashboard({
+      configDir,
+      defaultPort: 7891,
+      envPort: process.env.BOTMUX_DASHBOARD_PORT,
+      path: '/__cli/current',
+    });
+    if (cur.ok) {
+      // ⚠️ 这里曾硬编码 `platformHosted: true`，理由是「刚 bind 成功必然平台托管」——
+      // 那是错的：上面的 `remoteAccess === undefined` 才写 `true`，用户显式设过
+      // `false` 时保持 `false`。此时若配了 `BOTMUX_PUBLIC_URL` / Devbox 短链，
+      // dashboard 返回的是反代基址，硬编码 true 会**确定性**把 token 摘成死链。
+      // 现在一律读 dashboard 自己标注的 `cur.platformHosted`，不再由调用方判断。
+      const [primary, ...rest] = formatDashboardSuccessLines(cur);
+      console.log(`  面板: ${primary}`);
+      for (const line of rest) console.log(`  ${line}`);
+    } else {
+      console.log('  面板: 运行 `botmux dashboard` 获取中心化平台链接。');
+    }
+  } else {
+    console.log('  未发现运行中的 botmux —— 启动它即可连接平台并在网页打开本机 dashboard。');
+  }
+}

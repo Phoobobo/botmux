@@ -1,7 +1,8 @@
 /**
- * Shared projection helpers for workflow operator surfaces.
+ * Frozen read-only projection for archived v2 workflow runs.
  *
- * Used by CLI (`botmux workflow ls` / `tail`) and the dashboard backend.
+ * The v2 execution engine is retired. Migration/archive verification retains
+ * this projector so historical bytes can still be checked before deletion.
  * All readers in here are pure: they never `mkdir` and never validate
  * caller-provided runIds as filesystem paths without going through
  * `isValidRunId` first.  Callers built on top of this module can hand
@@ -17,7 +18,7 @@
  *     runDir + blobDir, which is wrong for a read-only API.
  */
 import { promises as fs } from 'node:fs';
-import { relative, resolve, sep, join, dirname } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   parseWorkflowDefinition,
@@ -35,7 +36,7 @@ import {
   type Snapshot,
 } from './events/replay.js';
 import type { OutputRef } from './events/payloads.js';
-import { workActivityId } from './orchestrator.js';
+import { workActivityId } from './migration/v2-read-only-ids.js';
 import {
   attemptTerminalSidecarPath,
   type AttemptTerminalSidecar,
@@ -600,14 +601,34 @@ async function previewRef(
     cache.set(key, res);
     return res;
   }
-  if (!isPathInside(runDir, ref.outputPath)) {
-    const res = { ...base, error: 'outputPath is outside run directory' };
+  let outputPath: string;
+  try {
+    const [canonicalRunDir, canonicalOutputPath] = await Promise.all([
+      fs.realpath(runDir),
+      fs.realpath(ref.outputPath),
+    ]);
+    if (!isPathInside(canonicalRunDir, canonicalOutputPath)) {
+      const res = { ...base, error: 'outputPath is outside run directory' };
+      cache.set(key, res);
+      return res;
+    }
+    outputPath = canonicalOutputPath;
+  } catch (err) {
+    if (!isPathInside(runDir, ref.outputPath)) {
+      const res = { ...base, error: 'outputPath is outside run directory' };
+      cache.set(key, res);
+      return res;
+    }
+    const res = {
+      ...base,
+      error: err instanceof Error ? err.message : String(err),
+    };
     cache.set(key, res);
     return res;
   }
 
   try {
-    const handle = await fs.open(ref.outputPath, 'r');
+    const handle = await fs.open(outputPath, 'r');
     try {
       const stat = await handle.stat();
       const bytesToRead = Math.min(stat.size, BLOB_PREVIEW_MAX_BYTES);
@@ -647,7 +668,8 @@ async function previewRef(
 
 function isPathInside(parent: string, child: string): boolean {
   const rel = relative(resolve(parent), resolve(child));
-  return rel === '' || (!!rel && !rel.startsWith('..') && !rel.startsWith(sep));
+  return rel === '' ||
+    (!!rel && !rel.startsWith('..') && !rel.startsWith(sep) && !isAbsolute(rel));
 }
 
 function isJsonContent(contentType?: string): boolean {
@@ -993,22 +1015,4 @@ export function eventSeqFromId(eventId: string): number {
   if (dash < 0) return 0;
   const n = Number(eventId.slice(dash + 1));
   return Number.isFinite(n) ? n : 0;
-}
-
-export function extractEventContext(
-  payload: unknown,
-): { nodeId?: string; activityId?: string; errorCode?: string } {
-  if (!payload || typeof payload !== 'object' || 'ref' in (payload as object)) {
-    return {};
-  }
-  const p = payload as Record<string, unknown>;
-  const out: { nodeId?: string; activityId?: string; errorCode?: string } = {};
-  if (typeof p.nodeId === 'string') out.nodeId = p.nodeId;
-  if (typeof p.activityId === 'string') out.activityId = p.activityId;
-  if (typeof p.failedNodeId === 'string') out.nodeId = p.failedNodeId;
-  const err = p.error;
-  if (err && typeof err === 'object' && 'errorCode' in err) {
-    out.errorCode = String((err as { errorCode: unknown }).errorCode);
-  }
-  return out;
 }

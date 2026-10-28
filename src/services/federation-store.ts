@@ -9,14 +9,22 @@
  * Storage: `{dataDir}/federations.json`, atomic writes. Single dashboard writer
  * (same assumption as invite-store): register/sync are read-modify-write.
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { readJsonFileSoft } from '../utils/json-file.js';
 
 export interface FederatedBot {
   larkAppId: string;
   botName: string;
   cliId: string;
+  /** Whether this bot has real Feishu transport. A core-only (apiOnly) bot is
+   *  `false` — it has no Feishu identity, so it can be neither a group creator
+   *  nor an invited member cross-deployment. Explicitly true/false on new
+   *  versions; ABSENT means a pre-capability spoke → treated as legacy normal
+   *  (true) for backward compatibility. */
+  larkTransportEnabled?: boolean;
   /** Tenant-stable bot id (used by P2 拉群 to add the bot cross-app). */
   botUnionId?: string;
   capability?: string | null;
@@ -58,21 +66,21 @@ function filePath(dataDir: string): string {
 }
 
 function readFile(dataDir: string): FileShape {
-  const fp = filePath(dataDir);
-  if (!existsSync(fp)) return { version: 1, teams: {} };
-  try {
-    const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed.teams === 'object' && parsed.teams) return { version: 1, teams: parsed.teams };
-  } catch { /* corrupt — fall through */ }
-  return { version: 1, teams: {} };
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次写入覆盖），见 utils/json-file.ts。
+  const parsed = readJsonFileSoft<FileShape>(filePath(dataDir), {
+    fallback: () => ({ version: 1, teams: {} }),
+    validate: (v): v is FileShape => {
+      const teams = !!v && (v as { teams?: unknown }).teams;
+      return typeof teams === 'object' && teams !== null;
+    },
+    label: 'federation-store',
+  });
+  return { version: 1, teams: parsed.teams };
 }
 
 function writeFileAtomic(dataDir: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  const fp = filePath(dataDir);
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, fp);
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n', { followTargetSymlink: false });
 }
 
 export interface RegisterInput {
@@ -140,6 +148,16 @@ export function syncDeployment(dataDir: string, syncToken: string, bots: Federat
 /** Member deployments of a team (empty if none). */
 export function listFederatedDeployments(dataDir: string, teamId: string): FederatedDeployment[] {
   return readFile(dataDir).teams[teamId] ?? [];
+}
+
+/** Member deployments across ALL hosted teams, each tagged with its teamId. */
+export function listAllFederatedDeployments(dataDir: string): Array<{ teamId: string; deployment: FederatedDeployment }> {
+  const teams = readFile(dataDir).teams;
+  const out: Array<{ teamId: string; deployment: FederatedDeployment }> = [];
+  for (const [teamId, deps] of Object.entries(teams)) {
+    for (const deployment of deps) out.push({ teamId, deployment });
+  }
+  return out;
 }
 
 /** Remove a deployment from a team (leave/kick). Returns true if removed. */

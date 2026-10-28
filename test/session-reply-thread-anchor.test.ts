@@ -1,0 +1,609 @@
+/**
+ * Integration guard for the chat-scope send chokepoint (daemon.ts sessionReply).
+ *
+ * Regression: in `shared` (chat-scope) mode the repo-selection card and other
+ * daemon-side sends that carry NO turnId leaked to the chat top level instead of
+ * threading into the shared fold-back topic — sessionReply resolved the reply
+ * target with the raw turnId rather than fallbackTurnId(ds, turnId), so the
+ * turnId gate never matched (daemon.ts:2491 et al. pass no turnId).
+ *
+ * resolveSessionReplyTarget's composition with fallbackTurnId was already unit
+ * tested (reply-target-fallback.test.ts), but NOTHING asserted that the real
+ * send function WIRES it — which is exactly the gap that let e619250d fix some
+ * sites and miss the repo-card ones. This drives the real sessionReply against a
+ * seeded session so a revert (or a new unguarded send site) re-opens a failing
+ * test, not a silent top-level leak.
+ *
+ * Run:  pnpm vitest run test/session-reply-thread-anchor.test.ts
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  replyMessage: vi.fn(async () => 'om_reply'),
+  sendMessage: vi.fn(async () => 'om_top'),
+  sendUserMessage: vi.fn(async () => 'om_private'),
+  getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+  getMessageDetail: vi.fn(),
+  topicRoots: new Map<string, string>(),
+  topicQueues: new Map<string, Promise<void>>(),
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  return { Client: FakeClient };
+});
+
+vi.mock('../src/im/lark/client.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/client.js');
+  return { ...actual, getMessageDetail: mocks.getMessageDetail, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, sendUserMessage: mocks.sendUserMessage, getChatMode: mocks.getChatMode };
+});
+
+vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
+  getVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>) => (
+    mocks.topicRoots.get(JSON.stringify(key))
+  )),
+  ensureVcMeetingListenerTopicRoot: vi.fn(async (
+    _dataDir: string,
+    key: Record<string, unknown>,
+    createRoot: () => Promise<string>,
+  ) => {
+    const serialized = JSON.stringify(key);
+    const previous = mocks.topicQueues.get(serialized) ?? Promise.resolve();
+    const waitForPrevious = previous.catch(() => undefined);
+    let release!: () => void;
+    const current = new Promise<void>(resolve => { release = resolve; });
+    const tail = waitForPrevious.then(() => current);
+    mocks.topicQueues.set(serialized, tail);
+    await waitForPrevious;
+    try {
+      const prior = mocks.topicRoots.get(serialized);
+      if (prior) return { rootMessageId: prior, created: false };
+      const rootMessageId = await createRoot();
+      mocks.topicRoots.set(serialized, rootMessageId);
+      return { rootMessageId, created: true };
+    } finally {
+      release();
+      if (mocks.topicQueues.get(serialized) === tail) mocks.topicQueues.delete(serialized);
+    }
+  }),
+  recordVcMeetingListenerTopicRoot: vi.fn((_dataDir: string, key: Record<string, unknown>, root: string) => {
+    const serialized = JSON.stringify(key);
+    const prior = mocks.topicRoots.get(serialized);
+    if (prior && prior !== root) return { ok: false as const, reason: 'conflict' as const };
+    mocks.topicRoots.set(serialized, root);
+    return { ok: true as const, rootMessageId: root, existing: !!prior };
+  }),
+}));
+
+import { createTopicMessageLookupCache } from '../src/cli/topic-send-guard.js';
+import { registerBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { writeRoleReplyPrivately, writeRolePrivateReplyNotice } from '../src/core/role-resolver.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
+import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
+import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import type { DaemonSession } from '../src/core/types.js';
+
+const APP = 'session_reply_anchor_app';
+const CHAT = 'oc_shared_chat';
+const NOW = new Date().toISOString();
+
+type Target = { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean };
+type TurnTargets = Record<string, { rootMessageId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean }>;
+
+function seedSharedSession(currentReplyTarget?: Target, replyTargets?: TurnTargets): DaemonSession {
+  const ds = {
+    scope: 'chat',
+    chatId: CHAT,
+    larkAppId: APP,
+    session: {
+      sessionId: 'sess-anchor-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      title: 't',
+      status: 'active',
+      createdAt: NOW,
+      currentReplyTarget,
+      replyTargets,
+    },
+    currentReplyTarget,
+  } as unknown as DaemonSession;
+  activeSessions.set(sessionKey(CHAT, APP), ds);
+  return ds;
+}
+
+function seedReceiverSession(): DaemonSession {
+  const ds = {
+    scope: 'chat',
+    chatId: CHAT,
+    larkAppId: APP,
+    session: {
+      sessionId: 'sess-receiver-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      title: 'meeting receiver',
+      status: 'active',
+      createdAt: NOW,
+      vcMeetingReceiver: {
+        listenerAppId: 'listener-app',
+        meetingId: 'meeting-1',
+        memberId: 'member-1',
+        memberEpoch: 1,
+      },
+    },
+  } as unknown as DaemonSession;
+  activeSessions.set(activeSessionKey(ds), ds);
+  return ds;
+}
+
+describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    config.session.dataDir = mkdtempSync(join(tmpdir(), 'botmux-private-route-'));
+    mocks.sendUserMessage.mockResolvedValue('om_private');
+    mocks.replyMessage.mockReset().mockResolvedValue('om_reply');
+    mocks.getMessageDetail.mockReset();
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.getChatMode.mockResolvedValue('group');
+    mocks.topicRoots.clear();
+    mocks.topicQueues.clear();
+    activeSessions.clear();
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
+  });
+
+  it('honors authenticated explicit chat publication from a thread session', async () => {
+    const ds = seedSharedSession();
+    activeSessions.clear();
+    ds.scope = 'thread'; ds.session.scope = 'thread'; ds.session.rootMessageId = 'om_dispatch';
+    activeSessions.set(sessionKey('om_dispatch', APP), ds);
+    await sessionReply('om_dispatch', 'result', 'interactive', APP, 'turn-report', {
+      sourceSessionId: ds.session.sessionId, placement: 'chat', uuid: 'report-id',
+    });
+    expect(mocks.sendMessage).toHaveBeenCalledWith(APP, CHAT, 'result', 'interactive', 'report-id', expect.any(Object));
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('strict policy permits an available topic and disabling it restores legacy fallback', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    seedSharedSession();
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_quote', deleted: false }] });
+    await sessionReply(CHAT, 'reply', 'text', APP, 'turn-1', { quoteMessageId: 'om_quote' });
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    mocks.getMessageDetail.mockClear();
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'legacy' });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_quote'));
+    await sessionReply(CHAT, 'reply', 'text', APP, 'turn-2', { quoteMessageId: 'om_quote' });
+    expect(mocks.getMessageDetail).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['deleted', 'network', 'race'] as const)('strict policy prevents automatic top-level fallback: %s', async failure => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    seedSharedSession();
+    mocks.getMessageDetail.mockImplementation(async (_app, id) => {
+      if (failure === 'network') throw new Error('network unavailable');
+      return { items: [{ message_id: id, deleted: failure === 'deleted' }] };
+    });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    await expect(sessionReply(CHAT, 'answer', 'text', APP, 'turn-a', { quoteMessageId: 'om_human_a' })).rejects.toThrow();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(failure === 'race' ? 1 : 0);
+  });
+
+  it('reuses a worker precheck only inside the same delivery', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [], topicUnavailablePolicy: 'stop' });
+    const ds = seedSharedSession({ rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW });
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_topic', deleted: false }] });
+    const cache = createTopicMessageLookupCache(mocks.getMessageDetail);
+    await cache.lookup(APP, 'om_topic');
+    await sessionReply(CHAT, 'result', 'text', APP, 'turn-1', {
+      sourceSessionId: ds.session.sessionId, topicMessageLookup: cache.lookup,
+    });
+    expect(mocks.getMessageDetail).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    // A separate send must query again; no process-wide cache can mask withdrawal.
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_topic', deleted: true }] });
+    await expect(sessionReply(CHAT, 'next', 'text', APP, 'turn-1')).rejects.toThrow('TOPIC_SEND_BLOCKED');
+    expect(mocks.getMessageDetail).toHaveBeenCalledTimes(2);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['om_topic', 'available'], ['om_topic', 'deleted'], ['om_topic', 'network'], ['om_topic', 'unknown'],
+    ['om_frozen', 'available'], ['om_frozen', 'deleted'], ['om_frozen', 'network'], ['om_frozen', 'unknown'],
+  ])('checks source topic %s before private delivery with strict policy: %s', async (root, state) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      replyTargets: { turn_a: { senderOpenId: 'ou_a', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    writeRolePrivateReplyNotice(APP, CHAT, 'sent privately');
+    mocks.getMessageDetail.mockImplementation(async () => {
+      if (state === 'network') throw new Error('network unavailable');
+      return { items: state === 'unknown' ? [] : [{ message_id: root, deleted: state === 'deleted' }] };
+    });
+    const cache = createTopicMessageLookupCache(mocks.getMessageDetail);
+    if (state === 'available') await cache.lookup(APP, root);
+    const send = sessionReply('om_topic', 'private answer', 'text', APP, 'turn_a', {
+      topicMessageLookup: cache.lookup,
+      ...(root === 'om_frozen' ? { replyTarget: { mode: 'thread' as const, rootMessageId: root } } : {}),
+    });
+    if (state === 'available') {
+      await expect(send).resolves.toBe('om_private');
+      expect(mocks.sendUserMessage).toHaveBeenCalledExactlyOnceWith(APP, 'ou_a', 'private answer', 'text', undefined);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    } else {
+      await expect(send).rejects.toThrow(state === 'deleted' ? 'TOPIC_SEND_BLOCKED' : 'TOPIC_SEND_CHECK_FAILED');
+      expect(mocks.sendUserMessage).not.toHaveBeenCalled();
+      expect(mocks.replyMessage).not.toHaveBeenCalled();
+    }
+    expect(mocks.getMessageDetail).toHaveBeenCalledExactlyOnceWith(APP, root);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('routes the actual daemon answer privately with group fallback, failure=%s', async failure => {
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      quoteTargetId: 'turn_b', quoteTargetSenderOpenId: 'ou_b',
+      replyTargets: { turn_a: { senderOpenId: 'ou_a', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    writeRolePrivateReplyNotice(APP, CHAT, 'sent privately');
+    if (failure) mocks.sendUserMessage.mockRejectedValueOnce(new Error('DM denied'));
+    const send = sessionReply('om_topic', 'private answer', 'text', APP, 'turn_a');
+    if (failure) {
+      expect(await send).toBe('om_reply');
+      expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'private answer',
+        'text', true, undefined, expect.anything());
+    } else {
+      expect(await send).toBe('om_private');
+      expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_topic', 'sent privately',
+        'text', true, undefined, undefined, { suppressHook: true });
+    }
+    expect(mocks.sendUserMessage).toHaveBeenCalledWith(APP, 'ou_a', 'private answer', 'text', undefined);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, 'om_command', 'evicted_turn'])('keeps an unregistered %s reply in its topic instead of messaging the last user', async turnId => {
+    const ds = seedSharedSession();
+    ds.scope = 'thread';
+    Object.assign(ds.session, {
+      larkAppId: APP, chatType: 'group', scope: 'thread', rootMessageId: 'om_topic',
+      quoteTargetId: 'turn_b', quoteTargetSenderOpenId: 'ou_b',
+      replyTargets: { turn_b: { senderOpenId: 'ou_b', updatedAt: NOW } },
+    });
+    activeSessions.clear();
+    activeSessions.set(sessionKey('om_topic', APP), ds);
+    writeRoleReplyPrivately(APP, CHAT, true);
+    expect(await sessionReply('om_topic', 'reply', 'text', APP, turnId)).toBe('om_reply');
+    expect(mocks.sendUserMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledExactlyOnceWith(APP, 'om_topic', 'reply',
+      'text', true, undefined, expect.anything());
+  });
+
+  it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW });
+    // Mirrors daemon.ts:2491 — a card sent with no 5th turnId arg.
+    await sessionReply(CHAT, '{"card":true}', 'interactive', APP);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_topic', '{"card":true}', 'interactive', true, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('explicit STALE turnId still routes top-level — the fallback must not weaken the cross-turn hijack guard', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW });
+    await sessionReply(CHAT, 'late', 'text', APP, 'turn-2');
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('honors a daemon-frozen turn-A root after mutable session state advances to turn B', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    await sessionReply(CHAT, 'late A', 'text', APP, 'turn-a', {
+      replyTarget: { mode: 'thread', rootMessageId: 'om_topic_a' },
+    });
+
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_topic_a', 'late A', 'text', true, undefined, expect.anything(),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('plain chat session (no fold-back anchor) keeps replying flat to the chat top-level', async () => {
+    seedSharedSession(undefined);
+    await sessionReply(CHAT, 'hello', 'text', APP);
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('topicless webhook automation stays flat even when the destination is a topic group', async () => {
+    const ds = seedSharedSession(undefined);
+    ds.session.externalTriggerTopicless = true;
+    mocks.getChatMode.mockResolvedValue('topic');
+
+    await sessionReply(CHAT, 'automation output', 'text', APP);
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.getChatMode).not.toHaveBeenCalled();
+  });
+
+  it('a queued earlier turn still replies under ITS OWN trigger after a later turn overwrote the slot', async () => {
+    // codex 2nd-review P2 repro: trigger A, then trigger B before A's reply.
+    // currentReplyTarget = B (single slot), but turn A resolves via the
+    // per-turn map and must NOT degrade to a top-level plain send.
+    seedSharedSession(
+      { rootMessageId: 'om_trigger_b', turnId: 'turn-b', updatedAt: NOW },
+      {
+        'turn-a': { rootMessageId: 'om_trigger_a', updatedAt: NOW },
+        'turn-b': { rootMessageId: 'om_trigger_b', updatedAt: NOW },
+      },
+    );
+    await sessionReply(CHAT, 'reply for A', 'text', APP, 'turn-a');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_a', 'reply for A', 'text', true, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+
+    await sessionReply(CHAT, 'reply for B', 'text', APP, 'turn-b');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_b', 'reply for B', 'text', true, undefined, expect.anything());
+  });
+
+  it('reverse order: the latest turn replies via the slot, the earlier one via the map', async () => {
+    seedSharedSession(
+      { rootMessageId: 'om_trigger_a', turnId: 'turn-a', updatedAt: NOW },
+      {
+        'turn-b': { rootMessageId: 'om_trigger_b', updatedAt: NOW, quoteOnly: true },
+        'turn-a': { rootMessageId: 'om_trigger_a', updatedAt: NOW },
+      },
+    );
+    await sessionReply(CHAT, 'reply for B', 'text', APP, 'turn-b');
+    // Per-turn quoteOnly honored for the overwritten turn too.
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_b', 'reply for B', 'text', false, undefined, expect.anything());
+    await sessionReply(CHAT, 'reply for A', 'text', APP, 'turn-a');
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_trigger_a', 'reply for A', 'text', true, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('quoteOnly anchor replies to the trigger message without creating a Lark thread', async () => {
+    seedSharedSession({ rootMessageId: 'om_substitute_trigger', turnId: 'turn-sub', updatedAt: NOW, quoteOnly: true });
+    await sessionReply(CHAT, 'avatar reply', 'text', APP, 'turn-sub');
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(APP, 'om_substitute_trigger', 'avatar reply', 'text', false, undefined, expect.anything());
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('routes a dedicated receiver by exact source session when an ordinary session shares its chat', async () => {
+    const ordinary = seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'receiver output', 'text', APP, 'turn-receiver', {
+      sourceSessionId: receiver.session.sessionId,
+      uuid: 'vcd_delivery_stable',
+      suppressHook: true,
+    });
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      'receiver output',
+      'text',
+      'vcd_delivery_stable',
+      {
+        sessionId: receiver.session.sessionId,
+        scope: receiver.scope,
+        anchor: CHAT,
+      },
+      { suppressHook: true },
+    );
+    expect(receiver.session.sessionId).not.toBe(ordinary.session.sessionId);
+  });
+
+  it('Plan B: a meeting-agent session is keyed at the ordinary chat slot, not an isolated vc-receiver key', () => {
+    // The one-line root cause of the "meeting listener totally broken" report:
+    // activeSessionKey used to key a vcMeetingReceiver session by
+    // `vc-receiver:${sessionId}`, splitting it into a second routing universe so
+    // plain IM (keyed by the chat anchor) could never reach it. Under Plan B the
+    // marker is pure delivery metadata and the session lives at the normal
+    // (chatId, appId) slot — so IM and transcripts fold into the SAME session.
+    const receiver = seedReceiverSession();
+    expect(activeSessionKey(receiver)).toBe(sessionKey(CHAT, APP));
+    expect(activeSessionKey(receiver)).not.toContain('vc-receiver:');
+    // The map slot the meeting agent occupies IS the ordinary chat key, so an
+    // inbound message to this chat resolves this exact session.
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(receiver);
+  });
+
+  it('keeps receiver hook attribution when no ordinary chat session exists', async () => {
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'receiver only', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP,
+      CHAT,
+      'receiver only',
+      'text',
+      undefined,
+      {
+        sessionId: receiver.session.sessionId,
+        scope: receiver.scope,
+        anchor: CHAT,
+      },
+      { suppressHook: true },
+    );
+  });
+
+  it('forces automatic chat placement to the group top level even when a shared anchor exists', async () => {
+    seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+    const receiver = seedReceiverSession();
+
+    await sessionReply(CHAT, 'important update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'chat',
+      suppressHook: true,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, 'important update', 'text', undefined, expect.anything(), { suppressHook: true },
+    );
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('uses the first automatic topic output as a durable root and threads later outputs into it', async () => {
+    const receiver = seedReceiverSession();
+    const meetingTopicKey = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-1',
+      memberId: 'member-1',
+      memberEpoch: 1,
+      targetChatId: CHAT,
+    };
+
+    await sessionReply(CHAT, 'first update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+    await sessionReply(CHAT, 'second update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, 'first update', 'text', undefined, expect.anything(), { suppressHook: true },
+    );
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_top', 'second update', 'text', true, undefined, expect.anything(), { suppressHook: true },
+    );
+  });
+
+  it('single-flights concurrent first topic outputs before creating the durable root', async () => {
+    const receiver = seedReceiverSession();
+    const meetingTopicKey = {
+      listenerAppId: 'listener-app',
+      meetingId: 'meeting-concurrent',
+      memberId: 'member-1',
+      memberEpoch: 1,
+      targetChatId: CHAT,
+    };
+    let releaseFirstSend!: () => void;
+    let markFirstSendStarted!: () => void;
+    const firstSendStarted = new Promise<void>(resolve => { markFirstSendStarted = resolve; });
+    const firstSendBlocked = new Promise<void>(resolve => { releaseFirstSend = resolve; });
+    mocks.sendMessage.mockImplementationOnce(async () => {
+      markFirstSendStarted();
+      await firstSendBlocked;
+      return 'om_concurrent_root';
+    });
+
+    const first = sessionReply(CHAT, 'first update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+    await firstSendStarted;
+    const second = sessionReply(CHAT, 'second update', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      meetingTopicKey,
+      suppressHook: true,
+    });
+
+    await Promise.resolve();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+
+    releaseFirstSend();
+    await expect(first).resolves.toBe('om_concurrent_root');
+    await expect(second).resolves.toBe('om_reply');
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP,
+      'om_concurrent_root',
+      'second update',
+      'text',
+      true,
+      undefined,
+      expect.anything(),
+      { suppressHook: true },
+    );
+  });
+
+  it('fails closed when topic placement lacks a matching stream key', async () => {
+    const receiver = seedReceiverSession();
+    await expect(sessionReply(CHAT, 'bad route', 'text', APP, undefined, {
+      sourceSessionId: receiver.session.sessionId,
+      placement: 'topic',
+      suppressHook: true,
+    })).rejects.toThrow(/durable topic key/i);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a receiver source session is stale instead of using the ordinary chat slot', async () => {
+    seedSharedSession({ rootMessageId: 'om_ordinary_topic', turnId: 'turn-ordinary', updatedAt: NOW });
+
+    await expect(sessionReply(CHAT, 'stale receiver output', 'text', APP, undefined, {
+      sourceSessionId: 'sess-closed-receiver',
+    })).rejects.toThrow(/source session identity/i);
+
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it('quotes the exact explicit VC IM turn with its stable UUID and keeps that UUID on withdrawn fallback', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    await sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+    });
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_human_a', '{"card":"A"}', 'interactive', false, 'vcp_reply_a', expect.anything(),
+    );
+
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    await sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+    });
+    expect(mocks.sendMessage).toHaveBeenCalledWith(
+      APP, CHAT, '{"card":"A"}', 'interactive', 'vcp_reply_a', expect.anything(),
+    );
+  });
+
+  it('revalidates authority after a withdrawn quote before the plain fallback', async () => {
+    seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    const beforeQuoteFallback = vi.fn(async () => {
+      throw new Error('member removed while quote request was in flight');
+    });
+
+    await expect(sessionReply(CHAT, '{"card":"A"}', 'interactive', APP, 'turn-a', {
+      quoteMessageId: 'om_human_a',
+      uuid: 'vcp_reply_a',
+      beforeQuoteFallback,
+    })).rejects.toThrow('member removed while quote request was in flight');
+
+    expect(beforeQuoteFallback).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+});

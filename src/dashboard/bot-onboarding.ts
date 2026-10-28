@@ -1,55 +1,400 @@
-import { createRequire } from 'node:module';
+import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
-import { normalizeBotConfig } from '../setup/bot-config-editor.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { logger } from '../utils/logger.js';
+import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
+import {
+  detectUnusableOwnerEntries,
+  resolveScannerAllowedUser,
+  resolveSessionEmailAllowedUser,
+} from '../setup/owner-identity.js';
 import { tryRegisterApp, type RegisterAppOptions, type RegisterAppResult } from '../setup/register-app.js';
-import { validateCredentials, type CredentialValidation } from '../setup/verify-permissions.js';
-import * as Lark from '@larksuiteoapi/node-sdk';
+import {
+  validateCredentials,
+  readCriticalScopesFromApplicationInfo,
+  buildRemainingSteps,
+  type CredentialValidation,
+  type CriticalScopeReadbackResult,
+  type RemainingStep,
+} from '../setup/verify-permissions.js';
+import { resolveCloneAppName, resolveSetupAppName } from '../setup/app-name.js';
+import {
+  automateOpenPlatformSetup,
+  BOT_BASELINE_APP_EVENTS,
+  BOT_BASELINE_CALLBACKS,
+  createFeishuOpenPlatformApp,
+  inspectCachedFeishuOpenPlatformSession,
+  type CreateFeishuOpenPlatformAppOptions,
+  type CreateFeishuOpenPlatformAppResult,
+  type FeishuOpenPlatformSessionInspectionResult,
+  type FeishuWebSessionIdentity,
+  type OpenPlatformAutomationOptions,
+  type OpenPlatformAutomationResult,
+} from '../setup/open-platform-automation.js';
+import type { CliId } from '../adapters/cli/types.js';
+import type { Brand } from '../im/lark/lark-hosts.js';
+import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 
-const require = createRequire(import.meta.url);
-const QRCode = require('qrcode-terminal/vendor/QRCode') as any;
-const QRErrorCorrectLevel = require('qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel') as Record<string, unknown>;
+// Static default-imports of qrcode-terminal's vendored QRCode class (its public
+// API only prints to a terminal; we need the low-level class to render a QR into
+// a data structure). Explicit `.js` file specifiers — NOT `createRequire(...)`
+// with a bare dir path — so `bun build --compile` traces and EMBEDS them into
+// the single-file binary. The old dynamic require left them unbundled, and the
+// compiled dashboard crashed at runtime with "Cannot find module
+// 'qrcode-terminal/vendor/QRCode' from /$bunfs/…". Both files are `module.exports
+// = …` CJS; ESM default-import interop gives the export on both Node and Bun.
+import QRCode from 'qrcode-terminal/vendor/QRCode/index.js';
+import QRErrorCorrectLevel from 'qrcode-terminal/vendor/QRCode/QRErrorCorrectLevel.js';
 
 export type BotOnboardingStatus =
   | 'starting'
   | 'waiting_for_scan'
   | 'verifying'
+  // 正在自动配置开放平台权限 (导入 scope / redirect / 发版).
+  | 'configuring_permissions'
+  // 仅显式兼容模式可能需要第二次扫码；Feishu 主路径不会进入此状态.
+  | 'waiting_for_platform_scan'
+  // 扫码人身份无法被新 app 验证 → 不落盘空 allowedUsers 的开放 bot, 等用户在
+  // Dashboard 手动填写并通过校验的 owner 后才进入 completed (fail-closed).
+  | 'needs_owner'
   | 'completed'
   | 'failed';
+
+/** 开放平台权限自动配置结果, 供前端展示成功摘要或手动兜底步骤. */
+export interface BotOnboardingPermission {
+  ok: boolean;
+  /** 成功导入的权限数 */
+  scopeCount?: number;
+  /** 当前租户目录里没有、被跳过的权限数 */
+  skippedScopeCount?: number;
+  /** 已提交发布的版本号 */
+  versionId?: string;
+  /** 部分权限注册失败的告警 */
+  scopeWarning?: string;
+  /** Exact same-session event mode ACK for MOSA-managed activation. */
+  eventMode?: number;
+  /** Exact baseline event + callback count ACK for MOSA-managed activation. */
+  verifiedEventCount?: number;
+  /**
+   * redirect 白名单是否写成功。**独立于 ok**：权限/发版全绿但白名单没写上时，这个
+   * bot 一点授权就 20029（群聊模式 / 会话群标签 / `/login` 全都用不了），前端必须
+   * 能把这一步单独讲出来，不能被一句「权限配置完成」盖过去。
+   */
+  redirectConfigured?: boolean;
+  /** redirect 白名单未配置成功的原因。 */
+  redirectWarning?: string;
+  /** 失败原因 / 信息 (失败时给出手动步骤) */
+  reason?: string;
+  message?: string;
+}
 
 export interface BotOnboardingSnapshot {
   id: string;
   status: BotOnboardingStatus;
   createdAt: number;
   updatedAt: number;
+  // 建应用扫码（Feishu 主路径仅此一个二维码）
   qrUrl?: string;
   qrDataUrl?: string;
   expireAt?: number;
+  // 显式兼容模式的开放平台登录扫码；主路径不会出现。
+  platformQrDataUrl?: string;
+  /** Exact second Open Platform QR was observed as scanned by Feishu polling. */
+  platformQrScanConfirmedAt?: number;
+  /** 自动配置进度文案 (来自 automation onStatus) */
+  permissionStatusMsg?: string;
   appId?: string;
+  appName?: string;
+  registrationMode?: 'web' | 'compat';
+  /** Existing onboarding job whose exact App permission setup is being resumed. */
+  recoveryOfJobId?: string;
+  /** Monotonic permission-recovery attempt within the same immutable target lineage. */
+  recoveryAttempt?: number;
+  /** Exact terminal/interrupted recovery attempt that authorized this fresh QR. */
+  previousRecoveryJobId?: string;
   brand?: 'feishu' | 'lark';
+  // 实际写入的 CLI / 工作目录, 供前端完成页回显
+  cliId?: string;
+  workingDir?: string;
   addedBotIndex?: number;
+  /**
+   * 新 bot 是否已自动上线（`botmux start-bot`，无需整组 botmux restart）。
+   * true = 已拉起单个 daemon 进程并开始收飞书消息；false = 尝试失败（回退到
+   * 「请重启」提示）；undefined = 未尝试（无 startBotLive 注入，如单测）。
+   */
+  liveStarted?: boolean;
+  /** 自动上线的诊断信息（成功给进程名，失败给原因），供前端提示。 */
+  liveStartMessage?: string;
+  /** Managed recovery stopped the exact existing daemon before issuing a fresh owner QR. */
+  liveStopped?: boolean;
+  /** Exact single-bot stop diagnostic. */
+  liveStopMessage?: string;
+  /**
+   * MOSA-managed onboarding only: the bot remains present in the private
+   * configuration for exact permission recovery but is excluded from daemon
+   * registration until every critical scope is observable.
+   */
+  activationPending?: boolean;
+  /** A durable exact-daemon stop is required before recovery can proceed. */
+  activationDeactivating?: boolean;
+  /** A durable activation ledger exists but the config marker is not yet final. */
+  activationCommitting?: boolean;
+  /** The caller explicitly requires the critical-scope activation gate. */
+  criticalScopeActivationRequired?: boolean;
+  permission?: BotOnboardingPermission;
+  /** 自动配置失败时的手动权限步骤 (深链) */
+  remainingSteps?: RemainingStep[];
+  /**
+   * needs_owner 时的预填建议：创建应用所用 Web session 的账号邮箱。前端已在表单
+   * 顶部展示过该邮箱，不算新增暴露；仅当自动确认失败需要用户复核时给出。
+   */
+  suggestedOwner?: string;
   error?: string;
   message?: string;
 }
 
+/** 调用方 (dashboard) 已校验过的表单输入: CLI / 工作目录 / model. */
+export interface BotOnboardingInput {
+  /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
+  appName?: string;
+  cloneSourceAppId?: string;
+  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
+  registrationMode?: 'web' | 'compat';
+  /**
+   * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
+   * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
+   */
+  sessionMode?: 'reuse' | 'qr';
+  expectedIdentity?: Pick<FeishuWebSessionIdentity, 'userId' | 'tenantId'>;
+  cliId?: CliId;
+  /** 通用启动前缀（如 "aiden x claude"）；aiden×* 选项解析所得，普通 CLI 为空。 */
+  wrapperCli?: string;
+  cliLaunchMode?: 'forge-traex';
+  workingDir?: string;
+  /**
+   * 新话题工作目录模式：'fixed' → 落 defaultWorkingDir（直接启动、不弹卡片）；
+   * 'card' → 落 workingDir（仓库选择卡片的扫描根）。缺省按 'card' 处理——
+   * 老前端 / 脚本不带该字段时行为不变；新 Web 表单默认发 'fixed'（推荐）。
+   */
+  dirMode?: 'fixed' | 'card';
+  model?: string;
+  /**
+   * MOSA-managed onboarding only. When true, a bot with incomplete critical
+   * scope readback is persisted as activation-pending and cannot be loaded by
+   * a daemon. The exact permission-recovery job clears the marker and starts
+   * the bot only after all critical scopes are readable.
+   */
+  requireCriticalScopesBeforeActivation?: boolean;
+}
+
 type RegisterAppFn = (opts?: RegisterAppOptions) => Promise<RegisterAppResult>;
+type CreateAppFn = (opts: CreateFeishuOpenPlatformAppOptions) => Promise<CreateFeishuOpenPlatformAppResult>;
+type InspectSessionFn = () => Promise<FeishuOpenPlatformSessionInspectionResult>;
 type ValidateCredentialsFn = (
   appId: string,
   appSecret: string,
   brand?: 'feishu' | 'lark',
 ) => Promise<CredentialValidation | { ok: true }>;
+type AutomateOpenPlatformFn = (opts: OpenPlatformAutomationOptions) => Promise<OpenPlatformAutomationResult>;
+type VerifyCriticalScopesFn = (appId: string, appSecret: string, brand: 'feishu' | 'lark') => Promise<CriticalScopeReadbackResult>;
+type RunBotsMutation = <T>(mutation: () => T | Promise<T>) => Promise<T>;
+
+const MANAGED_VERIFIED_EVENT_COUNT = BOT_BASELINE_APP_EVENTS.length + BOT_BASELINE_CALLBACKS.length;
+
+function hasExactManagedAutomationAck(result: OpenPlatformAutomationResult): boolean {
+  return result.ok
+    && result.eventMode === 4
+    && result.verifiedEventCount === MANAGED_VERIFIED_EVENT_COUNT
+    && typeof result.versionId === 'string'
+    && result.versionId.trim().length > 0;
+}
+
+type ManagedActivationState =
+  | 'initial_scope_propagation_pending'
+  | 'scope_propagation_pending'
+  | 'activation_committing'
+  | 'completed';
+
+function hasExactManagedPermissionAck(permission: BotOnboardingPermission | undefined): boolean {
+  return permission?.eventMode === 4
+    && permission.verifiedEventCount === MANAGED_VERIFIED_EVENT_COUNT
+    && typeof permission.versionId === 'string'
+    && permission.versionId.trim().length > 0;
+}
+
+function managedActivationStateForSnapshot(
+  job: BotOnboardingSnapshot,
+): ManagedActivationState | undefined {
+  if (
+    job.criticalScopeActivationRequired !== true
+    || !job.appId
+    || !job.workingDir
+    || job.platformQrScanConfirmedAt === undefined
+    || !hasExactManagedPermissionAck(job.permission)
+  ) {
+    return undefined;
+  }
+  if (
+    job.status === 'failed'
+    && job.recoveryOfJobId
+    && job.error === 'permission_recovery_failed'
+    && job.permission?.ok === false
+    && job.permission.reason === 'scope_mapping_failed'
+  ) {
+    return 'scope_propagation_pending';
+  }
+  if (
+    job.status === 'completed'
+    && job.permission?.ok === true
+    && job.activationPending === true
+    && job.activationCommitting === true
+  ) {
+    return 'activation_committing';
+  }
+  if (
+    job.status === 'completed'
+    && job.permission?.ok === true
+    && job.activationPending === true
+  ) {
+    return 'initial_scope_propagation_pending';
+  }
+  if (
+    job.status === 'completed'
+    && job.permission?.ok === true
+    && job.activationPending !== true
+    && job.liveStarted === true
+  ) {
+    return 'completed';
+  }
+  return undefined;
+}
+
+function isExactManagedActivationMarker(
+  value: unknown,
+  appId: string,
+  jobId?: string,
+): boolean {
+  return !!value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && (value as Record<string, unknown>).appId === appId
+    && typeof (value as Record<string, unknown>).jobId === 'string'
+    && (jobId === undefined || (value as Record<string, unknown>).jobId === jobId);
+}
+
+function managedActivationMarker(
+  bot: unknown,
+): { phase: 'deactivating' | 'starting' | 'committed'; appId: string; jobId: string } | undefined {
+  if (!bot || typeof bot !== 'object' || Array.isArray(bot)) return undefined;
+  const record = bot as Record<string, unknown>;
+  const appId = typeof record.larkAppId === 'string' ? record.larkAppId : '';
+  const markers = ([
+    ['deactivating', record.activationDeactivating],
+    ['starting', record.activationStarting],
+    ['committed', record.activationCommitted],
+  ] as const).filter(([, value]) => value !== undefined);
+  if (markers.length !== 1) return undefined;
+  const [phase, value] = markers[0];
+  if (!isExactManagedActivationMarker(value, appId)) return undefined;
+  return {
+    phase,
+    appId,
+    jobId: (value as Record<string, unknown>).jobId as string,
+  };
+}
 
 export interface BotOnboardingManagerOptions {
   botsJsonPath: string;
+  /**
+   * needs_owner 的私有恢复文件。默认与 bots.json 同目录，权限固定 0600；仅用于
+   * Dashboard 进程重启后继续完成已经创建、但尚未写入 bots.json 的应用。
+   */
+  pendingStorePath?: string;
+  /** Private, secret-free recovery lineage used to turn restart into a fresh owner QR. */
+  permissionRecoveryStorePath?: string;
+  /** 单次 Feishu Web 登录建应用主路径；测试可注入。 */
+  createApp?: CreateAppFn;
+  inspectSession?: InspectSessionFn;
+  /** SDK device flow fallback；显式只注入 registerApp 时保留旧测试路径。 */
   registerApp?: RegisterAppFn;
   validateCredentials?: ValidateCredentialsFn;
+  automateOpenPlatform?: AutomateOpenPlatformFn;
+  verifyCriticalScopes?: VerifyCriticalScopesFn;
+  /**
+   * A single complete application-info response is not an activation ACK:
+   * Feishu permission propagation can briefly expose an incomplete or stale
+   * view after the owner scan. Require consecutive complete observations
+   * before removing activationPending.
+   */
+  criticalScopeStableReads?: number;
+  /** Maximum bounded application-info observations for the stable gate. */
+  criticalScopeMaxAttempts?: number;
+  /** Delay between stable-gate observations. Tests may set this to zero. */
+  criticalScopePollIntervalMs?: number;
   renderQrDataUrl?: (url: string) => string;
   now?: () => number;
+  /**
+   * Bring the just-persisted bot online without a fleet-wide restart. Wired in
+   * the dashboard to spawn `botmux start-bot <appId>`: the new daemon
+   * self-registers, opens its Feishu WSClient long-connection, and publishes a
+   * descriptor the dashboard auto-discovers — so a newly added bot works with no
+   * `botmux restart`. Best-effort: a rejection/`ok:false` just falls back to the
+   * restart hint. Omitted in tests → onboarding behaves as before (persist only,
+   * `liveStarted` stays undefined).
+   */
+  startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  /** Stop only the exact existing bot before a managed permission recovery QR. */
+  stopBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  /**
+   * Serialize every bots.json read-modify-write through the deployment's
+   * durable config coordinator. Tests and non-primary callers may omit it.
+   */
+  runBotsMutation?: RunBotsMutation;
 }
 
 export interface BotOnboardingJob {
   id: string;
   done: Promise<void>;
 }
+
+interface PersistedPendingOnboardingJob {
+  snapshot: BotOnboardingSnapshot;
+  bot: Record<string, any>;
+}
+
+interface PersistedPendingOnboardingStore {
+  version: 1;
+  jobs: PersistedPendingOnboardingJob[];
+}
+
+export type StartPermissionRecoveryResult =
+  | { ok: true; job: BotOnboardingJob }
+  | {
+      ok: false;
+      error:
+        | 'permission_recovery_target_missing'
+        | 'permission_recovery_target_ambiguous'
+        | 'permission_recovery_target_invalid'
+        | 'permission_recovery_state_unavailable';
+    };
+
+export type CompleteScopePropagationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      error:
+        | 'permission_recovery_target_missing'
+        | 'permission_recovery_target_ambiguous'
+        | 'permission_recovery_target_invalid'
+        | 'permission_recovery_scopes_pending'
+        | 'permission_recovery_activation_failed'
+        | 'permission_recovery_state_unavailable';
+    };
+
+export type BotOnboardingSessionStatus =
+  | { status: 'ready'; source: string; identity: FeishuWebSessionIdentity }
+  | { status: 'scan_required'; reason?: string };
 
 function svgEscape(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
@@ -83,23 +428,905 @@ export function renderQrSvgDataUrl(value: string): string {
 
 export class BotOnboardingManager {
   private readonly jobs = new Map<string, BotOnboardingSnapshot>();
+  // needs_owner 状态下「待落盘」的 bot 配置（含 secret）——故意不写进 bots.json,
+  // 避免在 owner 确认前就有一个空 allowlist 的可启动 bot 留在磁盘上（重启即 fail-open）。
+  // 也不放进 jobs 快照（那个会序列化给前端、会泄漏 secret）。owner 校验通过后才 append。
+  private readonly pendingBots = new Map<string, Record<string, any>>();
+  private readonly createApp?: CreateAppFn;
+  private readonly inspectSession: InspectSessionFn;
   private readonly registerApp: RegisterAppFn;
   private readonly validateCredentials: ValidateCredentialsFn;
+  private readonly automateOpenPlatform: AutomateOpenPlatformFn;
+  private readonly verifyCriticalScopes: VerifyCriticalScopesFn;
+  private readonly criticalScopeStableReads: number;
+  private readonly criticalScopeMaxAttempts: number;
+  private readonly criticalScopePollIntervalMs: number;
   private readonly renderQrDataUrl: (url: string) => string;
   private readonly now: () => number;
+  private readonly startBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  private readonly pendingStorePath: string;
+  private readonly stopBotLive?: (appId: string) => Promise<{ ok: boolean; message?: string }>;
+  private readonly permissionRecoveryStorePath: string;
+  private readonly runBotsMutation: RunBotsMutation;
+  private readonly scopePropagationFlights = new Map<string, Promise<CompleteScopePropagationResult>>();
+  private activationStartupReconciliation: Promise<void> = Promise.resolve();
+  private permissionRecoveryStateError?: string;
 
   constructor(private readonly opts: BotOnboardingManagerOptions) {
+    // 生产默认走单次 Web session；旧单测/外部注入若只给 registerApp，则明确
+    // 视为要求直接测 SDK 路径，避免批量改写既有测试缝。
+    this.createApp = opts.createApp ?? (opts.registerApp ? undefined : createFeishuOpenPlatformApp);
+    this.inspectSession = opts.inspectSession ?? (() => inspectCachedFeishuOpenPlatformSession());
     this.registerApp = opts.registerApp ?? tryRegisterApp;
     this.validateCredentials = opts.validateCredentials ?? validateCredentials;
+    this.automateOpenPlatform = opts.automateOpenPlatform ?? automateOpenPlatformSetup;
+    this.verifyCriticalScopes = opts.verifyCriticalScopes ?? readCriticalScopesFromApplicationInfo;
+    this.criticalScopeStableReads = Number.isInteger(opts.criticalScopeStableReads)
+      && (opts.criticalScopeStableReads ?? 0) > 0
+      ? opts.criticalScopeStableReads!
+      : 3;
+    const configuredMaxAttempts = Number.isInteger(opts.criticalScopeMaxAttempts)
+      && (opts.criticalScopeMaxAttempts ?? 0) > 0
+      ? opts.criticalScopeMaxAttempts!
+      : 12;
+    this.criticalScopeMaxAttempts = Math.max(
+      this.criticalScopeStableReads,
+      configuredMaxAttempts,
+    );
+    this.criticalScopePollIntervalMs = Number.isInteger(opts.criticalScopePollIntervalMs)
+      && (opts.criticalScopePollIntervalMs ?? -1) >= 0
+      ? opts.criticalScopePollIntervalMs!
+      : 5_000;
     this.renderQrDataUrl = opts.renderQrDataUrl ?? renderQrSvgDataUrl;
     this.now = opts.now ?? (() => Date.now());
+    this.startBotLive = opts.startBotLive;
+    this.pendingStorePath = opts.pendingStorePath ?? `${opts.botsJsonPath}.onboarding-pending.json`;
+    this.stopBotLive = opts.stopBotLive;
+    this.permissionRecoveryStorePath = opts.permissionRecoveryStorePath ?? `${opts.botsJsonPath}.permission-recoveries.json`;
+    this.runBotsMutation = opts.runBotsMutation ?? (async mutation => mutation());
+    this.restorePendingJobs();
+    this.restorePermissionRecoveryJobs();
+    this.requireDurableManagedInitialJobs();
+    // A dashboard crash after PM2 has accepted the start but before the
+    // durable marker is cleared must converge to pending, never assume the
+    // daemon is safe to keep online.
+    this.activationStartupReconciliation = this.reconcileInterruptedManagedActivations();
   }
 
-  start(): BotOnboardingJob {
+  /**
+   * 恢复 owner 待确认任务。凭证只存在 0600 私有文件和内存中，公开 job snapshot
+   * 仍不包含 secret；bot 也仍未进入 bots.json，因此重启不会把空 allowlist bot
+   * 启起来。若上次进程在写入 bots.json 后、清理恢复文件前退出，则把该 job 恢复
+   * 为 completed，避免前端得到 unknown_onboarding_job。
+   */
+  private restorePendingJobs(): void {
+    if (!existsSync(this.pendingStorePath)) return;
+    let parsed: PersistedPendingOnboardingStore;
+    try {
+      parsed = JSON.parse(readFileSync(this.pendingStorePath, 'utf-8')) as PersistedPendingOnboardingStore;
+    } catch {
+      return;
+    }
+    if (parsed?.version !== 1 || !Array.isArray(parsed.jobs)) return;
+
+    const persistedBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    for (const record of parsed.jobs) {
+      const snapshot = record?.snapshot;
+      const bot = record?.bot;
+      if (!snapshot || snapshot.status !== 'needs_owner' || typeof snapshot.id !== 'string') continue;
+      if (!bot || typeof bot.larkAppId !== 'string' || typeof bot.larkAppSecret !== 'string') continue;
+      if (snapshot.appId && snapshot.appId !== bot.larkAppId) continue;
+
+      const existingIndex = persistedBots.findIndex((entry: any) => entry?.larkAppId === bot.larkAppId);
+      if (existingIndex >= 0) {
+        this.jobs.set(snapshot.id, { ...snapshot, status: 'completed', addedBotIndex: existingIndex, updatedAt: this.now() });
+        continue;
+      }
+      this.jobs.set(snapshot.id, { ...snapshot });
+      this.pendingBots.set(snapshot.id, { ...bot });
+    }
+    // 丢弃损坏项，以及「bot 已落盘但恢复文件尚未来得及清理」的旧凭证。
+    this.savePendingJobs();
+  }
+
+  /** 原子保存所有 needs_owner 任务；文件不为空时始终是 0600。 */
+  private savePendingJobs(): void {
+    const jobs: PersistedPendingOnboardingJob[] = [];
+    for (const [id, bot] of this.pendingBots) {
+      const snapshot = this.jobs.get(id);
+      if (snapshot?.status === 'needs_owner') jobs.push({ snapshot: { ...snapshot }, bot: { ...bot } });
+    }
+    if (jobs.length === 0) {
+      try {
+        unlinkSync(this.pendingStorePath);
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') logger.warn(`[bot-onboarding] 无法清理 owner 待确认恢复文件: ${err?.message ?? String(err)}`);
+      }
+      return;
+    }
+    const store: PersistedPendingOnboardingStore = { version: 1, jobs };
+    try {
+      atomicWriteFileSync(this.pendingStorePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+    } catch (err: any) {
+      // 保留内存态继续让当前页面完成；仅失去进程重启恢复能力，不把已创建应用误报失败。
+      logger.warn(`[bot-onboarding] 无法持久化 owner 待确认任务: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  private restorePermissionRecoveryJobs(): void {
+    if (!existsSync(this.permissionRecoveryStorePath)) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(this.permissionRecoveryStorePath, 'utf8'));
+    } catch (err) {
+      this.permissionRecoveryStateError = `permission recovery ledger is unreadable: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+    if ((parsed as any)?.version !== 1 || !Array.isArray((parsed as any).jobs) || (parsed as any).jobs.length > 128) {
+      this.permissionRecoveryStateError = 'permission recovery ledger schema is invalid';
+      return;
+    }
+    const records = (parsed as any).jobs;
+    const restored: BotOnboardingSnapshot[] = [];
+    const ids = new Set<string>();
+    for (const raw of records) {
+      const isRecovery = (
+        typeof raw?.recoveryOfJobId === 'string'
+        && raw.recoveryOfJobId.length > 0
+      );
+      const isManagedInitial = (
+        !isRecovery
+        && ['initial_scope_propagation_pending', 'activation_committing', 'completed'].includes(
+          raw?.managedActivationState,
+        )
+      );
+      if (
+        !raw || typeof raw !== 'object'
+        || typeof raw.id !== 'string'
+        || (
+          isRecovery
+            ? !/^botperm_[A-Za-z0-9_-]{1,160}$/.test(raw.id)
+            : !/^bot_[A-Za-z0-9_-]{1,160}$/.test(raw.id)
+        )
+        || (!isRecovery && !isManagedInitial)
+        || ids.has(raw.id)
+        || typeof raw.appId !== 'string' || !raw.appId
+        || typeof raw.workingDir !== 'string' || !raw.workingDir
+        || !Number.isFinite(raw.createdAt) || !Number.isFinite(raw.updatedAt)
+        || (
+          isRecovery
+            ? (!Number.isInteger(raw.recoveryAttempt) || raw.recoveryAttempt < 1)
+            : raw.recoveryAttempt !== undefined
+        )
+        || !['starting', 'configuring_permissions', 'waiting_for_platform_scan', 'completed', 'failed'].includes(raw.status)
+        || (isManagedInitial && raw.status !== 'completed')
+        || !['feishu', 'lark'].includes(raw.brand)
+        || (
+          raw.previousRecoveryJobId !== undefined
+          && (!isRecovery || typeof raw.previousRecoveryJobId !== 'string')
+        )
+        || (raw.platformQrScanConfirmedAt !== undefined
+          && (!Number.isInteger(raw.platformQrScanConfirmedAt) || raw.platformQrScanConfirmedAt <= 0))
+        || (raw.activationDeactivating !== undefined && raw.activationDeactivating !== true)
+        || (raw.activationCommitting !== undefined && raw.activationCommitting !== true)
+      ) {
+        this.permissionRecoveryStateError = 'permission recovery ledger contains an invalid record';
+        return;
+      }
+      ids.add(raw.id);
+      const status: BotOnboardingStatus = ['completed', 'failed'].includes(raw.status)
+        ? raw.status
+        : 'failed';
+      const snapshot: BotOnboardingSnapshot = {
+        id: raw.id,
+        status,
+        createdAt: raw.createdAt,
+        updatedAt: this.now(),
+        appId: raw.appId,
+        brand: raw.brand === 'lark' ? 'lark' : 'feishu',
+        cliId: 'traex',
+        workingDir: raw.workingDir,
+        registrationMode: 'compat',
+        ...(isRecovery
+          ? {
+              recoveryOfJobId: raw.recoveryOfJobId,
+              recoveryAttempt: raw.recoveryAttempt,
+              ...(typeof raw.previousRecoveryJobId === 'string'
+                ? { previousRecoveryJobId: raw.previousRecoveryJobId }
+                : {}),
+            }
+          : {}),
+        ...(raw.criticalScopeActivationRequired === true
+          ? { criticalScopeActivationRequired: true }
+          : {}),
+        ...(raw.activationPending === true
+          || raw.managedActivationState === 'initial_scope_propagation_pending'
+          ? { activationPending: true }
+          : {}),
+        ...(raw.activationDeactivating === true
+          ? { activationDeactivating: true, activationPending: true }
+          : {}),
+        ...(raw.activationCommitting === true
+          ? { activationCommitting: true, activationPending: true }
+          : {}),
+        ...(Number.isInteger(raw.platformQrScanConfirmedAt)
+          ? { platformQrScanConfirmedAt: raw.platformQrScanConfirmedAt }
+          : {}),
+        ...(raw.managedActivationState === 'initial_scope_propagation_pending'
+          ? {
+              permission: {
+                ok: true,
+                eventMode: raw.managedActivationAck?.eventMode,
+                verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
+                versionId: raw.managedActivationAck?.versionId,
+              },
+            }
+          : {}),
+        ...(raw.managedActivationState === 'scope_propagation_pending'
+          ? {
+              permission: {
+                ok: false,
+                reason: 'scope_mapping_failed',
+                message: '关键权限发布后仍在传播，等待 botmux 精确回读并启动',
+                eventMode: raw.managedActivationAck?.eventMode,
+                verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
+                versionId: raw.managedActivationAck?.versionId,
+              },
+            }
+          : {}),
+        ...(raw.managedActivationState === 'activation_committing'
+          ? {
+              activationPending: true,
+              activationCommitting: true,
+              permission: {
+                ok: true,
+                eventMode: raw.managedActivationAck?.eventMode,
+                verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
+                versionId: raw.managedActivationAck?.versionId,
+              },
+            }
+          : {}),
+        ...(raw.managedActivationState === 'completed'
+          ? {
+              liveStarted: true,
+              activationPending: false,
+              permission: {
+                ok: true,
+                eventMode: raw.managedActivationAck?.eventMode,
+                verifiedEventCount: raw.managedActivationAck?.verifiedEventCount,
+                versionId: raw.managedActivationAck?.versionId,
+              },
+            }
+          : {}),
+        ...(status === 'failed'
+          ? {
+              error: raw.status === 'failed' && typeof raw.error === 'string'
+                ? raw.error
+                : 'permission_recovery_interrupted',
+              message: raw.status === 'failed' && typeof raw.message === 'string'
+                ? raw.message
+                : 'Dashboard restarted before permission recovery reached a terminal result',
+            }
+          : {}),
+      };
+      if (
+        (
+          raw.managedActivationState !== undefined
+          && ![
+            'initial_scope_propagation_pending',
+            'scope_propagation_pending',
+            'activation_committing',
+            'completed',
+          ].includes(raw.managedActivationState)
+        )
+        || (
+          raw.managedActivationState === 'initial_scope_propagation_pending'
+          && (
+            raw.status !== 'completed'
+            || raw.activationPending !== true
+          )
+        )
+        || (
+          raw.managedActivationState === 'scope_propagation_pending'
+          && (
+            !isRecovery
+            || raw.status !== 'failed'
+            || raw.error !== 'permission_recovery_failed'
+          )
+        )
+        || (
+          raw.managedActivationState === 'activation_committing'
+          && (
+            raw.status !== 'completed'
+            || raw.activationPending !== true
+            || raw.activationDeactivating === true
+            || raw.activationCommitting !== true
+          )
+        )
+        || (
+          raw.managedActivationState === 'completed'
+          && raw.status !== 'completed'
+        )
+        || (
+          (raw.managedActivationState !== undefined)
+          !== (
+            raw.criticalScopeActivationRequired === true
+            && Number.isInteger(raw.platformQrScanConfirmedAt)
+            && raw.managedActivationAck?.eventMode === 4
+            && raw.managedActivationAck?.verifiedEventCount === MANAGED_VERIFIED_EVENT_COUNT
+            && typeof raw.managedActivationAck?.versionId === 'string'
+            && raw.managedActivationAck.versionId.trim().length > 0
+          )
+        )
+      ) {
+        this.permissionRecoveryStateError = 'permission recovery ledger contains an invalid activation ACK';
+        return;
+      }
+      restored.push(snapshot);
+    }
+    const groups = new Map<string, BotOnboardingSnapshot[]>();
+    for (const snapshot of restored.filter(item => item.recoveryOfJobId)) {
+      const key = JSON.stringify([snapshot.recoveryOfJobId, snapshot.workingDir, snapshot.appId]);
+      const group = groups.get(key) ?? [];
+      group.push(snapshot);
+      groups.set(key, group);
+    }
+    for (const group of groups.values()) {
+      group.sort((a, b) => (a.recoveryAttempt ?? 0) - (b.recoveryAttempt ?? 0));
+      for (let index = 0; index < group.length; index += 1) {
+        if (
+          group[index].recoveryAttempt !== index + 1
+          || (index === 0 && group[index].previousRecoveryJobId !== undefined)
+          || (index > 0 && group[index].previousRecoveryJobId !== group[index - 1].id)
+        ) {
+          this.permissionRecoveryStateError = 'permission recovery ledger lineage is ambiguous';
+          return;
+        }
+      }
+    }
+    try {
+      for (const snapshot of restored) {
+        if (snapshot.error === 'permission_recovery_interrupted') {
+          rmSync(join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${snapshot.id}.json`), { force: true });
+        }
+      }
+    } catch (err) {
+      this.permissionRecoveryStateError = `interrupted owner session could not be cleaned: ${err instanceof Error ? err.message : String(err)}`;
+      return;
+    }
+    for (const snapshot of restored) {
+      this.jobs.set(snapshot.id, snapshot);
+    }
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch (err) {
+      this.permissionRecoveryStateError = `permission recovery ledger cannot be updated: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  }
+
+  private persistPermissionRecoveryJobs(): void {
+    const jobs = [...this.jobs.values()]
+      .filter(job => (
+        (job.recoveryOfJobId && job.appId && job.workingDir && job.recoveryAttempt)
+        || managedActivationStateForSnapshot(job) !== undefined
+      ))
+      .sort((a, b) => a.updatedAt - b.updatedAt)
+      .slice(-128)
+      .map(job => {
+        const managedActivationState = managedActivationStateForSnapshot(job);
+        return {
+          id: job.id,
+          status: job.status,
+          createdAt: job.createdAt,
+          updatedAt: job.updatedAt,
+          appId: job.appId,
+          brand: job.brand,
+          workingDir: job.workingDir,
+          recoveryOfJobId: job.recoveryOfJobId,
+          recoveryAttempt: job.recoveryAttempt,
+          previousRecoveryJobId: job.previousRecoveryJobId,
+          criticalScopeActivationRequired: job.criticalScopeActivationRequired,
+          activationPending: job.activationPending,
+          ...(job.activationDeactivating === true
+            ? { activationDeactivating: true }
+            : {}),
+          ...(job.activationCommitting === true
+            ? { activationCommitting: true }
+            : {}),
+          platformQrScanConfirmedAt: job.platformQrScanConfirmedAt,
+          error: job.error,
+          message: job.message,
+          ...(managedActivationState && hasExactManagedPermissionAck(job.permission)
+            ? {
+                managedActivationState,
+                managedActivationAck: {
+                  eventMode: job.permission!.eventMode,
+                  verifiedEventCount: job.permission!.verifiedEventCount,
+                  versionId: job.permission!.versionId,
+                },
+              }
+            : {}),
+        };
+      });
+    if (jobs.length === 0) return;
+    atomicWriteFileSync(this.permissionRecoveryStorePath, `${JSON.stringify({ version: 1, jobs }, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  private savePermissionRecoveryJobsBestEffort(): void {
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch (err: any) {
+      logger.warn(`[bot-onboarding] 无法更新权限恢复 lineage: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  /**
+   * A managed initial ACK is restart authority, not optional UI history.
+   * Refuse activation when its first durable write cannot be proven.
+   */
+  private requireDurableManagedInitialJobs(): void {
+    if (this.permissionRecoveryStateError) return;
+    const hasPendingInitial = [...this.jobs.values()].some(job => (
+      !job.recoveryOfJobId
+      && managedActivationStateForSnapshot(job) === 'initial_scope_propagation_pending'
+    ));
+    if (!hasPendingInitial) return;
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch (err) {
+      this.permissionRecoveryStateError = `managed initial activation ledger could not be persisted: ${
+        err instanceof Error ? err.message : String(err)
+      }`;
+    }
+  }
+
+  /**
+   * Best-effort auto-start of the just-persisted bot's daemon (no fleet restart).
+   * Records the outcome on the job snapshot so the frontend shows "已自动上线"
+   * instead of the restart hint. Never throws.
+   */
+  private async runLiveStart(
+    id: string,
+    appId: string,
+    recordOutcome = true,
+  ): Promise<{ attempted: boolean; ok?: boolean; message?: string }> {
+    if (!this.startBotLive) return { attempted: false };
+    try {
+      const r = await this.startBotLive(appId);
+      if (recordOutcome) {
+        this.patch(id, { liveStarted: r.ok, liveStartMessage: r.message });
+      }
+      return { attempted: true, ok: r.ok, message: r.message };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (recordOutcome) {
+        this.patch(id, { liveStarted: false, liveStartMessage: message });
+      }
+      return { attempted: true, ok: false, message };
+    }
+  }
+
+  private async runLiveStop(
+    id: string,
+    appId: string,
+  ): Promise<{ attempted: boolean; ok?: boolean; message?: string }> {
+    if (!this.stopBotLive) return { attempted: false };
+    try {
+      const r = await this.stopBotLive(appId);
+      this.patch(id, { liveStopped: r.ok, liveStopMessage: r.message });
+      return { attempted: true, ok: r.ok, message: r.message };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.patch(id, { liveStopped: false, liveStopMessage: message });
+      return { attempted: true, ok: false, message };
+    }
+  }
+
+  private async stableCriticalScopeReadback(
+    id: string,
+    appId: string,
+    appSecret: string,
+    brand: 'feishu' | 'lark',
+  ): Promise<{ ready: boolean; readback: CriticalScopeReadbackResult }> {
+    let consecutiveComplete = 0;
+    let readback: CriticalScopeReadbackResult = {
+      ok: false,
+      error: 'network',
+      message: '尚未读取权限状态',
+    };
+    for (let attempt = 1; attempt <= this.criticalScopeMaxAttempts; attempt += 1) {
+      try {
+        readback = await this.verifyCriticalScopes(appId, appSecret, brand);
+      } catch (err) {
+        readback = {
+          ok: false,
+          error: 'network',
+          message: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (readback.ok && readback.missingCritical.length === 0) {
+        consecutiveComplete += 1;
+      } else {
+        consecutiveComplete = 0;
+      }
+      this.patch(id, {
+        permissionStatusMsg: consecutiveComplete > 0
+          ? `正在确认 9 项核心权限稳定生效（${consecutiveComplete}/${this.criticalScopeStableReads}）`
+          : `正在等待 9 项核心权限生效（${attempt}/${this.criticalScopeMaxAttempts}）`,
+      });
+      if (consecutiveComplete >= this.criticalScopeStableReads) {
+        return { ready: true, readback };
+      }
+      if (
+        attempt < this.criticalScopeMaxAttempts
+        && this.criticalScopePollIntervalMs > 0
+      ) {
+        await new Promise<void>(resolve => {
+          setTimeout(resolve, this.criticalScopePollIntervalMs);
+        });
+      }
+    }
+    return { ready: false, readback };
+  }
+
+  private async activateRecoveredBot(
+    id: string,
+    appId: string,
+    addedBotIndex: number,
+    ensureLiveStart = false,
+  ): Promise<void> {
+    const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const current = bots[addedBotIndex];
+    if (
+      !current
+      || typeof current !== 'object'
+      || current.larkAppId !== appId
+      || current.activationStarting !== undefined
+      || current.activationCommitted !== undefined
+      || current.activationCommitting !== undefined
+    ) {
+      throw new Error('permission_recovery_activation_target_drift');
+    }
+    // Existing pre-gate bots were already daemon-visible. Their exact App may
+    // recover permissions without performing a second activation transition.
+    if (current.activationPending !== true && !ensureLiveStart) {
+      return;
+    }
+    await this.beginManagedActivation(id, appId, addedBotIndex);
+    const live = await this.runLiveStart(id, appId, false);
+    if (live.attempted && live.ok === true) {
+      try {
+        this.patch(id, {
+          activationPending: true,
+          activationCommitting: true,
+          liveStarted: false,
+          liveStartMessage: live.message,
+        });
+        this.persistPermissionRecoveryJobs();
+        await this.commitManagedActivation(id, appId, addedBotIndex);
+        await this.completeManagedActivation(id, appId, addedBotIndex);
+        return;
+      } catch (err) {
+        const stopped = await this.runLiveStop(id, appId);
+        if (stopped.attempted && stopped.ok === true) {
+          await this.restoreManagedActivationPending(id, appId, addedBotIndex);
+        }
+        throw err;
+      }
+    }
+
+    // An exit/timeout from start-bot is an unknown PM2 outcome. Stop and
+    // re-read the exact App before returning it to pending; otherwise a daemon
+    // could remain online while the durable config says it is blocked.
+    const stopped = await this.runLiveStop(id, appId);
+    if (!stopped.attempted || stopped.ok !== true) {
+      throw new Error(
+        `permission_recovery_activation_stop_not_acknowledged${stopped.message ? `: ${stopped.message}` : ''}`,
+      );
+    }
+    await this.restoreManagedActivationPending(id, appId, addedBotIndex);
+    throw new Error(
+      `permission_recovery_activation_not_acknowledged${live.message ? `: ${live.message}` : ''}`,
+    );
+  }
+
+  private async beginManagedActivation(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || current.activationPending !== true
+      ) {
+        throw new Error('permission_recovery_activation_target_drift');
+      }
+      const next = [...bots];
+      const activating = {
+        ...current,
+        activationStarting: { appId, jobId: id },
+      };
+      delete activating.activationPending;
+      delete activating.activationDeactivating;
+      delete activating.activationCommitting;
+      next[addedBotIndex] = activating;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+  }
+
+  private async commitManagedActivation(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || current.activationPending === true
+        || !isExactManagedActivationMarker(current.activationStarting, appId, id)
+      ) {
+        throw new Error('permission_recovery_activation_ack_target_drift');
+      }
+      const next = [...bots];
+      const ready = { ...current, activationCommitted: { appId, jobId: id } };
+      delete ready.activationStarting;
+      next[addedBotIndex] = ready;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+  }
+
+  private async restoreManagedActivationPending(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || (
+          !isExactManagedActivationMarker(current.activationStarting, appId, id)
+          && !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+          && !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+        )
+      ) {
+        throw new Error('permission_recovery_activation_rollback_target_drift');
+      }
+      const next = [...bots];
+      const pending = { ...current, activationPending: true };
+      delete pending.activationStarting;
+      delete pending.activationDeactivating;
+      delete pending.activationCommitted;
+      next[addedBotIndex] = pending;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+    this.patch(id, {
+      activationPending: true,
+      activationDeactivating: false,
+      activationCommitting: false,
+      liveStarted: false,
+    });
+  }
+
+  private async completeManagedActivation(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || current.activationPending === true
+        || current.activationStarting !== undefined
+        || current.activationDeactivating !== undefined
+        || !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+      ) {
+        throw new Error('permission_recovery_activation_completion_target_drift');
+      }
+      const next = [...bots];
+      const ready = { ...current };
+      delete ready.activationCommitted;
+      next[addedBotIndex] = ready;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+    this.finalizeManagedActivationJob(id);
+  }
+
+  private finalizeManagedActivationJob(id: string): void {
+    this.patch(id, {
+      activationPending: false,
+      activationCommitting: false,
+      liveStarted: true,
+    });
+    this.persistPermissionRecoveryJobs();
+  }
+
+  private async clearManagedActivationCommitted(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || !isExactManagedActivationMarker(current.activationCommitted, appId, id)
+      ) {
+        throw new Error('permission_recovery_activation_committed_target_drift');
+      }
+      const next = [...bots];
+      const ready = { ...current };
+      delete ready.activationCommitted;
+      next[addedBotIndex] = ready;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+  }
+
+  private async reconcileInterruptedManagedActivations(): Promise<void> {
+    const targets = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+      const marker = managedActivationMarker(bot);
+      if (!marker) {
+        if (
+          bot
+          && typeof bot === 'object'
+          && (
+            bot.activationDeactivating !== undefined
+            || bot.activationStarting !== undefined
+            || bot.activationCommitted !== undefined
+            || bot.activationCommitting !== undefined
+          )
+        ) {
+          this.permissionRecoveryStateError = 'managed activation marker is invalid';
+        }
+        return [];
+      }
+      if (
+        marker.phase === 'deactivating'
+        || marker.phase === 'starting'
+        || marker.phase === 'committed'
+      ) {
+        return [{ index, ...marker }];
+      }
+      if (!marker.appId) {
+        this.permissionRecoveryStateError = 'managed activation marker is invalid';
+        return [];
+      }
+      return [];
+    });
+    if (this.permissionRecoveryStateError) return;
+    for (const target of targets) {
+      try {
+        const job = this.jobs.get(target.jobId);
+        if (
+          target.phase === 'committed'
+          && job?.status === 'completed'
+          && job.activationPending !== true
+          && job.liveStarted === true
+        ) {
+          await this.clearManagedActivationCommitted(target.jobId, target.appId, target.index);
+          continue;
+        }
+        const stopped = await this.runLiveStop(target.jobId, target.appId);
+        if (!stopped.attempted || stopped.ok !== true) {
+          this.permissionRecoveryStateError = `managed activation stop could not be confirmed for ${target.appId}`;
+          return;
+        }
+        await this.restoreManagedActivationPending(target.jobId, target.appId, target.index);
+      } catch (err) {
+        this.permissionRecoveryStateError = `managed activation rollback failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        return;
+      }
+    }
+    for (const job of this.jobs.values()) {
+      if (
+        job.activationCommitting !== true
+        || job.status !== 'completed'
+        || !job.appId
+        || !job.workingDir
+      ) {
+        continue;
+      }
+      const matches = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+        const committed = isExactManagedActivationMarker(
+          bot?.activationCommitted,
+          job.appId!,
+          job.id,
+        );
+        return bot
+          && typeof bot === 'object'
+          && bot.larkAppId === job.appId
+          && bot.cliId === 'traex'
+          && bot.defaultWorkingDir === job.workingDir
+          && bot.activationPending !== true
+          && bot.activationStarting === undefined
+          && bot.activationDeactivating === undefined
+          && (bot.activationCommitted === undefined || committed)
+          ? [{ index, committed }]
+          : [];
+      });
+      if (matches.length !== 1) {
+        this.permissionRecoveryStateError = `managed activation commit could not be reconciled for ${job.appId}`;
+        return;
+      }
+      try {
+        if (matches[0]!.committed) {
+          await this.completeManagedActivation(job.id, job.appId, matches[0]!.index);
+        } else {
+          // completeManagedActivation clears the durable marker before it
+          // updates the private recovery ledger. A crash in that narrow window
+          // leaves no marker; the missing marker is the atomic-write ACK, so
+          // finish the job snapshot without touching bots.json again.
+          this.finalizeManagedActivationJob(job.id);
+        }
+      } catch (err) {
+        this.permissionRecoveryStateError = `managed activation commit reconciliation failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`;
+        return;
+      }
+    }
+  }
+
+  private async holdRecoveryActivation(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+      ) {
+        throw new Error('permission_recovery_activation_target_drift');
+      }
+      if (
+        current.activationStarting !== undefined
+        || current.activationCommitted !== undefined
+        || (
+          current.activationDeactivating !== undefined
+          && !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+        )
+      ) {
+        throw new Error('permission_recovery_activation_target_drift');
+      }
+      const next = [...bots];
+      next[addedBotIndex] = {
+        ...current,
+        activationPending: true,
+        activationDeactivating: { appId, jobId: id },
+      };
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+    this.patch(id, { activationPending: true, activationDeactivating: true });
+    this.persistPermissionRecoveryJobs();
+  }
+
+  private async markManagedDeactivated(id: string, appId: string, addedBotIndex: number): Promise<void> {
+    await this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const current = bots[addedBotIndex];
+      if (
+        !current
+        || typeof current !== 'object'
+        || current.larkAppId !== appId
+        || !isExactManagedActivationMarker(current.activationDeactivating, appId, id)
+      ) {
+        throw new Error('permission_recovery_deactivation_target_drift');
+      }
+      const next = [...bots];
+      const pending = { ...current, activationPending: true };
+      delete pending.activationDeactivating;
+      next[addedBotIndex] = pending;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+    });
+    this.patch(id, { activationPending: true, activationDeactivating: false });
+  }
+
+  start(input: BotOnboardingInput = {}): BotOnboardingJob {
     const id = `bot_${Math.random().toString(36).slice(2)}_${this.now().toString(36)}`;
     const createdAt = this.now();
     this.jobs.set(id, { id, status: 'starting', createdAt, updatedAt: createdAt });
-    const done = this.run(id).catch(err => {
+    const done = this.run(id, input).catch(err => {
       this.patch(id, {
         status: 'failed',
         error: 'unexpected_error',
@@ -109,49 +1336,399 @@ export class BotOnboardingManager {
     return { id, done };
   }
 
+  /**
+   * Resume only Open Platform authorization for one already-persisted Space
+   * Agent. The exact neutral working directory is the durable target anchor:
+   * zero or multiple matching bots fail closed, and this path never creates an
+   * App or registers another Bot. A managed caller may place the exact existing
+   * row behind the critical-scope activation marker before the fresh QR.
+   */
+  startPermissionRecovery(input: {
+    workingDir: string;
+    predecessorJobId: string;
+    expectedAppId: string;
+    priorRecoveryJobId?: string;
+    requireCriticalScopesBeforeActivation?: boolean;
+  }): StartPermissionRecoveryResult {
+    if (this.permissionRecoveryStateError) {
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    if (configuredBots.some((bot: any) => (
+      bot?.activationDeactivating !== undefined
+      || bot?.activationStarting !== undefined
+      || bot?.activationCommitted !== undefined
+    ))) {
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const candidates = configuredBots.flatMap((bot: any, index) => {
+      if (
+        !bot
+        || typeof bot !== 'object'
+        || bot.cliId !== 'traex'
+        || bot.defaultWorkingDir !== input.workingDir
+      ) {
+        return [];
+      }
+      const appId = typeof bot.larkAppId === 'string' ? bot.larkAppId.trim() : '';
+      const appSecret = typeof bot.larkAppSecret === 'string' ? bot.larkAppSecret : '';
+      if (!appId || !appSecret || !Array.isArray(bot.allowedUsers) || !hasOwnerEntry(bot.allowedUsers)) return [];
+      return [{ appId, appSecret, brand: bot.brand === 'lark' ? 'lark' as const : 'feishu' as const, index }];
+    });
+    if (candidates.length === 0) return { ok: false, error: 'permission_recovery_target_missing' };
+    if (candidates.length !== 1) return { ok: false, error: 'permission_recovery_target_ambiguous' };
+    if (!input.predecessorJobId || !input.workingDir || !input.expectedAppId || candidates[0].appId !== input.expectedAppId) {
+      return { ok: false, error: 'permission_recovery_target_invalid' };
+    }
+
+    const lineage = [...this.jobs.values()].filter(job =>
+      job.recoveryOfJobId === input.predecessorJobId
+      && job.workingDir === input.workingDir
+      && job.appId === input.expectedAppId,
+    ).sort((a, b) => (a.recoveryAttempt ?? 0) - (b.recoveryAttempt ?? 0));
+    const latest = lineage.at(-1);
+    if (!input.priorRecoveryJobId) {
+      if (latest) return { ok: true, job: { id: latest.id, done: Promise.resolve() } };
+    } else {
+      if (!latest || latest.id !== input.priorRecoveryJobId) {
+        return { ok: false, error: 'permission_recovery_target_invalid' };
+      }
+      if (!['completed', 'failed'].includes(latest.status)) {
+        return { ok: true, job: { id: latest.id, done: Promise.resolve() } };
+      }
+    }
+
+    const target = candidates[0];
+    const id = `botperm_${Math.random().toString(36).slice(2)}_${this.now().toString(36)}`;
+    const createdAt = this.now();
+    this.jobs.set(id, {
+      id,
+      status: 'starting',
+      createdAt,
+      updatedAt: createdAt,
+      appId: target.appId,
+      brand: target.brand,
+      cliId: 'traex',
+      workingDir: input.workingDir,
+      registrationMode: 'compat',
+      recoveryOfJobId: input.predecessorJobId,
+      recoveryAttempt: (latest?.recoveryAttempt ?? 0) + 1,
+      ...(input.requireCriticalScopesBeforeActivation === true
+        ? { criticalScopeActivationRequired: true }
+        : {}),
+      ...(latest ? { previousRecoveryJobId: latest.id } : {}),
+    });
+    try {
+      this.persistPermissionRecoveryJobs();
+    } catch {
+      this.jobs.delete(id);
+      this.permissionRecoveryStateError = 'permission recovery intent could not be persisted';
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const done = this.runPermissionRecovery(
+      id,
+      target.appId,
+      target.appSecret,
+      target.brand,
+      target.index,
+      input.requireCriticalScopesBeforeActivation === true,
+    ).catch(err => {
+      this.patch(id, {
+        status: 'failed',
+        error: 'permission_recovery_failed',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+    return { ok: true, job: { id, done } };
+  }
+
+  /**
+   * Finish only the exact activation-pending tail of an already-scanned
+   * managed initial/recovery job. This never opens SSO, creates an App, or
+   * issues another owner QR. botmux itself re-reads stable scopes, removes
+   * activationPending, and requires an idempotent exact-daemon start ACK
+   * before returning success.
+   */
+  async completeScopePropagation(input: {
+    jobId: string;
+    workingDir: string;
+    expectedAppId: string;
+  }): Promise<CompleteScopePropagationResult> {
+    await this.activationStartupReconciliation;
+    if (this.permissionRecoveryStateError) {
+      return { ok: false, error: 'permission_recovery_state_unavailable' };
+    }
+    const job = this.jobs.get(input.jobId);
+    if (!job) return { ok: false, error: 'permission_recovery_target_missing' };
+    const exactTarget = (
+      job.workingDir === input.workingDir
+      && job.appId === input.expectedAppId
+      && job.criticalScopeActivationRequired === true
+    );
+    if (!exactTarget) {
+      return { ok: false, error: 'permission_recovery_target_invalid' };
+    }
+    if (
+      job.status === 'completed'
+      && job.activationPending !== true
+      && job.liveStarted === true
+      && job.permission?.ok === true
+      && job.permission.eventMode === 4
+      && job.permission.verifiedEventCount === MANAGED_VERIFIED_EVENT_COUNT
+      && typeof job.permission.versionId === 'string'
+      && job.permission.versionId.trim().length > 0
+    ) {
+      return { ok: true };
+    }
+    const exactAck = (
+      job.permission?.eventMode === 4
+      && job.permission.verifiedEventCount === MANAGED_VERIFIED_EVENT_COUNT
+      && typeof job.permission.versionId === 'string'
+      && job.permission.versionId.trim().length > 0
+    );
+    const initialPropagationPending = (
+      job.status === 'completed'
+      && job.activationPending === true
+      && job.liveStarted !== true
+      && job.permission?.ok === true
+      && job.activationCommitting !== true
+    );
+    const recoveryPropagationPending = (
+      job.status === 'failed'
+      && job.error === 'permission_recovery_failed'
+      && job.permission?.ok === false
+      && job.permission.reason === 'scope_mapping_failed'
+    );
+    if (
+      job.platformQrScanConfirmedAt === undefined
+      || !exactAck
+      || (!initialPropagationPending && !recoveryPropagationPending)
+    ) {
+      return { ok: false, error: 'permission_recovery_target_invalid' };
+    }
+    const existingFlight = this.scopePropagationFlights.get(job.id);
+    if (existingFlight) return existingFlight;
+    const flight = this.finishScopePropagation(job, input);
+    this.scopePropagationFlights.set(job.id, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.scopePropagationFlights.get(job.id) === flight) {
+        this.scopePropagationFlights.delete(job.id);
+      }
+    }
+  }
+
+  private async finishScopePropagation(
+    job: BotOnboardingSnapshot,
+    input: {
+      jobId: string;
+      workingDir: string;
+      expectedAppId: string;
+    },
+  ): Promise<CompleteScopePropagationResult> {
+    const managedPermission = job.permission;
+    if (!managedPermission) {
+      return { ok: false, error: 'permission_recovery_target_invalid' };
+    }
+    const candidates = readBotsJsonOrEmpty(this.opts.botsJsonPath).flatMap((bot: any, index) => {
+      if (
+        !bot
+        || typeof bot !== 'object'
+        || bot.cliId !== 'traex'
+        || bot.defaultWorkingDir !== input.workingDir
+        || bot.larkAppId !== input.expectedAppId
+        || typeof bot.larkAppSecret !== 'string'
+        || !bot.larkAppSecret
+        || !Array.isArray(bot.allowedUsers)
+        || !hasOwnerEntry(bot.allowedUsers)
+      ) {
+        return [];
+      }
+      return [{
+        index,
+        appSecret: bot.larkAppSecret,
+        brand: bot.brand === 'lark' ? 'lark' as const : 'feishu' as const,
+      }];
+    });
+    if (candidates.length === 0) {
+      return { ok: false, error: 'permission_recovery_target_missing' };
+    }
+    if (candidates.length !== 1) {
+      return { ok: false, error: 'permission_recovery_target_ambiguous' };
+    }
+    const target = candidates[0];
+    const stable = await this.stableCriticalScopeReadback(
+      job.id,
+      input.expectedAppId,
+      target.appSecret,
+      target.brand,
+    );
+    if (!stable.ready) {
+      return { ok: false, error: 'permission_recovery_scopes_pending' };
+    }
+    const permissionAck: OpenPlatformAutomationResult = {
+      ok: true,
+      sessionFile: 'permission-recovery-ledger',
+      sessionSource: 'qr_login',
+      cookieCount: 0,
+      scopeCount: 9,
+      skippedScopeCount: 0,
+      subscribedEventCount: MANAGED_VERIFIED_EVENT_COUNT,
+      missingVcEvents: [],
+      eventModeReady: true,
+      // 这份 ACK 是从权限台账重建的，本次并没有碰 redirect 白名单。宁可报「没配」
+      // 让人去核一眼，也不能凭空报「配好了」——那正是 20029 静默失败的来源。
+      redirectConfigured: false,
+      // 同上：本次没有读/写「权限可访问的数据范围」。0 + warning 才是诚实的
+      // 「没碰过」，报 0 而不带 warning 会被下游读成「本来就没有待配的」。
+      privilegeRangeCount: 0,
+      privilegeRangeWarning: '本次从权限台账重建，未读写权限数据范围',
+      eventMode: managedPermission.eventMode,
+      verifiedEventCount: managedPermission.verifiedEventCount,
+      versionId: managedPermission.versionId,
+    };
+    this.finalizePermissions(
+      job.id,
+      input.expectedAppId,
+      target.brand,
+      target.index,
+      permissionAck,
+      'completed',
+    );
+    try {
+      await this.activateRecoveredBot(job.id, input.expectedAppId, target.index, true);
+    } catch {
+      return { ok: false, error: 'permission_recovery_activation_failed' };
+    }
+    this.patch(job.id, {
+      error: undefined,
+      message: undefined,
+      remainingSteps: undefined,
+    });
+    return { ok: true };
+  }
+
   get(id: string): BotOnboardingSnapshot | undefined {
     const job = this.jobs.get(id);
     return job ? { ...job } : undefined;
   }
 
+  suggestedAppName(): string {
+    return resolveSetupAppName(undefined, readBotsJsonOrEmpty(this.opts.botsJsonPath).length);
+  }
+
+  async sessionStatus(): Promise<BotOnboardingSessionStatus> {
+    const inspected = await this.inspectSession();
+    return inspected.ok
+      ? { status: 'ready', source: inspected.source, identity: inspected.identity }
+      : { status: 'scan_required', reason: inspected.reason };
+  }
+
   private patch(id: string, patch: Partial<BotOnboardingSnapshot>): void {
     const current = this.jobs.get(id);
     if (!current) return;
-    this.jobs.set(id, { ...current, ...patch, updatedAt: this.now() });
+    const next = { ...current, ...patch, updatedAt: this.now() };
+    this.jobs.set(id, next);
+    if (
+      current.recoveryOfJobId
+      || next.recoveryOfJobId
+      || managedActivationStateForSnapshot(current) !== undefined
+      || managedActivationStateForSnapshot(next) !== undefined
+    ) {
+      this.savePermissionRecoveryJobsBestEffort();
+    }
   }
 
-  private async run(id: string): Promise<void> {
-    const result = await this.registerApp({
-      onQRCodeReady: info => {
-        this.patch(id, {
-          status: 'waiting_for_scan',
-          qrUrl: info.url,
-          qrDataUrl: this.renderQrDataUrl(info.url),
-          expireAt: this.now() + info.expireIn * 1000,
-        });
-      },
-      onStatusChange: info => {
-        if (info.status === 'slow_down') this.patch(id, { message: 'slow_down' });
-        if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
-      },
+  private confirmPlatformQrScan(id: string, confirmedAt: number): void {
+    const current = this.jobs.get(id);
+    if (!current || current.platformQrScanConfirmedAt !== undefined) return;
+    if (!Number.isInteger(confirmedAt) || confirmedAt <= 0) {
+      throw new Error('platform_qr_scan_confirmation_invalid');
+    }
+    this.patch(id, { platformQrScanConfirmedAt: confirmedAt });
+  }
+
+  private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+    const cloneSource = input.cloneSourceAppId
+      ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
+      : undefined;
+    if (input.cloneSourceAppId && !cloneSource) {
+      this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
+    // Freeze the resolved name before any asynchronous work. Later bot list
+    // changes must not make the name drift midway through onboarding.
+    const appName = cloneSource
+      ? resolveCloneAppName(
+          input.appName,
+          [cloneSource.displayName, cloneSource.name, input.cloneSourceAppId]
+            .find(value => typeof value === 'string' && value.trim()),
+          this.now(),
+        )
+      : resolveSetupAppName(input.appName, configuredBots.length);
+    this.patch(id, {
+      registrationMode: input.registrationMode ?? 'web',
+      ...(input.requireCriticalScopesBeforeActivation
+        ? { criticalScopeActivationRequired: true }
+        : {}),
+      // SDK/Lark compatibility mode cannot apply a custom application name, so
+      // do not claim that the resolved Feishu name was used.
+      ...(input.registrationMode === 'compat' ? {} : { appName }),
     });
+
+    let result: RegisterAppResult;
+    // Web 主路径的登录身份邮箱。免扫码/单扫链路没有 device-flow 的 userOpenId,
+    // 自动确认 owner 只能靠它——正是表单顶部「将使用 …」展示并确认过的账号。
+    let sessionEmail: string | undefined;
+    if (input.registrationMode === 'compat' || !this.createApp) {
+      result = await this.registerWithSdk(id);
+    } else {
+      const created = await this.createApp({
+        name: appName,
+        ...(input.sessionMode === 'reuse'
+          ? { disableQrLogin: true, expectedIdentity: input.expectedIdentity }
+          : { forceQrLogin: true }),
+        disableBytedcliFallback: true,
+        onQrCode: info => {
+          this.patch(id, {
+            status: 'waiting_for_scan',
+            qrUrl: undefined,
+            qrDataUrl: this.renderQrDataUrl(info.qrPayload),
+            expireAt: this.now() + 120_000,
+          });
+        },
+        onStatus: message => {
+          this.patch(id, { message });
+        },
+      });
+      if (created.ok) {
+        result = created;
+        sessionEmail = created.sessionIdentity?.email?.trim() || undefined;
+      } else if (created.appId) {
+        this.patch(id, {
+          status: 'failed',
+          appId: created.appId,
+          error: created.reason,
+          message: `${created.message}；应用已经创建。为避免重复创建，本任务不会重试创建。可在开放平台读取 App Secret 后运行 botmux setup add --app-id ${created.appId} --app-secret <APP_SECRET> --allowed-users <OWNER_EMAIL> --open-platform-auto 继续。`,
+        });
+        return;
+      } else {
+        // Never surprise the user with a second QR. The frontend may offer a
+        // clearly labelled compatibility action that starts a separate job.
+        this.patch(id, { status: 'failed', error: created.reason, message: created.message });
+        return;
+      }
+    }
 
     if (!result.ok) {
       this.patch(id, { status: 'failed', error: result.error, message: result.message });
       return;
     }
-    if (result.brand === 'lark') {
-      this.patch(id, {
-        status: 'failed',
-        appId: result.appId,
-        brand: result.brand,
-        error: 'lark_unsupported',
-        message: 'botmux 当前 daemon 运行链路仅支持飞书 (feishu.cn) 租户',
-      });
-      return;
-    }
-
-    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand });
+    // brand (feishu / lark) 由扫码 tenant_brand 自动识别后落盘；daemon 链路
+    // 全程从 BotConfig.brand 派生域名，feishu / lark 都能直接跑。
+    this.patch(id, { status: 'verifying', appId: result.appId, brand: result.brand, message: undefined });
     const validation = await this.validateCredentials(result.appId, result.appSecret, result.brand);
     if (!validation.ok) {
       this.patch(id, {
@@ -168,35 +1745,426 @@ export class BotOnboardingManager {
       return;
     }
 
-    const bot: Record<string, any> = {
+    // CLI / 工作目录 / model 来自前端表单 (dashboard 已用 resolveCliId +
+    // invalidWorkingDirs 校验过). 留空回退到 setup 同款默认: claude-code / '~'.
+    let cliId: CliId = input.cliId ?? 'claude-code';
+    let workingDir = input.workingDir?.trim() || '~';
+    let bot: Record<string, any> = {
       larkAppId: result.appId,
       larkAppSecret: result.appSecret,
-      cliId: 'claude-code',
-      workingDir: '~',
+      cliId,
+      // aiden × claude/codex 等启动前缀；普通 CLI 不写此字段。
+      ...(input.wrapperCli ? { wrapperCli: input.wrapperCli } : {}),
+      ...(input.cliLaunchMode ? { cliLaunchMode: input.cliLaunchMode } : {}),
+      // 'fixed' → defaultWorkingDir（新话题直接启动、不弹卡片，扫描根回退 ~）；
+      // 'card'/缺省 → workingDir（仓库选择卡片扫描根，兼容旧调用方语义）。
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
     };
-    if (result.userOpenId) {
-      // 优先存 union_id（on_，跨应用稳定），避免 open_id 在其他 bot 下报 cross-app 错误。
-      // 用刚注册的应用自身凭证查询；若查询失败（无 contact 权限）则 fallback 到 open_id。
-      bot.allowedUsers = [await resolveToUnionId(result.appId, result.appSecret, result.userOpenId)];
+    if (input.model && input.model.trim()) bot.model = input.model.trim();
+    // brand 落盘：只在国际版写字段，feishu 留空（向后兼容，见 normalizeBrand）。
+    if (result.brand === 'lark') {
+      bot.brand = 'lark';
     }
-    writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalizeBotConfig(bot)]);
-    this.patch(id, { status: 'completed', addedBotIndex: bots.length });
-  }
-}
+    if (cloneSource) {
+      bot = cloneBotConfig(cloneSource, bot);
+      cliId = bot.cliId ?? 'claude-code';
+      workingDir = bot.defaultWorkingDir ?? bot.workingDir ?? '~';
+    }
+    try {
+      validateCliLaunchModeConfig({
+        cliId: bot.cliId,
+        cliLaunchMode: bot.cliLaunchMode,
+        wrapperCli: bot.wrapperCli,
+        cliRuntime: bot.cliRuntime,
+        cliPathOverride: bot.cliPathOverride,
+        sandbox: bot.sandbox,
+        readIsolation: bot.readIsolation,
+      }, 'Dashboard onboarding bot');
+    } catch (e) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: (e as Error).message,
+      });
+      return;
+    }
+    // 注意：此处 **不** 立刻把 bot 写进 bots.json。空 allowedUsers 的 bot 一旦落盘,
+    // 就是一个「可被 botmux start/restart 读取、运行时按无白名单全开放」的 fail-open
+    // 隐患（哪怕没出 restart hint, 关弹窗 / 重启 / pm2 重启都会以开放模式起）。
+    // 只有「能确认 owner」时才落盘——见下方两条路径。
 
-/**
- * 用指定应用的凭证把 open_id (ou_) 解析成 union_id (on_)。
- * union_id 跨应用稳定，适合写入 allowedUsers 供多个 bot 共用。
- * 若查询失败（无 contact 权限 / API 错误）则 fallback 返回原 open_id。
- */
-async function resolveToUnionId(appId: string, appSecret: string, openId: string): Promise<string> {
-  try {
-    const client = new Lark.Client({ appId, appSecret, disableTokenCache: false });
-    const res = await (client as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
+    // 跑 setup 同款开放平台自动配置 (导入权限 / 配 redirect / 建并发版)。
+    const auto = await this.runPermissionAutomation(id, result.appId, result.brand, {
+      cliId,
+      workingDir,
+      registrationMode: input.registrationMode ?? 'web',
+      requireVerifiedEvents: input.requireCriticalScopesBeforeActivation === true,
     });
-    if (res.code === 0 && res.data?.user?.union_id) return res.data.user.union_id as string;
-  } catch { /* fallback */ }
-  return openId;
+    // Every managed initial App first reaches one durable activation-pending
+    // snapshot. Even when scopes are immediately stable, starting here would
+    // leave a crash window between the exact PM2 ACK and persistence of the
+    // owner-session event/version ACK. The Web helper always completes this
+    // same job through the singleflight scope-propagation endpoint.
+    const activationPending = input.requireCriticalScopesBeforeActivation === true;
+    if (activationPending) {
+      bot.activationPending = true;
+      this.patch(id, { activationPending: true });
+    }
+
+    // 关键顺序：先确认 owner, 再决定是否落盘 + 终态。completed 必须意味着「bots.json
+    // 里这个 bot 带着至少一个 owner」, 绝不产出空 allowedUsers 的可启动 bot。
+    let ownerEntry: string | undefined;
+    // Native ou_ to persist as the resolve-independent fail-safe recipient —
+    // only when the scanner path verifies it belongs to THIS app (below).
+    let ownerOpenId: string | undefined;
+    if (result.userOpenId) {
+      // registerApp 返回的 open_id 来自扫码链路; 用新 app 自身凭证验证, 失败不
+      // fallback 写入该 (常为跨 app 的) ou_——避免把其他 app 视角的 open_id 固化
+      // 成 owner, 导致 /grant 和授权卡片一直判 non-owner。
+      ownerEntry = await resolveScannerAllowedUser(result.appId, result.appSecret, result.userOpenId, result.brand);
+      // Verified against this app (ownerEntry set) → the native open_id is a
+      // trustworthy owner anchor; store it raw so a boot-time contact-API blip
+      // can't strip our only DM recipient. (Skip on the email path below: no
+      // native open_id there, only an on_/email that still needs resolving.)
+      if (ownerEntry) ownerOpenId = result.userOpenId;
+    }
+    if (!ownerEntry && sessionEmail) {
+      // Web 主路径：创建应用的登录账号邮箱就是 owner（表单第一步已展示并确认），
+      // 不再让用户手填一遍。能解析成 union_id 就落 on_；无法证伪（scope 未生效 /
+      // 网络错误）直接落邮箱，运行时 resolveAllowedUsers 会再解析成本 app open_id；
+      // 只有确凿不在本企业时才回落 needs_owner。
+      ownerEntry = await resolveSessionEmailAllowedUser(result.appId, result.appSecret, sessionEmail, result.brand);
+    }
+
+    if (ownerEntry) {
+      const addedBotIndex = await this.persistBot({ ...bot, allowedUsers: [ownerEntry], ...(ownerOpenId ? { ownerOpenId } : {}) });
+      if (!activationPending) {
+        await this.runLiveStart(id, result.appId);
+      }
+      this.finalizePermissions(id, result.appId, result.brand, addedBotIndex, auto, 'completed');
+    } else {
+      // owner 没法自动确认：bot 先不落盘, 暂存内存等用户手动填 owner 校验通过后再写。
+      this.pendingBots.set(id, bot);
+      if (sessionEmail) this.patch(id, { suggestedOwner: sessionEmail });
+      this.finalizePermissions(id, result.appId, result.brand, undefined, auto, 'needs_owner');
+      this.savePendingJobs();
+    }
+  }
+
+  private async registerWithSdk(id: string): Promise<RegisterAppResult> {
+    return this.registerApp({
+      onQRCodeReady: info => {
+        this.patch(id, {
+          status: 'waiting_for_scan',
+          qrUrl: info.url,
+          qrDataUrl: this.renderQrDataUrl(info.url),
+          expireAt: this.now() + info.expireIn * 1000,
+        });
+      },
+      onStatusChange: info => {
+        if (info.status === 'slow_down') this.patch(id, { message: 'slow_down' });
+        if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
+      },
+    });
+  }
+
+  /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */
+  private async persistBot(bot: Record<string, any>): Promise<number> {
+    return this.runBotsMutation(() => {
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const normalized = normalizeBotConfig(bot);
+      const existing = bots.findIndex((b: any) => b?.larkAppId === bot.larkAppId);
+      if (existing >= 0) {
+        const next = [...bots];
+        next[existing] = normalized;
+        writeBotsJsonAtomic(this.opts.botsJsonPath, next);
+        return existing;
+      }
+      const index = bots.length;
+      writeBotsJsonAtomic(this.opts.botsJsonPath, [...bots, normalized]);
+      return index;
+    });
+  }
+
+  /**
+   * 用户在 needs_owner 状态下手动提交 owner。先做格式校验, 再用新 app 凭证 best-effort
+   * 校验「填的身份在本应用里是否可用」：只对能确凿判定的错误 (跨 app 的 ou_ / 不在本
+   * 企业的邮箱) 拒绝；scope 未生效 / 权限不足 / 网络错误等无法证伪的情况不拦截, 避免把
+   * 用户永久卡在 needs_owner。校验通过才落盘 allowedUsers 并进入 completed。
+   */
+  async submitOwner(id: string, rawEntries: string[]): Promise<{ ok: boolean; error?: string; message?: string }> {
+    const job = this.jobs.get(id);
+    if (!job) return { ok: false, error: 'unknown_onboarding_job' };
+    if (job.status !== 'needs_owner') return { ok: false, error: 'not_awaiting_owner' };
+    const pending = this.pendingBots.get(id);
+    if (!pending) return { ok: false, error: 'missing_app' };
+
+    const entries = rawEntries.map(e => e.trim()).filter(Boolean);
+    const invalid = findInvalidAllowedUserEntries(entries);
+    if (invalid.length > 0) {
+      return { ok: false, error: 'invalid_entries', message: `不是完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_)：${invalid.join(', ')}` };
+    }
+    if (!hasOwnerEntry(entries)) {
+      return { ok: false, error: 'no_owner', message: '至少需要一个完整邮箱、手机号（大陆 11 位 / 海外带 + 国家码）、union_id(on_) 或 open_id(ou_) 作为 owner。' };
+    }
+
+    const appId = typeof pending.larkAppId === 'string' ? pending.larkAppId : '';
+    const appSecret = typeof pending.larkAppSecret === 'string' ? pending.larkAppSecret : '';
+    const brand: Brand = job.brand ?? 'feishu';
+
+    const unusable = await detectUnusableOwnerEntries(appId, appSecret, brand, entries);
+    if (unusable.length > 0) {
+      return {
+        ok: false,
+        error: 'unusable_owner',
+        message: `以下身份在当前应用里无法解析（可能是其他应用的 open_id，或邮箱/手机号不在本企业）：${unusable.join(', ')}。请改用本企业邮箱、手机号或 union_id(on_)。`,
+      };
+    }
+
+    // 校验通过才落盘：此刻 bot 第一次进入 bots.json, 且带着非空 allowedUsers。
+    const addedBotIndex = await this.persistBot({ ...pending, allowedUsers: entries });
+    this.pendingBots.delete(id);
+    if (pending.activationPending === true) {
+      this.patch(id, { activationPending: true });
+    } else {
+      await this.runLiveStart(id, appId);
+    }
+    this.patch(id, { status: 'completed', addedBotIndex });
+    this.requireDurableManagedInitialJobs();
+    this.savePendingJobs();
+    return { ok: true };
+  }
+
+  /**
+   * 跑开放平台权限自动配置 (复用 setup 的 automateOpenPlatformSetup)。只负责把进度
+   * 推给前端 (configuring_permissions / waiting_for_platform_scan) 并返回结果——终态
+   * 由调用方在 owner 落盘后统一决定 (见 finalizePermissions)。
+   */
+  private async runPermissionAutomation(
+    id: string,
+    appId: string,
+    brand: 'feishu' | 'lark',
+    meta: {
+      cliId: string;
+      workingDir: string;
+      registrationMode: 'web' | 'compat';
+      requireVerifiedEvents: boolean;
+    },
+  ): Promise<OpenPlatformAutomationResult> {
+    this.patch(id, {
+      status: 'configuring_permissions',
+      appId,
+      cliId: meta.cliId,
+      workingDir: meta.workingDir,
+    });
+
+    const callbacks = {
+      onQrCode: (info: { qrText: string; qrPayload: string }) => {
+        this.patch(id, {
+          status: 'waiting_for_platform_scan',
+          platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
+        });
+      },
+      onQrScanConfirmed: (info: { confirmedAt: number }) => {
+        this.confirmPlatformQrScan(id, info.confirmedAt);
+      },
+      onStatus: (msg: string) => {
+        // onStatus follows onQrCode while polling; keep the QR visible.
+        this.patch(id, { permissionStatusMsg: msg });
+      },
+    };
+
+    try {
+      if (meta.registrationMode === 'compat') {
+        const sessionFilePath = join(
+          dirname(this.opts.botsJsonPath),
+          'onboarding-sessions',
+          `${id}.json`,
+        );
+        return await this.runOwnerPermissionAutomation(
+          id,
+          appId,
+          brand,
+          callbacks,
+          sessionFilePath,
+          meta.requireVerifiedEvents,
+          // compat 路径同样是「刚注册出来的新应用」（registerWithSdk），白名单必然为空。
+          true,
+        );
+      }
+      const first = await this.automateOpenPlatform({
+        appId,
+        brand,
+        // The Feishu primary path must never surprise the user with a second
+        // QR. It reuses the session created moments earlier or falls back to
+        // manual recovery. Only explicit compatibility mode may scan again.
+        disableQrLogin: meta.registrationMode === 'web',
+        disableBytedcliFallback: meta.registrationMode === 'web',
+        requireVerifiedEvents: meta.requireVerifiedEvents,
+        // 这条链路只在 run() 的建应用流程里被调到（应用几分钟前刚由本任务创建），
+        // 所以允许 redirect 白名单在读失败时覆盖写；存量 bot 的权限恢复走
+        // runPermissionRecovery，那边不传。
+        appJustCreated: true,
+        ...callbacks,
+      });
+      return first;
+    } catch (err) {
+      // automation 不应抛 (内部已结构化返回), 兜底当作失败 → 手动步骤.
+      return {
+        ok: false,
+        reason: 'api_error',
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  private async runPermissionRecovery(
+    id: string,
+    appId: string,
+    appSecret: string,
+    brand: 'feishu' | 'lark',
+    addedBotIndex: number,
+    requireCriticalScopesBeforeActivation: boolean,
+  ): Promise<void> {
+    if (requireCriticalScopesBeforeActivation) {
+      await this.holdRecoveryActivation(id, appId, addedBotIndex);
+      const stopped = await this.runLiveStop(id, appId);
+      if (!stopped.attempted || stopped.ok !== true) {
+        throw new Error(
+          `permission_recovery_deactivation_not_acknowledged${stopped.message ? `: ${stopped.message}` : ''}`,
+        );
+      }
+      await this.markManagedDeactivated(id, appId, addedBotIndex);
+    }
+    this.patch(id, { status: 'configuring_permissions' });
+    const sessionFilePath = join(dirname(this.opts.botsJsonPath), 'onboarding-sessions', `${id}.json`);
+    const auto = await this.runOwnerPermissionAutomation(id, appId, brand, {
+      onQrCode: (info: { qrText: string; qrPayload: string }) => {
+        this.patch(id, {
+          status: 'waiting_for_platform_scan',
+          platformQrDataUrl: this.renderQrDataUrl(info.qrPayload),
+        });
+      },
+      onQrScanConfirmed: (info: { confirmedAt: number }) => {
+        this.confirmPlatformQrScan(id, info.confirmedAt);
+      },
+      onStatus: (msg: string) => this.patch(id, { permissionStatusMsg: msg }),
+    }, sessionFilePath, requireCriticalScopesBeforeActivation);
+    if (!auto.ok) {
+      this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'failed', 'permission_recovery_failed');
+      return;
+    }
+    if (requireCriticalScopesBeforeActivation && !hasExactManagedAutomationAck(auto)) {
+      this.finalizePermissions(id, appId, brand, addedBotIndex, {
+        ok: false,
+        reason: 'event_verification_failed',
+        message: '受管权限恢复缺少同一 owner 会话的事件与版本精确 ACK',
+      }, 'failed', 'permission_recovery_failed');
+      return;
+    }
+    if (
+      requireCriticalScopesBeforeActivation
+      && this.jobs.get(id)?.platformQrScanConfirmedAt === undefined
+    ) {
+      throw new Error('platform_qr_scan_not_confirmed');
+    }
+    const stableScopeReadback = await this.stableCriticalScopeReadback(
+      id,
+      appId,
+      appSecret,
+      brand,
+    );
+    const scopeReadback = stableScopeReadback.readback;
+    if (!stableScopeReadback.ready) {
+      const failed: OpenPlatformAutomationResult = {
+        ok: false,
+        reason: scopeReadback.ok ? 'scope_mapping_failed' : 'api_error',
+        message: scopeReadback.ok
+          ? scopeReadback.missingCritical.length > 0
+            ? `关键权限回读仍缺失: ${scopeReadback.missingCritical.map(scope => scope.name).join(', ')}`
+            : `9 项核心权限尚未连续稳定生效（需要连续 ${this.criticalScopeStableReads} 次）`
+          : `关键权限回读失败: ${scopeReadback.message}`,
+        eventMode: auto.eventMode,
+        verifiedEventCount: auto.verifiedEventCount,
+        versionId: auto.versionId,
+      };
+      this.finalizePermissions(id, appId, brand, addedBotIndex, failed, 'failed', 'permission_recovery_failed');
+      return;
+    }
+    this.finalizePermissions(id, appId, brand, addedBotIndex, auto, 'completed');
+    await this.activateRecoveredBot(id, appId, addedBotIndex);
+  }
+
+  private async runOwnerPermissionAutomation(
+    id: string,
+    appId: string,
+    brand: 'feishu' | 'lark',
+    callbacks: Pick<OpenPlatformAutomationOptions, 'onQrCode' | 'onQrScanConfirmed' | 'onStatus'>,
+    sessionFilePath: string,
+    requireVerifiedEvents: boolean,
+    appJustCreated = false,
+  ): Promise<OpenPlatformAutomationResult> {
+    try {
+      return await this.automateOpenPlatform({
+        appId,
+        brand,
+        sessionFilePath,
+        forceQrLogin: true,
+        disableQrLogin: false,
+        disableBytedcliFallback: true,
+        requireVerifiedEvents,
+        appJustCreated,
+        ...callbacks,
+      });
+    } finally {
+      rmSync(sessionFilePath, { force: true });
+    }
+  }
+
+  /**
+   * 统一落终态：completed (已落盘 + 有 owner) 或 needs_owner (尚未落盘、待用户手动填)。
+   * needs_owner 时 addedBotIndex 为 undefined——bot 还没进 bots.json, 没有行号。
+   */
+  private finalizePermissions(
+    id: string,
+    appId: string,
+    brand: 'feishu' | 'lark',
+    addedBotIndex: number | undefined,
+    auto: OpenPlatformAutomationResult,
+    status: 'completed' | 'needs_owner' | 'failed',
+    error?: string,
+  ): void {
+    const permission: BotOnboardingPermission = auto.ok
+      ? {
+          ok: true,
+          scopeCount: auto.scopeCount,
+          skippedScopeCount: auto.skippedScopeCount,
+          versionId: auto.versionId,
+          scopeWarning: auto.scopeWarning,
+          eventMode: auto.eventMode,
+          verifiedEventCount: auto.verifiedEventCount,
+          // 白名单状态与 ok 分开透传：ok:true 也可能没写成 redirect（见类型注释）。
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
+        }
+      : {
+          ok: false,
+          reason: auto.reason,
+          message: auto.message,
+          eventMode: auto.eventMode,
+          verifiedEventCount: auto.verifiedEventCount,
+          versionId: auto.versionId,
+          redirectConfigured: auto.redirectConfigured,
+          redirectWarning: auto.redirectWarning,
+        };
+    this.patch(id, {
+      status,
+      ...(addedBotIndex !== undefined ? { addedBotIndex } : {}),
+      platformQrDataUrl: undefined,
+      permission,
+      ...(error ? { error } : {}),
+      ...(auto.ok ? {} : { remainingSteps: buildRemainingSteps(appId, brand) }),
+    });
+    this.requireDurableManagedInitialJobs();
+  }
 }

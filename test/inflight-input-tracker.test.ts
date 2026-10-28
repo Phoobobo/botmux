@@ -1,0 +1,274 @@
+/**
+ * InflightInputTracker — the state machine that re-queues user inputs across
+ * a CLI crash.
+ *
+ * Regression for the 2026-06-10 incident: a bot-to-bot @mention spawned a
+ * fresh codex session, the worker wrote the prompt to the PTY, codex exited
+ * code 1 ~3s later WITHOUT recording the submit (history.jsonl has no entry),
+ * the auto-restart brought up an idle CLI, and nothing re-delivered — the
+ * session sat at 「等待输入」 forever and the message was silently lost
+ * (killCli wipes pendingMessages; the item had already been dequeued).
+ *
+ * Run:  pnpm vitest run test/inflight-input-tracker.test.ts
+ */
+import { describe, it, expect } from 'vitest';
+
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+
+const item = (content: string, turnId?: string) => ({ content, turnId });
+
+describe('InflightInputTracker', () => {
+  it('retires an interrupted turn before CLI exit without dropping its next task', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.retireTurn('stop');
+    expect(tracker.onCliExit()).toBe(1);
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
+  it('retires an interrupted turn already moved to carry-over before restart', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.onCliExit();
+    tracker.retireTurn('stop');
+    tracker.retireTurn('stop');
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
+  it('incident shape: write → CLI crash → respawn re-queues the lost input', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('review PR #159', 'turn-1'));
+
+    expect(t.onCliExit()).toBe(1);
+
+    const carry = t.takeCarryOver();
+    expect(carry).toEqual([{ content: 'review PR #159', turnId: 'turn-1' }]);
+    // Consumed exactly once — a second spawn gets nothing.
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('preserves the Codex App structured sidecar across a crash replay', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = {
+      text: 'clean',
+      additionalContext: { botmux_sender: { kind: 'untrusted' as const, value: 'Alice' } },
+    };
+    t.onWrite({ content: '<legacy />', turnId: 'om_1', codexAppInput });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: '<legacy />', turnId: 'om_1', codexAppInput }]);
+  });
+
+  it('preserves logical content for a deferred transport command across crash replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    });
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 'om_1',
+    }]);
+  });
+
+  it('completed turn: idle clears in-flight, a later crash re-queues nothing', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('hello'));
+    t.onTurnComplete();
+
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('durable terminal clears the attempt before a later CLI exit can carry it over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 3 });
+
+    // worker emitTurnTerminal uses this same completion edge before releasing
+    // the durable arbiter back to the receiver-owned replay loop.
+    t.onTurnComplete();
+
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('CLI exit leaves durable replay to the receiver while preserving ordinary carry-over', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'ordinary IM', turnId: 'im-1' });
+    t.onWrite({ content: 'meeting delivery', turnId: 'delivery-1', dispatchAttempt: 2 });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{ content: 'ordinary IM', turnId: 'im-1' }]);
+  });
+
+  it('at-most-once (noReplay) input is NEVER carried over, but a plain sibling IS — per-item, not per-session', () => {
+    // codex #776 round-7 #1 + round-8: a keyed idempotency turn (dispatchAttempt
+    // undefined, so it would otherwise look like ordinary carry-over) is marked
+    // noReplay. The daemon terminalizes it to dispatch_unknown on CLI exit, so
+    // replaying it onto the auto-restarted CLI would run a turn the caller already
+    // saw failed. Round-8: the exclusion MUST be per-item — a plain (no-key)
+    // follow-up turn folded into the same http_async_ session via target.sessionId
+    // must SURVIVE the same CLI exit, not be dropped by a whole-session flag.
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'plain follow-up (same session, no key)', turnId: 'im-1' });
+    t.onWrite({ content: 'keyed async turn', turnId: 'trg_k', noReplay: true });
+
+    // Worker's real predicate: dispatchAttempt===undefined && !noReplay.
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined && !item.noReplay)).toBe(1);
+    // The keyed at-most-once turn is dropped; the plain sibling is preserved for replay.
+    expect(t.takeCarryOver()).toEqual([{ content: 'plain follow-up (same session, no key)', turnId: 'im-1' }]);
+  });
+
+  it('preserves a clean explicit-IM envelope but leaves a clean durable replay to the receiver', () => {
+    const t = new InflightInputTracker();
+    const codexAppInput = { text: 'clean' };
+    const origin = {
+      listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+      memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+      membershipGeneration: 1, sinkOwnerGeneration: 1,
+      receiverSessionId: 'receiver', larkMessageId: 'im-clean',
+    };
+    t.onWrite({
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    });
+    t.onWrite({
+      content: '<legacy delivery />',
+      turnId: 'delivery-clean',
+      dispatchAttempt: 7,
+      codexAppInput,
+    });
+
+    expect(t.onCliExit(item => item.dispatchAttempt === undefined)).toBe(1);
+    expect(t.takeCarryOver()).toEqual([{
+      content: '<legacy IM />',
+      turnId: 'im-clean',
+      vcMeetingImTurnOrigin: origin,
+      codexAppInput,
+    }]);
+  });
+
+  it('type-ahead: multiple writes before idle are all carried over in order', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('msg-1', 'a'));
+    t.onWrite(item('msg-2', 'b'));
+
+    expect(t.onCliExit()).toBe(2);
+    expect(t.takeCarryOver().map(i => i.content)).toEqual(['msg-1', 'msg-2']);
+  });
+
+  it('retires only an ambiguous write so a restart cannot blindly replay it', () => {
+    const t = new InflightInputTracker();
+    const ambiguous = item('possibly submitted', 'a');
+    const later = item('not attempted yet', 'b');
+    t.onWrite(ambiguous);
+    t.onWrite(later);
+
+    expect(t.retire(ambiguous)).toBe(true);
+    expect(t.retire(ambiguous)).toBe(false);
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver()).toEqual([later]);
+  });
+
+  it('double exit before respawn keeps the earlier stash (appends, not replaces)', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('first'));
+    expect(t.onCliExit()).toBe(1);
+
+    // Second exit with nothing newly in flight must not drop the stash.
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver().map(i => i.content)).toEqual(['first']);
+  });
+
+  it('exit → stash → new write before consume → second exit appends both batches', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('first'));
+    t.onCliExit();
+    t.onWrite(item('second'));
+    t.onCliExit();
+
+    expect(t.takeCarryOver().map(i => i.content)).toEqual(['first', 'second']);
+  });
+
+  it('takeCarryOver on a fresh spawn drops stale in-flight entries from a previous life', () => {
+    const t = new InflightInputTracker();
+    // A detach-style kill never fires onExit, so unacked could go stale.
+    t.onWrite(item('stale'));
+    expect(t.takeCarryOver()).toEqual([]);   // nothing stashed — nothing replayed
+    // The stale entry must be gone: a later exit has nothing to stash.
+    expect(t.onCliExit()).toBe(0);
+  });
+
+  it('full lifecycle: turns complete normally, only the crashed turn replays', () => {
+    const t = new InflightInputTracker();
+    // Turn 1 — normal.
+    t.onWrite(item('turn-1'));
+    t.onTurnComplete();
+    // Turn 2 — crash mid-turn.
+    t.onWrite(item('turn-2'));
+    expect(t.onCliExit()).toBe(1);
+    expect(t.takeCarryOver().map(i => i.content)).toEqual(['turn-2']);
+    // Turn 3 on the fresh CLI — normal again, nothing lingers.
+    t.onWrite(item('turn-3'));
+    t.onTurnComplete();
+    expect(t.onCliExit()).toBe(0);
+    expect(t.takeCarryOver()).toEqual([]);
+  });
+
+  it('a turn whose user record reached the transcript is kept apart: resumed CLIs do not get it again', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('review PR 1650', 'started'));
+    t.onWrite(item('queued follow-up', 'unseen'));
+    t.onTurnStarted('started');
+    expect(t.onCliExit()).toBe(1);
+    // Re-delivered as before: only the input the CLI never recorded.
+    expect(t.takeCarryOver()).toEqual([item('queued follow-up', 'unseen')]);
+    // The started one is held for a respawn that cannot resume (fresh session).
+    expect(t.takeStartedCarryOver()).toEqual([item('review PR 1650', 'started')]);
+    expect(t.takeStartedCarryOver()).toEqual([]);
+  });
+
+  it('a finished turn, a retired turn, or a forgotten input leaves nothing started to replay', () => {
+    const t = new InflightInputTracker();
+    t.onWrite(item('a', 'a'));
+    t.onTurnStarted('a');
+    t.onTurnComplete();
+    t.onCliExit();
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const b = item('b', 'b');
+    t.onWrite(b);
+    t.onTurnStarted('b');
+    t.onCliExit();
+    t.retireTurn('b');
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const c = item('c', 'c');
+    t.onWrite(c);
+    t.onTurnStarted('c');
+    expect(t.retire(c)).toBe(true);
+    t.onCliExit();
+    expect(t.takeStartedCarryOver()).toEqual([]);
+
+    const d = item('d', 'd');
+    t.onWrite(d);
+    t.onTurnStarted('d');
+    t.onCliExit();
+    t.forget(d);
+    expect(t.takeStartedCarryOver()).toEqual([]);
+  });
+
+  it('started inputs obey the same no-replay predicate on exit', () => {
+    const t = new InflightInputTracker();
+    t.onWrite({ content: 'keyed', turnId: 'k', noReplay: true });
+    t.onTurnStarted('k');
+    t.onCliExit(i => !i.noReplay);
+    expect(t.takeStartedCarryOver()).toEqual([]);
+  });
+});

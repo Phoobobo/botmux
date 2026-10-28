@@ -1,0 +1,424 @@
+import { stripAnsiScreenText } from './idle-detector.js';
+
+/**
+ * Worker input-gate — decide whether an incoming Lark message is written to the
+ * CLI's PTY now, or queued until the CLI is ready.
+ *
+ * `pendingMessages` always buffers the message; this only decides whether to
+ * kick `flushPending()` immediately. Three "write now" cases:
+ *
+ *  - `isPromptReady`  — the CLI is idle and waiting for input.
+ *  - `isFlushing`     — a drain loop is already running; let it pick this up.
+ *  - type-ahead       — the adapter (Codex/CoCo/Claude/antigravity) can accept
+ *                       input while BUSY: the TUI parks it, or steers it into
+ *                       the active turn. Antigravity's Queue waits for the turn
+ *                       to end; Send Immediately forwards without cancelling
+ *                       the current tool. That Enter is unsafe on agy's
+ *                       permission dialog, so the policy drops type-ahead when
+ *                       the bot disables the approval bypass.
+ *
+ * The catch the type-ahead case must respect: parking only works once the TUI
+ * is actually up. During STARTUP (and tmux re-attach) the input box doesn't
+ * exist yet, so a write is silently dropped — this is exactly how dispatch's
+ * brief reached Codex ~6s before its first idle and never landed. A first ready
+ * or explicit initialized-banner evidence must prove the TUI has booted. The
+ * latter survives screen resyncs and lets later arrivals use type-ahead even
+ * before the first idle; absence of a loading banner is not sufficient proof.
+ */
+export function shouldWriteNow(state: {
+  /** CLI is idle, waiting for input. */
+  isPromptReady: boolean;
+  /** A flushPending() drain loop is already in progress. */
+  isFlushing: boolean;
+  /** Adapter accepts input while the CLI is mid-turn (type-ahead). */
+  supportsTypeAhead: boolean;
+  /** True until the CLI has reached its first ready state (boot / re-attach window). */
+  awaitingFirstPrompt: boolean;
+  /** Positive initialization evidence for this CLI generation, not an idle signal. */
+  startupComplete?: boolean;
+  /** A stale Codex App runner must not receive normal or type-ahead input. */
+  holdForRunnerReload?: boolean;
+}): boolean {
+  if (state.holdForRunnerReload) return false;
+  if (state.isPromptReady || state.isFlushing) return true;
+  // Type-ahead is only safe after the TUI has booted at least once.
+  return state.supportsTypeAhead && (!state.awaitingFirstPrompt || state.startupComplete === true);
+}
+
+/**
+ * Claude runs every matching SessionStart hook in parallel and waits for all of
+ * them before it renders the real input prompt. Botmux's own hook can therefore
+ * finish while a slower project hook is still running. During the first prompt,
+ * treat the signal as an outer-selector boundary only and wait for fresh prompt
+ * evidence emitted after that boundary.
+ *
+ * Other ready-integrated CLIs (notably Hermes) emit their signal only once their
+ * prompt is usable, so their established authoritative-signal behavior stays
+ * unchanged.
+ */
+export function shouldWaitForPostSessionStartPromptEvidence(state: {
+  isClaudeFamily: boolean;
+  hasReadyPattern: boolean;
+  awaitingFirstPrompt: boolean;
+  isPromptReady: boolean;
+  alreadyWaiting: boolean;
+}): boolean {
+  return state.isClaudeFamily
+    && state.hasReadyPattern
+    && state.awaitingFirstPrompt
+    && !state.isPromptReady
+    && !state.alreadyWaiting;
+}
+
+/**
+ * Whether the "accept a prompt that is ALREADY on screen" fallback
+ * (decidePostHookPromptEvidence) may be armed for THIS SessionStart signal.
+ *
+ * The fallback exists only for `source=startup`: a brand-new session paints its
+ * prompt before the hooks finish and never redraws, so the fresh-evidence fence
+ * would otherwise wait out the full first-prompt timeout. Every OTHER source
+ * (resume/clear/compact) replays or reprints its transcript AFTER the boundary,
+ * so a genuinely fresh ❯ redraw arrives on its own in ~2s — the fence resolves
+ * without help. Arming the fallback there would instead let a >2s pause over a
+ * REPLAYED historical ❯ (still on the viewport during replay) satisfy the quiet
+ * gate and accept a pre-boundary prompt, defeating the very fence resume relies
+ * on. So the fallback is startup-only; the fence itself stays for all sources.
+ *
+ * Fail-safe: an unknown/absent source is NOT startup, so it does not arm — the
+ * signal simply falls back to the existing first-prompt timeout (status quo),
+ * never a new premature-delivery path.
+ */
+export function shouldArmPostHookPromptEvidenceFallback(state: {
+  /** shouldWaitForPostSessionStartPromptEvidence already said we're fencing. */
+  waitingForPostHookPrompt: boolean;
+  /** The SessionStart hook payload's `source` field (Claude: startup/resume/…). */
+  source: string | undefined;
+}): boolean {
+  return state.waitingForPostHookPrompt && state.source === 'startup';
+}
+
+/**
+ * How long after the SessionStart boundary the fallback starts polling.
+ *
+ * The boundary also resets the quiescence baseline (`lastPtyOutputAtMs`), so the
+ * quiet window can never be satisfied before `POST_HOOK_EVIDENCE_QUIET_MS` has
+ * passed — polling earlier than that only burns a wakeup. Polling LATER just
+ * adds dead time to every new session, so this tracks the quiet threshold.
+ */
+export const POST_HOOK_EVIDENCE_FALLBACK_MS = 2_000;
+/** PTY must be silent at least this long before the screen is trusted. */
+export const POST_HOOK_EVIDENCE_QUIET_MS = 2_000;
+/** Past this the fallback gives up and hands back to the first-prompt timeout. */
+export const POST_HOOK_EVIDENCE_MAX_WAIT_MS = 10_000;
+/** Re-poll delay when the PTY is quiet enough but the prompt isn't on screen yet. */
+export const POST_HOOK_EVIDENCE_RETRY_MS = 500;
+
+/**
+ * SessionStart boundary fallback — accept a prompt that is ALREADY on screen.
+ *
+ * At the boundary `resetReadyEvidence()` drops old evidence and waits for a
+ * freshly rendered ❯. Resume replays its transcript, so it redraws and the real
+ * evidence arrives in ~2s. A `source=startup` session does not redraw at all:
+ * the prompt was painted before the hooks finished and the TUI has no reason to
+ * paint it again. `!readySeen` then suppresses the idle detector's quiescence
+ * strategy permanently and every new topic waits out the full first-prompt
+ * timeout before its first message is forced in.
+ *
+ * So the wait window gets a second, independent criterion: the screen has been
+ * quiet long enough AND the prompt is visible on the CURRENT screen — no longer
+ * depending on a redraw that may never happen.
+ *
+ * What keeps a startup selector's look-alike ❯ out is NOT the quiet window — a
+ * selector sitting there waiting for a keypress is perfectly quiet. It is the
+ * arming point: the caller only arms this fallback once the SessionStart ready
+ * signal has arrived, and that hook does not fire while the selector is still
+ * up. Outside that window the fallback never runs at all.
+ *
+ * The caller must read the prompt from the rendered viewport
+ * (`renderer.rawSnapshot()`), NOT from the appended PTY log: after ANSI erase
+ * sequences are stripped, a ❯ the TUI already wiped still matches, which would
+ * accept a prompt that is no longer there.
+ *
+ * Returns the action for the polling timer:
+ *   - `accept` — seed the ready evidence; the idle detector still runs a full
+ *                quiescence check (spinner guard included) on top of it.
+ *   - `retry`  — re-arm after `retryInMs`.
+ *   - `stop`   — real evidence won the race, or the window expired; hand back
+ *                to the existing first-prompt timeout rather than poll forever.
+ */
+export function decidePostHookPromptEvidence(state: {
+  /** The worker is still waiting for post-boundary prompt evidence. */
+  stillWaiting: boolean;
+  /** Milliseconds since the fallback was armed at the SessionStart boundary. */
+  elapsedMs: number;
+  /** Milliseconds since the last PTY byte. */
+  quietMs: number;
+  /** The CURRENT rendered screen matches the adapter's readyPattern. */
+  screenHasReadyPattern: boolean;
+  maxWaitMs?: number;
+  quietThresholdMs?: number;
+}): { action: 'accept' | 'retry' | 'stop'; retryInMs?: number } {
+  const maxWaitMs = state.maxWaitMs ?? POST_HOOK_EVIDENCE_MAX_WAIT_MS;
+  const quietThresholdMs = state.quietThresholdMs ?? POST_HOOK_EVIDENCE_QUIET_MS;
+  // Real evidence arrived — the fallback steps aside.
+  if (!state.stillWaiting) return { action: 'stop' };
+  if (state.elapsedMs >= maxWaitMs) return { action: 'stop' };
+  if (state.quietMs < quietThresholdMs) {
+    // Wait out the remainder of the quiet window, plus a small margin so the
+    // next poll lands after the threshold rather than exactly on it.
+    return { action: 'retry', retryInMs: quietThresholdMs - state.quietMs + 100 };
+  }
+  if (!state.screenHasReadyPattern) return { action: 'retry', retryInMs: POST_HOOK_EVIDENCE_RETRY_MS };
+  return { action: 'accept' };
+}
+
+/**
+ * First-prompt-timeout fallback for a SessionStart boundary that never got its
+ * fresh prompt — accept the input box ALREADY on screen.
+ *
+ * `shouldArmPostHookPromptEvidenceFallback` keeps the boundary fallback
+ * startup-only because resume is expected to redraw a fresh ❯ within ~2s. That
+ * expectation does not always hold: when a session is woken with nothing to
+ * deliver (e.g. opening the web terminal of a suspended session), Claude can
+ * paint the resumed transcript and its prompt before the SessionStart signal
+ * reaches the worker and then never output again. The boundary has already
+ * dropped the ready evidence, the idle detector's quiescence strategy stays
+ * suppressed, and for a type-ahead CLI the first-prompt timeout only calls
+ * flushPending() — which is a no-op with an empty queue. The prompt is then
+ * never marked ready, the screen status stays `working` for the life of the
+ * worker, and anything waiting for an idle edge (a deferred suspend, for one)
+ * waits forever.
+ *
+ * Arm only when the boundary was still unresolved at the timeout, nothing was
+ * queued, and nobody typed into the web terminal since the boundary: a queued
+ * message is flushed by the timeout itself and its reply redraws the prompt
+ * through the normal path; typed input echoes a redraw of its own. By the time
+ * the timeout fires the transcript replay is long over, so the replay concern
+ * that keeps the boundary fallback startup-only does not apply; the caller
+ * still requires a quiet PTY and a framed input box (see
+ * `screenShowsFramedPrompt`).
+ */
+export function shouldArmFirstPromptTimeoutPromptSeed(state: {
+  /** `awaitingPostSessionStartPromptEvidence` as it was when the timeout fired. */
+  wasAwaitingPostHookPrompt: boolean;
+  /** Any input was queued for the timeout's flush. */
+  hasPendingInput: boolean;
+  /** Bytes were forwarded from the web terminal since the SessionStart boundary.
+   *  Such a submission is invisible to the queue and may not have produced
+   *  output yet, so the screen can no longer be read as a prompt left idle. */
+  webInputSinceBoundary: boolean;
+}): boolean {
+  return state.wasAwaitingPostHookPrompt && !state.hasPendingInput && !state.webInputSinceBoundary;
+}
+
+/**
+ * Whether the first-prompt-timeout fallback may keep polling.
+ *
+ * The fallback only ever accepts a screen that has been FROZEN since it was
+ * armed. Any PTY output after arming — a redraw, an echo of keys typed straight
+ * into the web terminal, a live turn — hands the prompt back to the normal idle
+ * path: fresh output re-feeds the idle detector, and a submission made directly
+ * in the terminal is invisible to the queue and in-flight tracking, so a quiet
+ * gap later in that turn must not be mistaken for a prompt left idle. Input is
+ * fenced separately from output because a submission can land before the CLI
+ * has echoed anything.
+ */
+export function firstPromptSeedStillWaiting(state: {
+  /** The backend the fallback was armed for is still the current one. */
+  sameBackend: boolean;
+  /** The prompt already became ready by itself. */
+  promptReady: boolean;
+  /** Input is queued for the CLI. */
+  hasPendingInput: boolean;
+  /** Input written to the PTY has not been consumed yet. */
+  hasUnackedInput: boolean;
+  /** Any PTY output chunk since the fallback was armed. */
+  outputSinceArm: boolean;
+  /** Any input since arming that the queue does not track — bytes forwarded from
+   *  the web terminal, or a botmux turn (e.g. a raw command) that changed the
+   *  current turn id — even if the CLI has not answered it with output yet. */
+  inputSinceArm: boolean;
+}): boolean {
+  return state.sameBackend
+    && !state.promptReady
+    && !state.hasPendingInput
+    && !state.hasUnackedInput
+    && !state.outputSinceArm
+    && !state.inputSinceArm;
+}
+
+/** A full-width light horizontal rule, as Claude draws above and below its input box. */
+const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
+
+/**
+ * The LAST line matching `readyPattern` sits inside a framed input box: the
+ * nearest non-blank line above and below it are both horizontal rules.
+ *
+ * A bare `readyPattern.test(screen)` also matches a selector's `❯ 1. Yes`
+ * (startup / trust / hook dialogs) and any ❯ left in the replayed transcript.
+ * Neither is framed by rules on both sides, so they are rejected here. Pass the
+ * rendered viewport with box drawing kept
+ * (`renderer.rawSnapshot({ preserveFormatting: true })`) — the default snapshot
+ * turns every `─` into a space — and never the appended PTY log.
+ */
+export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): boolean {
+  if (!screen) return false;
+  const lines = screen.split('\n');
+  let promptLine = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (readyPattern.test(lines[i])) { promptLine = i; break; }
+  }
+  if (promptLine < 0) return false;
+  const nearestNonBlank = (from: number, step: 1 | -1): string | undefined => {
+    for (let i = from + step; i >= 0 && i < lines.length; i += step) {
+      if (lines[i].trim() !== '') return lines[i];
+    }
+    return undefined;
+  };
+  const above = nearestNonBlank(promptLine, -1);
+  const below = nearestNonBlank(promptLine, 1);
+  return above !== undefined && below !== undefined
+    && INPUT_BOX_RULE.test(above) && INPUT_BOX_RULE.test(below);
+}
+
+export function shouldReleaseFirstPromptTimeout(state: {
+  /** Adapter wants the soft timeout to wait for a real readyPattern. */
+  deferFirstPromptTimeoutUntilReady: boolean;
+  /** There is a readyPattern that can eventually prove the input box exists. */
+  hasReadyPattern: boolean;
+  /** Milliseconds elapsed since this CLI spawn armed the first-prompt timer. */
+  elapsedMs: number;
+  /** Absolute hard cap for keeping the first prompt queued. */
+  hardTimeoutMs: number;
+}): boolean {
+  if (!state.deferFirstPromptTimeoutUntilReady) return true;
+  if (!state.hasReadyPattern) return true;
+  return state.elapsedMs >= state.hardTimeoutMs;
+}
+
+/**
+ * How long the ready-gate waits for its signal before falling back.
+ *
+ * The gate's fallback is only allowed to remove the gate's OWN extra hold; it
+ * must never become the effective first-prompt deadline for an adapter that
+ * deferred the first prompt to a real readyPattern. For such an adapter the
+ * gate's fallback flushes through `settleThenFlush` → `flushPending()`, and a
+ * type-ahead adapter admits that write while `isPromptReady` is still false —
+ * so a 45s fallback would deliver the first prompt at ~45-51s, straight into a
+ * TUI whose composer may not be mounted yet (dsh-tui boots in three stages and
+ * a first run also shells out to `dsh plugin add`). That silently pre-empts the
+ * adapter's own 90s hard cap, which exists precisely because no earlier
+ * evidence is trustworthy.
+ *
+ * The alignment is therefore an EXPLICIT, per-adapter opt-in
+ * (`readyGateFallbackAlignedWithHardCap`) and is deliberately not derived from
+ * the shared `deferFirstPromptTimeoutUntilReady` + readyPattern flags: dsh-tui
+ * explicitly opts in because its multi-stage boot needs the 90s hard cap, whereas
+ * other adapters (such as Hermes or Grok) rely on their own readyPattern /
+ * composer detection without aligning ready-gate fallbacks. Deriving it from
+ * shared flags would silently move unrelated deferring adapters from 45s to 90s.
+ *
+ * For an adapter that opts in, aligning the fallback with its hard cap keeps one
+ * deadline: the readyPattern still releases the gate as soon as it proves the
+ * input box, and an absent signal degrades to exactly the adapter's own
+ * hard-cap path.
+ */
+export function resolveReadySignalTimeoutMs(state: {
+  /** Adapter-declared opt-in (see `CliAdapter.readyGateFallbackAlignedWithHardCap`). */
+  alignFallbackWithFirstPromptHardCap: boolean;
+  /** Default fallback for adapters whose readiness signal is their only edge. */
+  readySignalTimeoutMs: number;
+  /** The adapter's own absolute cap for keeping the first prompt queued. */
+  firstPromptHardTimeoutMs: number;
+}): number {
+  if (!state.alignFallbackWithFirstPromptHardCap) return state.readySignalTimeoutMs;
+  return Math.max(state.readySignalTimeoutMs, state.firstPromptHardTimeoutMs);
+}
+
+/**
+ * After the ready-gate releases (SessionStart/direct-ready signal OR the timeout
+ * fallback), the worker settles for PTY quiescence and then decides whether to
+ * mark the prompt ready (which flushes for ALL adapters) vs. just calling
+ * flushPending() (which only flushes for type-ahead adapters). Marking ready is
+ * correct when ANY of these hold:
+ *   - promptReadyAfterSettle         — an authoritative direct ready command
+ *                                      fired (Hermes). Claude passes false here
+ *                                      and waits for post-hook PTY evidence.
+ *   - promptReadyDetectedDuringSettle — the idle detector fired during the
+ *                                      settle (a readyPattern/idle proved readiness).
+ *   - readyPatternSeenDuringHold      — a readyPattern fired WHILE the gate was
+ *                                      holding (markPromptReady was blocked by
+ *                                      readyGate.shouldHold()). The input box
+ *                                      exists; the gate only deferred delivery.
+ *
+ * Pins the Hermes regression: a non-type-ahead adapter that renders its prompt
+ * (❯) during the hold but never fires the SessionStart signal must be marked
+ * ready at settle — otherwise settle calls flushPending(), which bails on
+ * !isPromptReady && !typeAheadAllowed and leaves the first message queued until
+ * the hard timeout (and, before the hard-timeout fix, forever).
+ */
+export function decideSettleMarkReady(state: {
+  promptReadyAfterSettle: boolean;
+  promptReadyDetectedDuringSettle: boolean;
+  readyPatternSeenDuringHold: boolean;
+}): boolean {
+  return state.promptReadyAfterSettle || state.promptReadyDetectedDuringSettle || state.readyPatternSeenDuringHold;
+}
+
+/**
+ * At the first-prompt hard timeout the worker has waited the full cap. For
+ * type-ahead adapters flushPending() drains the queue even while !isPromptReady
+ * (the TUI parks input in its own queue). For non-type-ahead adapters
+ * flushPending() bails on !isPromptReady && !typeAheadAllowed, so the worker
+ * must mark the prompt ready first (markPromptReady() then flushes).
+ * Returns the action the worker must take:
+ *   - 'flush'      — call flushPending() (type-ahead adapters).
+ *   - 'mark-ready' — call markPromptReady() (non-type-ahead adapters).
+ *
+ * Pins the regression where non-type-ahead adapters only logged "forcing
+ * queued message flush" at the hard timeout without actually delivering the
+ * held first message.
+ */
+export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | 'mark-ready' {
+  return supportsTypeAhead ? 'flush' : 'mark-ready';
+}
+
+/**
+ * May the FIRST write of a fresh CLI spawn (startup commands or the first
+ * queued prompt) be typed now?
+ *
+ * Every timeout path that releases the first prompt (the 15s soft timeout's
+ * type-ahead flush, the ready-gate's 45s fallback settle) assumes the TUI is
+ * already reading input. Under host load that assumption fails: on 2026-10-20 a
+ * Claude Code spawn printed nothing for 66s, the gate fallback measured "45s of
+ * quiet" from a PTY that had never produced a byte, and `/effort xhigh` plus a
+ * multi-line prompt were typed into a process that was not reading yet. When
+ * Ink finally attached, it read the whole backlog as one paste burst: every
+ * Enter became a newline, every soft-newline `\` stayed literal, and nothing was
+ * submitted.
+ *
+ * Evidence that the input box exists, strongest first: an authoritative ready
+ * signal from the CLI itself (a direct ready command — NOT Claude's
+ * SessionStart hook, which only proves the startup selector is behind us), or
+ * the readyPattern on screen, which every adapter with one already relies on
+ * for idle detection. Without a readyPattern or a viewport there is nothing to
+ * check (unchanged behavior). The first-prompt hard cap stays a real deadline:
+ * past it the write goes through as before, so a stale readyPattern can delay
+ * the first prompt but never trap it.
+ */
+export function decideFirstWriteLiveness(state: {
+  readyPattern: RegExp | undefined;
+  /** Rendered viewport text; undefined when no screen is available. */
+  viewport: string | undefined;
+  /** The CLI's own ready signal arrived and proves its input box (not Claude-family). */
+  readySignal: boolean;
+  /** The spawn's first-prompt hard cap has elapsed. */
+  hardCapReached: boolean;
+}): { write: boolean; reason: 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  if (!state.readyPattern) return { write: true, reason: 'no-ready-pattern' };
+  if (state.readySignal) return { write: true, reason: 'ready-signal' };
+  if (state.viewport === undefined) return { write: true, reason: 'no-viewport' };
+  if (state.readyPattern.test(stripAnsiScreenText(state.viewport))) return { write: true, reason: 'prompt-visible' };
+  if (state.hardCapReached) return { write: true, reason: 'hard-cap' };
+  return { write: false, reason: 'prompt-not-visible' };
+}

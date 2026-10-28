@@ -1,383 +1,496 @@
-// Roles page: hierarchical group → bot role editor.
-// Displays groups as collapsible sections with bots nested inside.
-// Each bot has its own per-group role definition selectable for editing.
-import { escapeHtml, t } from './ui.js';
+import type {
+  EffectiveRoleValue,
+  RoleProfileEntryLike,
+} from './role-profile-match.js';
+import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
+import { readJson } from './dashboard-api.js';
 
-interface BotInfo {
+export interface BotInfo {
   larkAppId: string;
   botName: string;
   inChat: boolean;
   hasRole: boolean;
+  hasMessageListener?: boolean;
   oncallChat: unknown;
 }
 
-interface GroupInfo {
+export interface DashboardBot {
+  larkAppId: string;
+  botName: string;
+  botAvatarUrl?: string;
+}
+
+export interface GroupInfo {
   chatId: string;
   name?: string;
   memberBots: BotInfo[];
 }
 
-interface RoleData {
+export type RoleInjectMode = 'every' | 'once';
+
+export interface RoleData {
   chatId: string;
   content: string | null;
   byteLength: number;
   hasRole: boolean;
+  injectMode?: RoleInjectMode;
+  dispatchCompletionEnabled?: boolean;
+  replyPrivately?: boolean;
+  privateReplyNotice?: string;
+  effectiveContent?: string | null;
+  effectiveSource?: string;
+  hasEffectiveRole?: boolean;
 }
 
-const MAX_ROLE_BYTES = 4096;
-
-let cache: GroupInfo[] = [];
-let selectedGroupId: string | null = null;
-let selectedBotId: string | null = null;
-let editingContent = '';
-let expandedGroups = new Set<string>();
-
-function pageHtml(): string {
-  return `<section class="page roles-page">
-<div class="page-heading">
-  <div>
-    <p class="eyebrow">${t('nav.roles')}</p>
-    <h1>${t('roles.title')}</h1>
-    <p>${t('roles.subtitle')}</p>
-  </div>
-</div>
-<div class="roles-layout">
-  <div class="roles-tree-panel">
-    <div class="roles-tree-header">
-      <input type="search" id="roles-search" placeholder="${t('roles.search')}" />
-      <button type="button" id="roles-refresh">${t('roles.refresh')}</button>
-    </div>
-    <div id="roles-tree" class="roles-tree"></div>
-  </div>
-  <div class="roles-editor-panel">
-    <div id="roles-editor-empty" class="roles-editor-empty">${t('roles.selectHint')}</div>
-    <div id="roles-editor-form" class="roles-editor-form" style="display:none">
-      <div class="roles-editor-breadcrumb">
-        <span id="roles-editor-group-name"></span>
-        <span class="roles-breadcrumb-sep">›</span>
-        <span id="roles-editor-bot-name"></span>
-      </div>
-      <div class="roles-editor-meta">
-        <span id="roles-editor-chat-id" class="roles-editor-meta-line"></span>
-      </div>
-      <textarea id="roles-editor-textarea" placeholder="${t('roles.editorPlaceholder')}" rows="14"></textarea>
-      <div class="roles-editor-footer">
-        <span id="roles-editor-bytecount" class="roles-bytecount"></span>
-        <div class="roles-editor-actions">
-          <button type="button" id="roles-delete" class="danger">${t('roles.delete')}</button>
-          <button type="button" id="roles-save" class="primary">${t('roles.save')}</button>
-        </div>
-      </div>
-      <div id="roles-preview" class="roles-preview"></div>
-    </div>
-  </div>
-</div>
-</section>`;
+export interface MessageListenerData {
+  autoCloseAfterCompletion?: boolean;
+  enabled: boolean;
+  name?: string;
+  replyCardTitle?: string;
+  workingDir?: string;
+  prompt: string;
+  senderPolicy?: {
+    mode?: 'all_except_excluded' | 'include_only';
+    includeSenderOpenIds?: string[];
+    excludeSenderOpenIds?: string[];
+    excludeSenderKinds?: Record<string, 'user' | 'bot'>;
+    includeSenderTypes?: Array<'user' | 'bot'>;
+    excludeSenderTypes?: Array<'user' | 'bot'>;
+    excludeSelf?: boolean;
+  };
+  messagePolicy?: {
+    includeMsgTypes?: string[];
+    scope?: 'top_level';
+  };
+  /**
+   * Optional daemon-side keyword pre-filter. Absent or all-empty = match every
+   * message. Keywords are case-insensitive substrings. matchMode 'any'
+   * (default) needs one keyword to hit; 'all' needs every keyword to hit.
+   * V1 is keyword-only: regexes are not evaluated on the daemon main loop
+   * (catastrophic-backtracking DoS risk).
+   */
+  contentPolicy?: {
+    includeKeywords?: string[];
+    matchMode?: 'any' | 'all';
+    resolveDocumentTitles?: boolean;
+  };
+  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
 }
 
-async function loadGroups(): Promise<void> {
+export function mergeListenerContentPolicy(
+  current: MessageListenerData['contentPolicy'],
+  patch: NonNullable<MessageListenerData['contentPolicy']>,
+): NonNullable<MessageListenerData['contentPolicy']> {
+  return { ...(current ?? {}), ...patch };
+}
+
+export interface MessageListenerPreviewItem {
+  messageId: string;
+  createTime?: string;
+  messageText: string;
+  messageTitle?: string;
+  msgType: string;
+  senderOpenId?: string;
+  senderName?: string;
+  senderType: 'user' | 'bot';
+}
+
+export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+
+export interface MessageListenerRunPreviewResult {
+  runId?: string;
+  messageId: string;
+  ok: boolean;
+  state?: MessageListenerRunPreviewState;
+  action?: string;
+  sessionId?: string;
+  triggerId?: string;
+  error?: string;
+  replyMessageId?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  finishedAt?: string;
+}
+
+export interface MessageListenerPreviewResponse {
+  ok: boolean;
+  requestedLimit: number;
+  matches: MessageListenerPreviewItem[];
+  runId?: string;
+  results?: MessageListenerRunPreviewResult[];
+  error?: string;
+}
+
+export interface MessageListenerRunPreviewStatusResponse {
+  ok: boolean;
+  runId?: string;
+  results?: MessageListenerRunPreviewResult[];
+  error?: string;
+}
+
+export interface GroupMemberDisplay {
+  openId: string;
+  name: string;
+  memberType: 'user' | 'bot' | 'unknown';
+}
+
+export interface RoleProfileSummary {
+  profileId: string;
+  entryCount: number;
+  updatedAt: number | null;
+  botEntries?: Array<{ larkAppId: string; hasEntry: boolean }>;
+}
+
+export interface RoleProfileEntry {
+  profileId: string;
+  larkAppId: string;
+  content: string;
+  byteLength: number;
+  updatedAt: number | null;
+}
+
+export interface RoleProfileEntryData {
+  profileId: string;
+  larkAppId: string;
+  content: string | null;
+  byteLength: number;
+  hasEntry: boolean;
+}
+
+export interface RoleProfileContext {
+  entriesByProfile: Map<string, RoleProfileEntryLike[]>;
+  effectiveRolesByBot: Map<string, EffectiveRoleValue>;
+}
+
+export interface RoleProfileApplyResult {
+  larkAppId: string;
+  ok: boolean;
+  status: number;
+  error?: unknown;
+  wouldRefuse?: boolean;
+}
+
+// Keep in sync with MAX_ROLE_BYTES in core/role-resolver.ts (this is a browser
+// bundle, so it can't import the Node module — mirror the value here).
+export const MAX_ROLE_BYTES = 32768;
+export const ROLE_WARN_BYTES = Math.floor(MAX_ROLE_BYTES * 0.95);
+export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32768;
+export const MESSAGE_LISTENER_WARN_BYTES = Math.floor(MAX_MESSAGE_LISTENER_PROMPT_BYTES * 0.95);
+export const DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT = 5;
+export const MAX_MESSAGE_LISTENER_PREVIEW_LIMIT = 20;
+
+const PROFILE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+export function isValidProfileId(profileId: string): boolean {
+  return PROFILE_ID_RE.test(profileId) && profileId !== '.' && profileId !== '..';
+}
+
+export function hashChatId(hash = location.hash): string | null {
+  const [, query = ''] = hash.split('?');
+  const chatId = new URLSearchParams(query).get('chatId')?.trim();
+  return chatId || null;
+}
+
+export function hashBotId(hash = location.hash): string | null {
+  const [, query = ''] = hash.split('?');
+  const botId = new URLSearchParams(query).get('botId')?.trim();
+  return botId || null;
+}
+
+export function roleKey(larkAppId: string, chatId: string): string {
+  return effectiveRoleKey(larkAppId, chatId);
+}
+
+export function byteLength(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
+
+export function botRoleCount(group: GroupInfo): number {
+  return group.memberBots.filter(bot => bot.inChat && bot.hasRole).length;
+}
+
+export function botInChatCount(group: GroupInfo): number {
+  return group.memberBots.filter(bot => bot.inChat).length;
+}
+
+export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | null): RoleProfileEntry | undefined {
+  return larkAppId ? entries.find(entry => entry.larkAppId === larkAppId) : undefined;
+}
+
+export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo[] {
+  const q = filter.toLowerCase();
+  if (!q) return groups;
+  return groups.filter(group => {
+    const matchGroup = group.chatId.toLowerCase().includes(q) || (group.name ?? '').toLowerCase().includes(q);
+    const matchBot = group.memberBots.some(bot =>
+      bot.larkAppId.toLowerCase().includes(q) || (bot.botName ?? '').toLowerCase().includes(q),
+    );
+    return matchGroup || matchBot;
+  });
+}
+
+export function filterRoleProfiles(profiles: RoleProfileSummary[], filter: string): RoleProfileSummary[] {
+  const q = filter.toLowerCase();
+  return profiles.filter(profile => !q || profile.profileId.toLowerCase().includes(q));
+}
+
+export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: DashboardBot[] }> {
   const r = await fetch('/api/groups');
-  const data = await r.json();
-  cache = (data.chats ?? []).map((c: any) => ({
-    chatId: c.chatId,
-    name: c.name ?? c.chatId,
-    memberBots: (c.memberBots ?? []).map((m: any) => ({
-      larkAppId: m.larkAppId,
-      botName: m.botName ?? m.larkAppId,
-      inChat: m.inChat ?? false,
-      hasRole: m.hasRole ?? false,
-      oncallChat: m.oncallChat ?? null,
+  const data = await readJson(r);
+  return {
+    bots: (data.bots ?? []).map((bot: any) => ({
+      larkAppId: bot.larkAppId,
+      botName: bot.botName ?? bot.larkAppId,
+      botAvatarUrl: bot.botAvatarUrl,
     })),
-  }));
+    groups: (data.chats ?? []).map((chat: any) => ({
+      chatId: chat.chatId,
+      name: chat.name ?? chat.chatId,
+      memberBots: (chat.memberBots ?? []).map((member: any) => ({
+        larkAppId: member.larkAppId,
+        botName: member.botName ?? member.larkAppId,
+        inChat: member.inChat ?? false,
+        hasRole: member.hasRole ?? false,
+        hasMessageListener: member.hasMessageListener ?? false,
+        oncallChat: member.oncallChat ?? null,
+      })),
+    })),
+  };
 }
 
-async function loadRole(larkAppId: string, chatId: string): Promise<RoleData> {
+export async function loadProfiles(): Promise<RoleProfileSummary[]> {
+  const r = await fetch('/api/role-profiles');
+  const data = await readJson(r);
+  return data.profiles ?? [];
+}
+
+export async function loadProfileEntries(profileId: string): Promise<RoleProfileEntry[]> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}`);
+  const data = await readJson(r);
+  return data.entries ?? [];
+}
+
+export async function loadRole(larkAppId: string, chatId: string): Promise<RoleData> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`);
-  return r.json();
+  return readJson(r) as Promise<RoleData>;
 }
 
-async function saveRole(larkAppId: string, chatId: string, content: string): Promise<boolean> {
+export async function saveRole(
+  larkAppId: string,
+  chatId: string,
+  content: string,
+  injectMode: RoleInjectMode,
+  dispatchCompletionEnabled: boolean,
+): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, injectMode, dispatchCompletionEnabled }),
   });
   return r.ok;
 }
 
-async function deleteRole(larkAppId: string, chatId: string): Promise<boolean> {
+/** Persist only the injection mode (no content) — used when toggling the mode
+ *  select, which can apply even to a chat whose role comes from the team default. */
+export async function saveInjectMode(larkAppId: string, chatId: string, injectMode: RoleInjectMode): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ injectMode }),
+  });
+  return r.ok;
+}
+
+export async function saveDispatchCompletionEnabled(
+  larkAppId: string,
+  chatId: string,
+  dispatchCompletionEnabled: boolean,
+): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ dispatchCompletionEnabled }),
+  });
+  return r.ok;
+}
+
+export async function deleteRole(larkAppId: string, chatId: string): Promise<boolean> {
   const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, { method: 'DELETE' });
   return r.ok;
 }
 
-function botRoleCount(group: GroupInfo): number {
-  return group.memberBots.filter(b => b.inChat && b.hasRole).length;
+export function normalizeListenerPreviewLimit(limit: number): number {
+  if (!Number.isFinite(limit)) return DEFAULT_MESSAGE_LISTENER_PREVIEW_LIMIT;
+  return Math.min(MAX_MESSAGE_LISTENER_PREVIEW_LIMIT, Math.max(1, Math.floor(limit)));
 }
 
-function botInChatCount(group: GroupInfo): number {
-  return group.memberBots.filter(b => b.inChat).length;
+function padDatePart(value: number): string {
+  return String(value).padStart(2, '0');
 }
 
-function renderTree(filter: string = ''): void {
-  const tree = document.getElementById('roles-tree');
-  if (!tree) return;
+export function formatListenerPreviewTime(createTime: string | undefined): string {
+  if (!createTime) return '';
+  const raw = Number(createTime);
+  if (!Number.isFinite(raw) || raw <= 0) return '';
+  const ms = raw < 1_000_000_000_000 ? raw * 1000 : raw;
+  const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return '';
+  return [
+    date.getFullYear(),
+    '-',
+    padDatePart(date.getMonth() + 1),
+    '-',
+    padDatePart(date.getDate()),
+    ' ',
+    padDatePart(date.getHours()),
+    ':',
+    padDatePart(date.getMinutes()),
+    ':',
+    padDatePart(date.getSeconds()),
+  ].join('');
+}
 
-  const q = filter.toLowerCase();
-  const filtered = cache.filter(g => {
-    if (!q) return true;
-    const matchGroup = g.chatId.toLowerCase().includes(q) || (g.name ?? '').toLowerCase().includes(q);
-    const matchBot = g.memberBots.some(b =>
-      b.larkAppId.toLowerCase().includes(q) || (b.botName ?? '').toLowerCase().includes(q),
-    );
-    return matchGroup || matchBot;
+export async function previewMessageListener(
+  larkAppId: string,
+  chatId: string,
+  listener: MessageListenerData,
+  limit: number,
+): Promise<MessageListenerPreviewResponse> {
+  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}/preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ listener, limit: normalizeListenerPreviewLimit(limit) }),
   });
+  const body = await readJson(r);
+  return {
+    ok: r.ok && body.ok !== false,
+    requestedLimit: body.requestedLimit ?? normalizeListenerPreviewLimit(limit),
+    matches: body.matches ?? [],
+    error: body.error,
+  };
+}
 
-  if (filtered.length === 0) {
-    tree.innerHTML = `<div class="roles-empty">${t('roles.noChats')}</div>`;
-    return;
-  }
-
-  tree.innerHTML = filtered.map(g => {
-    const expanded = expandedGroups.has(g.chatId);
-    const inChatBots = g.memberBots.filter(b => b.inChat);
-    const arrow = expanded ? '▾' : '▸';
-    const roleCount = botRoleCount(g);
-    const totalInChat = botInChatCount(g);
-
-    const botRows = expanded
-      ? inChatBots.map(b => {
-          const isSelected = selectedGroupId === g.chatId && selectedBotId === b.larkAppId;
-          return `
-            <div class="roles-bot-row ${isSelected ? 'selected' : ''}"
-                 data-group-id="${escapeHtml(g.chatId)}"
-                 data-bot-id="${escapeHtml(b.larkAppId)}">
-              <span class="roles-bot-indent"></span>
-              <span class="roles-bot-icon">🤖</span>
-              <div class="roles-bot-info">
-                <div class="roles-bot-name">${escapeHtml(b.botName)}</div>
-                <div class="roles-bot-id">${escapeHtml(b.larkAppId)}</div>
-              </div>
-              <span class="roles-badge ${b.hasRole ? 'has-role' : 'no-role'}">
-                ${b.hasRole ? t('roles.configured') : t('roles.unconfigured')}
-              </span>
-            </div>`;
-        }).join('')
-      : '';
-
-    return `
-      <div class="roles-group-section">
-        <div class="roles-group-row ${expanded ? 'expanded' : ''} ${selectedGroupId === g.chatId && !selectedBotId ? 'selected' : ''}"
-             data-group-id="${escapeHtml(g.chatId)}">
-          <span class="roles-group-arrow">${arrow}</span>
-          <span class="roles-group-icon">📁</span>
-          <div class="roles-group-info">
-            <div class="roles-group-name">${escapeHtml(g.name ?? g.chatId)}</div>
-            <div class="roles-group-meta">
-              ${roleCount}/${totalInChat} ${t('roles.botsWithRoles')}
-            </div>
-          </div>
-          <span class="roles-group-chevron"></span>
-        </div>
-        <div class="roles-bot-list">${botRows}</div>
-      </div>`;
-  }).join('');
-
-  // Group row click → toggle expand
-  tree.querySelectorAll('.roles-group-row').forEach(row => {
-    row.addEventListener('click', () => {
-      const gid = (row as HTMLElement).dataset.groupId;
-      if (!gid) return;
-      if (expandedGroups.has(gid)) {
-        expandedGroups.delete(gid);
-      } else {
-        expandedGroups.add(gid);
-      }
-      renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-    });
+export async function runMessageListenerPreview(
+  larkAppId: string,
+  chatId: string,
+  listener: MessageListenerData,
+  limit: number,
+): Promise<MessageListenerPreviewResponse> {
+  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}/run-preview`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ listener, limit: normalizeListenerPreviewLimit(limit) }),
   });
+  const body = await readJson(r);
+  return {
+    ok: r.ok && body.ok !== false,
+    requestedLimit: body.requestedLimit ?? normalizeListenerPreviewLimit(limit),
+    matches: body.matches ?? [],
+    results: body.results,
+    error: body.error,
+  };
+}
 
-  // Bot row click → select for editing
-  tree.querySelectorAll('.roles-bot-row').forEach(row => {
-    row.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const gid = (row as HTMLElement).dataset.groupId;
-      const bid = (row as HTMLElement).dataset.botId;
-      if (gid && bid) selectBot(gid, bid);
-    });
+export async function loadMessageListenerRunPreviewStatus(
+  larkAppId: string,
+  chatId: string,
+  runId: string,
+): Promise<MessageListenerRunPreviewStatusResponse> {
+  const r = await fetch(`/api/message-listeners/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}/run-preview/${encodeURIComponent(runId)}`);
+  const body = await readJson(r);
+  return {
+    ok: r.ok && body.ok !== false,
+    runId: body.runId,
+    results: body.results,
+    error: body.error,
+  };
+}
+
+export async function loadGroupMemberDisplays(larkAppId: string, chatId: string): Promise<GroupMemberDisplay[]> {
+  const r = await fetch(`/api/groups/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}/members-display`);
+  const data = await readJson(r);
+  return data.members ?? [];
+}
+
+export async function loadProfileEntry(profileId: string, larkAppId: string): Promise<RoleProfileEntryData> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`);
+  return readJson(r) as Promise<RoleProfileEntryData>;
+}
+
+export async function saveProfileEntry(profileId: string, larkAppId: string, content: string): Promise<boolean> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ content, allowEmpty: true }),
   });
+  return r.ok;
 }
 
-async function selectBot(groupId: string, botId: string): Promise<void> {
-  selectedGroupId = groupId;
-  selectedBotId = botId;
-
-  const role = await loadRole(botId, groupId);
-
-  const empty = document.getElementById('roles-editor-empty');
-  const form = document.getElementById('roles-editor-form');
-  const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
-  const groupName = document.getElementById('roles-editor-group-name');
-  const botName = document.getElementById('roles-editor-bot-name');
-  const chatIdEl = document.getElementById('roles-editor-chat-id');
-
-  if (empty) empty.style.display = 'none';
-  if (form) form.style.display = '';
-
-  const group = cache.find(g => g.chatId === groupId);
-  const bot = group?.memberBots.find(b => b.larkAppId === botId);
-
-  if (groupName) groupName.textContent = group?.name ?? groupId;
-  if (botName) botName.textContent = bot?.botName ?? botId;
-  if (chatIdEl) chatIdEl.textContent = `${groupId}  ·  ${botId}`;
-
-  editingContent = role.content ?? '';
-  if (textarea) {
-    textarea.value = editingContent;
-    textarea.focus();
-  }
-  updateByteCount();
-  updatePreview();
-  renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-
-  const delBtn = document.getElementById('roles-delete');
-  if (delBtn) delBtn.style.display = role.hasRole ? '' : 'none';
+export async function deleteProfileEntry(profileId: string, larkAppId: string): Promise<boolean> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(profileId)}/${encodeURIComponent(larkAppId)}`, { method: 'DELETE' });
+  return r.ok;
 }
 
-function updateByteCount(): void {
-  const el = document.getElementById('roles-editor-bytecount');
-  if (!el) return;
-  const len = new TextEncoder().encode(editingContent).length;
-  el.textContent = `${len} / ${MAX_ROLE_BYTES} bytes`;
-  el.className = `roles-bytecount ${len > 3800 ? 'warn' : ''} ${len > MAX_ROLE_BYTES ? 'over' : ''}`;
-  updateSaveButton(len);
-}
-
-function updateSaveButton(byteLen?: number): void {
-  const btn = document.getElementById('roles-save') as HTMLButtonElement | null;
-  if (!btn) return;
-  const len = byteLen ?? new TextEncoder().encode(editingContent).length;
-  btn.disabled = len > MAX_ROLE_BYTES || editingContent.trim().length === 0;
-}
-
-function updatePreview(): void {
-  const preview = document.getElementById('roles-preview');
-  if (!preview) return;
-  if (!editingContent.trim()) {
-    preview.innerHTML = `<small>${t('roles.previewEmpty')}</small>`;
-  } else {
-    preview.innerHTML = `<strong>${t('roles.preview')}</strong><pre>${escapeHtml(editingContent)}</pre>`;
-  }
-}
-
-function resetEditor(): void {
-  selectedGroupId = null;
-  selectedBotId = null;
-  editingContent = '';
-
-  const empty = document.getElementById('roles-editor-empty');
-  const form = document.getElementById('roles-editor-form');
-  const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
-  const delBtn = document.getElementById('roles-delete');
-
-  if (empty) empty.style.display = '';
-  if (form) form.style.display = 'none';
-  if (textarea) textarea.value = '';
-  if (delBtn) delBtn.style.display = 'none';
-}
-
-export async function renderRolesPage(root: HTMLElement): Promise<void> {
-  root.innerHTML = pageHtml();
-  expandedGroups.clear();
-  resetEditor();
-
-  await loadGroups();
-  // Auto-expand groups that have at least one bot with a role
-  for (const g of cache) {
-    if (botRoleCount(g) > 0) expandedGroups.add(g.chatId);
-  }
-  renderTree();
-
-  // Search
-  document.getElementById('roles-search')?.addEventListener('input', (e) => {
-    renderTree((e.target as HTMLInputElement).value);
-  });
-
-  // Refresh
-  document.getElementById('roles-refresh')?.addEventListener('click', async () => {
-    await loadGroups();
-    renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-    // Re-fetch current selection if any
-    if (selectedGroupId && selectedBotId) {
-      const role = await loadRole(selectedBotId, selectedGroupId);
-      const textarea = document.getElementById('roles-editor-textarea') as HTMLTextAreaElement;
-      if (textarea) textarea.value = role.content ?? '';
-      editingContent = role.content ?? '';
-      updateByteCount();
-      updatePreview();
-      const delBtn = document.getElementById('roles-delete');
-      if (delBtn) delBtn.style.display = role.hasRole ? '' : 'none';
-    }
-  });
-
-  // Save
-  document.getElementById('roles-save')?.addEventListener('click', async function(this: HTMLButtonElement) {
-    if (!selectedGroupId || !selectedBotId) return;
-    this.disabled = true;
-    this.textContent = '...';
+export async function loadRoleProfileContext(groups: GroupInfo[], profiles: RoleProfileSummary[]): Promise<RoleProfileContext> {
+  const detailPairs = await Promise.all(profiles.map(async profile => {
     try {
-      const ok = await saveRole(selectedBotId, selectedGroupId, editingContent);
-      if (ok) {
-        await loadGroups();
-        renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-        const delBtn = document.getElementById('roles-delete');
-        if (delBtn) delBtn.style.display = '';
-        // Brief saved indicator
-        const statusEl = document.createElement('span');
-        statusEl.className = 'roles-saved-flash';
-        statusEl.textContent = ` ${t('roles.saved')}`;
-        const footer = document.querySelector('.roles-editor-footer');
-        footer?.appendChild(statusEl);
-        setTimeout(() => statusEl.remove(), 2000);
-      } else {
-        // Show error feedback
-        const statusEl = document.createElement('span');
-        statusEl.className = 'roles-saved-flash roles-save-error';
-        statusEl.textContent = editingContent.trim().length === 0
-          ? ` ${t('roles.emptyError')}`
-          : ` ${t('roles.saveFailed')}`;
-        const footer = document.querySelector('.roles-editor-footer');
-        footer?.appendChild(statusEl);
-        setTimeout(() => statusEl.remove(), 3000);
-      }
-    } finally {
-      this.disabled = false;
-      this.textContent = t('roles.save');
+      const r = await fetch(`/api/role-profiles/${encodeURIComponent(profile.profileId)}`);
+      const body = await readJson(r);
+      return [profile.profileId, Array.isArray(body.entries) ? body.entries as RoleProfileEntryLike[] : []] as const;
+    } catch {
+      return [profile.profileId, [] as RoleProfileEntryLike[]] as const;
     }
-  });
+  }));
 
-  // Delete
-  document.getElementById('roles-delete')?.addEventListener('click', async function(this: HTMLButtonElement) {
-    if (!selectedGroupId || !selectedBotId) return;
-    if (!confirm(t('roles.confirmDelete'))) return;
-    this.disabled = true;
-    this.textContent = '...';
-    try {
-      const ok = await deleteRole(selectedBotId, selectedGroupId);
-      if (ok) {
-        await loadGroups();
-        resetEditor();
-        renderTree((document.getElementById('roles-search') as HTMLInputElement)?.value ?? '');
-      }
-    } finally {
-      this.disabled = false;
-      this.textContent = t('roles.delete');
+  const seen = new Set<string>();
+  const roleTargets: Array<{ larkAppId: string; chatId: string }> = [];
+  for (const group of groups) {
+    for (const bot of group.memberBots) {
+      if (!bot.inChat || !bot.hasRole) continue;
+      const key = roleKey(bot.larkAppId, group.chatId);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      roleTargets.push({ larkAppId: bot.larkAppId, chatId: group.chatId });
     }
-  });
+  }
+  const nextEffectiveRoles = await loadEffectiveRoleMap(roleTargets);
 
-  // Live edit
-  document.getElementById('roles-editor-textarea')?.addEventListener('input', (e) => {
-    editingContent = (e.target as HTMLTextAreaElement).value;
-    updateByteCount();
-    updatePreview();
+  return {
+    entriesByProfile: new Map(detailPairs),
+    effectiveRolesByBot: nextEffectiveRoles,
+  };
+}
+
+export async function applyRoleProfile(input: {
+  profileId: string;
+  chatId: string;
+  larkAppId: string;
+  force: boolean;
+  preview: boolean;
+}): Promise<RoleProfileApplyResult> {
+  const r = await fetch(`/api/role-profiles/${encodeURIComponent(input.profileId)}/apply`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      chatId: input.chatId,
+      larkAppId: input.larkAppId,
+      force: input.force,
+      preview: input.preview,
+    }),
   });
+  const body = await readJson(r);
+  return {
+    larkAppId: input.larkAppId,
+    ok: r.ok && body.ok !== false,
+    status: r.status,
+    error: body.error,
+    wouldRefuse: body.wouldRefuse,
+  };
+}
+
+export async function saveReplyPrivately(larkAppId: string, chatId: string, settings: { replyPrivately?: boolean; privateReplyNotice?: string }): Promise<boolean> {
+  const r = await fetch(`/api/roles/${encodeURIComponent(larkAppId)}/${encodeURIComponent(chatId)}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings),
+  });
+  return r.ok;
 }

@@ -8,15 +8,28 @@ import {
   type ConnectorDefinition,
 } from '../services/connector-store.js';
 import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../services/connector-lifecycle-group-name.js';
+import {
   createWebhookSecret,
   deleteWebhookSecret,
   generateWebhookSecretPlaintext,
   listWebhookSecretRefs,
   setWebhookSecret,
 } from '../services/webhook-key.js';
-import { listTriggerLogs, pruneTriggerLogs, summarizeTriggerLogs, type TriggerLogStats } from '../services/trigger-log-store.js';
-import type { TriggerErrorCode } from '../services/trigger-types.js';
-import { jsonRes } from './workflow-api.js';
+import { platformMachineBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
+import {
+  pruneTriggerLogs,
+  queryTriggerLogs,
+  summarizeTriggerLogOverview,
+  summarizeTriggerLogs,
+  type TriggerLogListOptions,
+  type TriggerLogStats,
+} from '../services/trigger-log-store.js';
+import type { TriggerAction, TriggerErrorCode } from '../services/trigger-types.js';
+import { jsonRes } from './http.js';
 
 const DEFAULT_VERIFY_HEADERS = {
   signatureHeader: 'x-botmux-signature',
@@ -64,6 +77,25 @@ function logStatus(v: string | null): 'ok' | 'error' | undefined {
   return v === 'ok' || v === 'error' ? v : undefined;
 }
 
+function logAction(v: string | null): TriggerAction | 'failed' | undefined {
+  return v && ['queued', 'delivered', 'dry_run', 'ignored', 'completed', 'failed'].includes(v)
+    ? v as TriggerAction | 'failed'
+    : undefined;
+}
+
+function triggerLogFilters(url: URL): TriggerLogListOptions {
+  const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
+  return {
+    connectorId: url.searchParams.get('connectorId') ?? undefined,
+    status: logStatus(url.searchParams.get('status')),
+    errorCode: errorCode ?? undefined,
+    method: url.searchParams.get('method') ?? undefined,
+    action: logAction(url.searchParams.get('action')),
+    query: url.searchParams.get('q') ?? undefined,
+    since: url.searchParams.get('since') ?? undefined,
+  };
+}
+
 function emptyStats(connectorId: string): TriggerLogStats {
   return { connectorId, total: 0, ok: 0, error: 0, actions: {}, errorCodes: {} };
 }
@@ -72,16 +104,145 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const r = v as Record<string, unknown>;
   if (typeof r.dedupKey !== 'string' || !r.dedupKey.trim()) return null;
-  if (typeof r.status !== 'string' || !r.status.trim()) return null;
-  const rawMap = record(r.statusMap);
-  const statusMap = Object.fromEntries(
-    Object.entries(rawMap).filter((e): e is [string, string] => typeof e[1] === 'string'),
-  );
-  return {
-    dedupKey: r.dedupKey.trim(),
-    status: r.status.trim(),
-    ...(Object.keys(statusMap).length > 0 ? { statusMap } : {}),
+  return { dedupKey: r.dedupKey.trim() };
+}
+
+function normalizeLifecycleGroupName(
+  value: unknown,
+  prior: ConnectorDefinition['lifecycleGroupName'] | undefined,
+): { ok: true; value?: ConnectorDefinition['lifecycleGroupName'] } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'fixed', 'template'].includes(mode)) {
+    return { ok: false, error: 'bad_lifecycle_group_name_mode' };
+  }
+  if (mode === 'default') return { ok: true };
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: 'lifecycle_group_name_required' };
+  if (Array.from(text).length > CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH) {
+    return { ok: false, error: 'lifecycle_group_name_too_long' };
+  }
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'lifecycle_group_name_template_invalid' };
+  }
+  return { ok: true, value: { mode: mode as 'fixed' | 'template', text } };
+}
+
+/** Inbound idempotency config. Both knobs are optional and the whole object is
+ *  omitted when neither is set, so existing stores stay byte-identical (and
+ *  header/query carriage needs no config at all — it is always honoured). An
+ *  invalid `keyPath` is dropped rather than rejected: the field only ADDS a
+ *  carriage option, so a typo must not make an otherwise-valid connector
+ *  unsavable. Path syntax matches the dedupKey extractor's own grammar. */
+function normalizeIdempotency(v: unknown): ConnectorDefinition['idempotency'] | undefined {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  const r = v as Record<string, unknown>;
+  const rawPath = typeof r.keyPath === 'string' ? r.keyPath.trim() : '';
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafeSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const keyPath = rawPath && pathPattern.test(rawPath)
+    && (rawPath.startsWith('$.') ? rawPath.slice(2) : rawPath).split('.').every(s => !unsafeSegments.has(s))
+    ? rawPath
+    : undefined;
+  const disabled = r.disabled === true;
+  if (!keyPath && !disabled) return undefined;
+  return { ...(keyPath ? { keyPath } : {}), ...(disabled ? { disabled: true } : {}) };
+}
+
+function normalizeTopicMessage(
+  value: unknown,
+  prior: ConnectorDefinition['topicMessage'] | undefined,
+): { ok: true; value: NonNullable<ConnectorDefinition['topicMessage']> } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'custom', 'template', 'none'].includes(mode)) {
+    return { ok: false, error: 'bad_topic_message_mode' };
+  }
+  if (mode !== 'custom' && mode !== 'template') {
+    return { ok: true, value: { mode } as NonNullable<ConnectorDefinition['topicMessage']> };
+  }
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: mode === 'template' ? 'topic_message_template_required' : 'topic_message_required' };
+  if (Array.from(text).length > 200) {
+    return { ok: false, error: mode === 'template' ? 'topic_message_template_too_long' : 'topic_message_too_long' };
+  }
+  if (mode === 'custom') return { ok: true, value: { mode: 'custom', text } };
+
+  const extractorsInput = raw.extractors ?? (prior?.mode === 'template' ? prior.extractors : undefined) ?? {};
+  if (!extractorsInput || typeof extractorsInput !== 'object' || Array.isArray(extractorsInput)) {
+    return { ok: false, error: 'topic_message_template_extractors_invalid' };
+  }
+  const extractorEntries = Object.entries(extractorsInput as Record<string, unknown>);
+  if (extractorEntries.length > 20) return { ok: false, error: 'topic_message_template_extractors_too_many' };
+
+  const extractors: NonNullable<ConnectorDefinition['topicMessage']>['extractors'] = {};
+  const aliasPattern = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
+  const pathPattern = /^(?:\$\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+  const unsafePathSegments = new Set(['__proto__', 'prototype', 'constructor']);
+  const validPath = (path: string): boolean => {
+    if (!pathPattern.test(path)) return false;
+    const normalized = path.startsWith('$.') ? path.slice(2) : path;
+    return normalized.split('.').every(segment => !unsafePathSegments.has(segment));
   };
+
+  for (const [alias, value] of extractorEntries) {
+    if (!aliasPattern.test(alias) || !value || typeof value !== 'object' || Array.isArray(value)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    const extractor = value as Record<string, unknown>;
+    const path = typeof extractor.path === 'string' ? extractor.path.trim() : '';
+    const kind = extractor.kind;
+    const identityPath = typeof extractor.identityPath === 'string' ? extractor.identityPath.trim() : undefined;
+    const namePath = typeof extractor.namePath === 'string' ? extractor.namePath.trim() : undefined;
+    if (!validPath(path) || (kind !== 'text' && kind !== 'mention')) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if (kind === 'text' && (identityPath || namePath)) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    if ((identityPath && !validPath(identityPath)) || (namePath && !validPath(namePath))) {
+      return { ok: false, error: 'topic_message_template_extractor_invalid' };
+    }
+    extractors[alias] = {
+      path,
+      kind,
+      ...(identityPath ? { identityPath } : {}),
+      ...(namePath ? { namePath } : {}),
+    };
+  }
+
+  const tokenPattern = /{{\s*(?:(mention)\s+)?([A-Za-z][A-Za-z0-9_.-]{0,63})\s*}}/g;
+  const stripped = text.replace(tokenPattern, (_token, mention: string | undefined, alias: string) => {
+    if (alias === 'source') return mention ? '{{invalid}}' : '';
+    const extractor = extractors[alias];
+    if (!extractor) return '{{missing}}';
+    if ((mention ? 'mention' : 'text') !== extractor.kind) return '{{mismatch}}';
+    return '';
+  });
+  if (stripped.includes('{{') || stripped.includes('}}')) {
+    return { ok: false, error: 'topic_message_template_token_invalid' };
+  }
+  return { ok: true, value: { mode: 'template', text, extractors } };
+}
+
+function sameStringSet(left: string[] | undefined, right: string[] | undefined): boolean {
+  return JSON.stringify([...new Set(left ?? [])].sort())
+    === JSON.stringify([...new Set(right ?? [])].sort());
+}
+
+function sameConnectorTarget(
+  left: ConnectorDefinition['target'],
+  right: ConnectorDefinition['target'],
+): boolean {
+  return left.mode === right.mode
+    && left.kind === right.kind
+    && left.botId === right.botId
+    && left.chatId === right.chatId
+    && left.workflowId === right.workflowId
+    && sameStringSet(left.botIds, right.botIds)
+    && sameStringSet(left.allowChats, right.allowChats);
 }
 
 function normalizeConnectorInput(
@@ -91,6 +252,7 @@ function normalizeConnectorInput(
   const body = record(raw);
   const c = record(body.connector ?? body);
   const prior = opts.prior ?? null;
+  const targetProvided = hasOwn(c, 'target');
   const verify = record(c.verify ?? prior?.verify);
   const target = record(c.target ?? prior?.target);
   const promptEnvelope = record(c.promptEnvelope ?? prior?.promptEnvelope);
@@ -110,21 +272,37 @@ function normalizeConnectorInput(
   const botIds = hasOwn(target, 'botIds')
     ? Array.from(new Set(stringList(target.botIds).map(x => x.trim()).filter(Boolean)))
     : prior?.target.botIds;
-  const chatId = typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId;
+  const chatId = targetMode === 'fixed'
+    ? (typeof target.chatId === 'string' && target.chatId.trim() ? target.chatId.trim() : prior?.target.chatId)
+    : undefined;
   if (targetMode === 'fixed' && !chatId) return { ok: false, error: 'fixed_chat_required' };
-  const workflowId = typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId;
+  const workflowId = targetKind === 'workflow'
+    ? (typeof target.workflowId === 'string' && target.workflowId.trim() ? target.workflowId.trim() : prior?.target.workflowId)
+    : undefined;
   if (targetKind === 'workflow' && !workflowId) return { ok: false, error: 'workflow_id_required' };
-  const lifecycleExtractors = c.lifecycleExtractors === undefined
-    ? (prior?.lifecycleExtractors ?? null)
-    : normalizeLifecycleExtractors(c.lifecycleExtractors);
-  if (targetMode === 'new-group' && !lifecycleExtractors) {
-    return { ok: false, error: 'lifecycle_extractors_required' };
-  }
+  // Dedup is now OPTIONAL for new-group (null = a fresh group per event).
+  const lifecycleExtractors = targetMode === 'new-group'
+    ? (c.lifecycleExtractors === undefined
+      ? (prior?.lifecycleExtractors ?? null)
+      : normalizeLifecycleExtractors(c.lifecycleExtractors))
+    : null;
+  const lifecycleGroupName = targetMode === 'new-group'
+    ? normalizeLifecycleGroupName(c.lifecycleGroupName, prior?.lifecycleGroupName)
+    : null;
+  if (lifecycleGroupName && !lifecycleGroupName.ok) return lifecycleGroupName;
 
   const secretRef =
     opts.secretRef ||
     (typeof verify.secretRef === 'string' && verify.secretRef.trim() ? verify.secretRef.trim() : prior?.verify.secretRef);
   if (!secretRef) return { ok: false, error: 'secret_required' };
+
+  // Default new connectors to the easy `token` mode; HMAC is the advanced opt-in.
+  const verifyType: ConnectorDefinition['verify']['type'] =
+    verify.type === 'hmac-sha256' || verify.type === 'token'
+      ? verify.type
+      : prior?.verify.type ?? 'token';
+  const topicMessage = normalizeTopicMessage(c.topicMessage, prior?.topicMessage);
+  if (!topicMessage.ok) return topicMessage;
 
   const now = new Date().toISOString();
   const next: ConnectorDefinition = {
@@ -132,7 +310,7 @@ function normalizeConnectorInput(
     name,
     enabled: bool(c.enabled, prior?.enabled ?? true),
     verify: {
-      type: 'hmac-sha256',
+      type: verifyType,
       secretRef,
       signatureHeader: typeof verify.signatureHeader === 'string' && verify.signatureHeader.trim()
         ? verify.signatureHeader.trim().toLowerCase()
@@ -145,13 +323,15 @@ function normalizeConnectorInput(
         : prior?.verify.nonceHeader ?? DEFAULT_VERIFY_HEADERS.nonceHeader,
       toleranceSeconds: positiveInt(verify.toleranceSeconds, prior?.verify.toleranceSeconds ?? DEFAULT_VERIFY_HEADERS.toleranceSeconds, 30, 86_400),
     },
-    target: {
+    target: prior?.target.kind === 'workflow' && !targetProvided ? { ...prior.target } : {
       mode: targetMode as ConnectorDefinition['target']['mode'],
       kind: targetKind as ConnectorDefinition['target']['kind'],
       botId,
       ...(botIds && botIds.length > 0 ? { botIds: botIds.includes(botId) ? botIds : [botId, ...botIds] } : {}),
       ...(chatId ? { chatId } : {}),
-      ...(hasOwn(target, 'allowChats') ? { allowChats: stringList(target.allowChats) } : prior?.target.allowChats ? { allowChats: prior.target.allowChats } : {}),
+      ...(targetMode === 'dynamic'
+        ? { allowChats: hasOwn(target, 'allowChats') ? stringList(target.allowChats) : (prior?.target.allowChats ?? []) }
+        : {}),
       ...(workflowId ? { workflowId } : {}),
     },
     promptEnvelope: {
@@ -163,13 +343,27 @@ function normalizeConnectorInput(
         : prior?.promptEnvelope.headerAllowlist ?? [],
       includeRawText: bool(promptEnvelope.includeRawText, prior?.promptEnvelope.includeRawText ?? false),
       maxBodyBytes: positiveInt(promptEnvelope.maxBodyBytes, prior?.promptEnvelope.maxBodyBytes ?? 256 * 1024, 1, 10 * 1024 * 1024),
+      // A provided string sets/clears the trusted instruction (empty = clear);
+      // when the field is absent entirely, keep whatever the prior had.
+      ...(typeof promptEnvelope.instruction === 'string'
+        ? (promptEnvelope.instruction.trim() ? { instruction: promptEnvelope.instruction.trim().slice(0, 8000) } : {})
+        : prior?.promptEnvelope.instruction ? { instruction: prior.promptEnvelope.instruction } : {}),
     },
+    topicMessage: topicMessage.value,
+    ...(bool(c.suppressFinalOutput, prior?.suppressFinalOutput ?? false) ? { suppressFinalOutput: true } : {}),
     loggingPolicy: {
-      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? false),
+      storePayload: bool(loggingPolicy.storePayload, prior?.loggingPolicy.storePayload ?? true),
       storeHeaders: bool(loggingPolicy.storeHeaders, prior?.loggingPolicy.storeHeaders ?? true),
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
     lifecycleExtractors,
+    ...(lifecycleGroupName?.ok && lifecycleGroupName.value ? { lifecycleGroupName: lifecycleGroupName.value } : {}),
+    // Absent in the request → keep whatever the stored connector had (a PATCH
+    // that doesn't mention idempotency must not silently turn it off).
+    ...(() => {
+      const idempotency = c.idempotency === undefined ? prior?.idempotency : normalizeIdempotency(c.idempotency);
+      return idempotency ? { idempotency } : {};
+    })(),
     ...(rateLimitCleared ? {} : rateLimit && Object.keys(rateLimit).length > 0 ? {
       rateLimit: {
         windowSeconds: positiveInt(rateLimit.windowSeconds, prior?.rateLimit?.windowSeconds ?? 60, 1, 86_400),
@@ -179,13 +373,38 @@ function normalizeConnectorInput(
     createdAt: prior?.createdAt ?? now,
     updatedAt: prior?.updatedAt ?? now,
   };
+
+  // Workflow targets belong to the retiring v2 engine. Keep existing assets
+  // maintainable during the migration window, but never create a new entry,
+  // convert a turn connector into one, or let an existing workflow connector
+  // drift to a different target. Non-target fields (name, prompt, secret,
+  // enabled state, logging policy, etc.) remain editable.
+  if (!prior && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'turn' && next.target.kind === 'workflow') {
+    return { ok: false, error: 'legacy_workflow_connector_creation_disabled' };
+  }
+  if (prior?.target.kind === 'workflow' && !sameConnectorTarget(next.target, prior.target)) {
+    return { ok: false, error: 'legacy_workflow_connector_target_immutable' };
+  }
   return { ok: true, connector: next };
 }
 
-function publicWebhookUrl(req: IncomingMessage, connectorId: string): string {
-  const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
-  const host = req.headers.host ?? 'localhost';
-  return `${proto}://${host}/webhook/${encodeURIComponent(connectorId)}`;
+function publicWebhookUrl(req: IncomingMessage, connectorId: string, token?: string): string {
+  // 远程访问开启且绑定平台后用「机器子域」中心域名（外部/内网可达，经隧道回本机）；否则回退本机 host。
+  // 经隧道访问时 req.headers.host 会被平台改写成 127.0.0.1，故必须优先用 binding 推导的中心域名。
+  const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+  let origin: string;
+  if (platformBase) {
+    origin = platformBase;
+  } else {
+    const proto = typeof req.headers['x-forwarded-proto'] === 'string' ? req.headers['x-forwarded-proto'] : 'http';
+    origin = `${proto}://${req.headers.host ?? 'localhost'}`;
+  }
+  const base = `${origin}/webhook/${encodeURIComponent(connectorId)}`;
+  // token mode: bake the secret into the path so the whole URL is the credential.
+  return token ? `${base}/${encodeURIComponent(token)}` : base;
 }
 
 export async function handleConnectorApi(
@@ -267,12 +486,13 @@ export async function handleConnectorApi(
         return true;
       }
       const connector = upsertConnector(normalized.connector);
+      const plaintext = providedSecret ?? generatedSecret;
       jsonRes(res, 201, {
         ok: true,
         connector,
         secretRef: record.ref,
         ...(generatedSecret ? { secret: generatedSecret } : {}),
-        webhookUrl: publicWebhookUrl(req, connector.id),
+        webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintext : undefined),
       });
     } catch (e: any) {
       jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
@@ -291,15 +511,30 @@ export async function handleConnectorApi(
       }
       try {
         const body = await readJsonBody<any>(req);
+        // Validate the complete update before rotating the secret. In
+        // particular, a rejected legacy-workflow target mutation must not
+        // leave behind an otherwise successful credential side effect.
+        const preflight = normalizeConnectorInput({ ...body, id }, {
+          id,
+          prior,
+          secretRef: prior.verify.secretRef,
+        });
+        if (!preflight.ok) {
+          jsonRes(res, 400, { ok: false, error: preflight.error });
+          return true;
+        }
         let generatedSecret: string | undefined;
         let secretRef: string | undefined;
+        let plaintextForUrl: string | undefined;
         if (typeof body.secret === 'string' && body.secret) {
           secretRef = prior.verify.secretRef || createWebhookSecret(body.secret).ref;
           setWebhookSecret(secretRef, body.secret);
+          plaintextForUrl = body.secret;
         } else if (body.rotateSecret === true) {
           generatedSecret = generateWebhookSecretPlaintext();
           secretRef = prior.verify.secretRef || createWebhookSecret(generatedSecret).ref;
           setWebhookSecret(secretRef, generatedSecret);
+          plaintextForUrl = generatedSecret;
         }
         const normalized = normalizeConnectorInput({ ...body, id }, { id, prior, secretRef });
         if (!normalized.ok) {
@@ -312,7 +547,7 @@ export async function handleConnectorApi(
           connector,
           ...(secretRef ? { secretRef } : {}),
           ...(generatedSecret ? { secret: generatedSecret } : {}),
-          webhookUrl: publicWebhookUrl(req, connector.id),
+          webhookUrl: publicWebhookUrl(req, connector.id, connector.verify.type === 'token' ? plaintextForUrl : undefined),
         });
       } catch (e: any) {
         jsonRes(res, 400, { ok: false, error: e?.message ?? 'bad_json' });
@@ -350,13 +585,15 @@ export async function handleConnectorApi(
     return true;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/trigger-logs/summary') {
+    jsonRes(res, 200, { summary: summarizeTriggerLogOverview(triggerLogFilters(url)) });
+    return true;
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/trigger-logs') {
     const limit = Number(url.searchParams.get('limit') ?? '100');
-    const connectorId = url.searchParams.get('connectorId') ?? undefined;
-    const status = logStatus(url.searchParams.get('status'));
-    const errorCode = url.searchParams.get('errorCode') as TriggerErrorCode | null;
-    const since = url.searchParams.get('since') ?? undefined;
-    jsonRes(res, 200, { logs: listTriggerLogs({ limit, connectorId, status, errorCode: errorCode ?? undefined, since }) });
+    const offset = Number(url.searchParams.get('offset') ?? '0');
+    jsonRes(res, 200, queryTriggerLogs({ ...triggerLogFilters(url), limit, offset }));
     return true;
   }
 

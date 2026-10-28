@@ -1,118 +1,100 @@
-import { store } from './store.js';
-import { escapeHtml, relTime, t } from './ui.js';
+import { attentionReason, botNameForAppId } from './ui.js';
+import { fetchGroupsNamesSnapshot } from './groups-api.js';
 
 let groupsSnapshot: { chats: any[]; bots: any[] } = { chats: [], bots: [] };
 
-async function loadGroupsSnapshot(): Promise<void> {
+export function __setGroupsSnapshotForTest(snapshot: { chats: any[]; bots: any[] }): void {
+  groupsSnapshot = snapshot;
+}
+
+export async function loadGroupsSnapshot(): Promise<void> {
   try {
-    const r = await fetch('/api/groups');
-    if (!r.ok) return;
-    groupsSnapshot = await r.json();
+    // 轻量视图：buildBotCards() 只遍历 snapshot.bots，且只读 larkAppId /
+    // botName / botAvatarUrl / cliId / brand 这 5 个字段；`snapshot.chats` 在
+    // 本文件里零读取（attentionReason() 只看传入的 session row，与 groups
+    // 快照无关）。所以完整矩阵里那 12.34MB 的 chats[].memberBots 是纯浪费。
+    //
+    // ⚠️ 更要紧的是**去重**：app.tsx 启动时并行跑 loadNameMaps() 与本函数。
+    // 两者必须落在 groups-api 的**同一个 in-flight** 上，否则会变成
+    // 「names 387KB + full 12.73MB」两发（MEASURED 13.11MB，比改动前的
+    // 12.73MB 更差）。loadNameMaps 走 names，本函数也必须走 names。
+    groupsSnapshot = await fetchGroupsNamesSnapshot();
   } catch {
     // Overview stays useful even when Lark group APIs are unavailable.
   }
 }
 
-function statusClass(status: string): string {
-  return `status status-${escapeHtml(status || 'unknown')}`;
-}
+export type BotCard = {
+  botName: string;
+  larkAppId?: string;
+  /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
+   *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
+  brand?: string;
+  botAvatarUrl?: string;
+  cliId: string;
+  online: boolean;
+  sessions: any[];
+  active: any[];
+  busy: any[];
+  attention: any[];
+  lastActiveAt: number;
+};
 
-function renderSessionMini(s: any): string {
-  return `<li class="overview-list-row">
-    <div>
-      <strong>${escapeHtml(s.title ?? s.sessionId)}</strong>
-      <span>${escapeHtml(s.botName ?? '')} · ${escapeHtml(s.cliId ?? 'unknown')}</span>
-    </div>
-    <span class="${statusClass(s.status)}">${escapeHtml(s.status ?? 'unknown')}</span>
-  </li>`;
-}
+const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 
-function renderScheduleMini(s: any): string {
-  const next = s.nextRunAt ? new Date(s.nextRunAt).toLocaleString() : '-';
-  return `<li class="overview-list-row">
-    <div>
-      <strong>${escapeHtml(s.name ?? s.id)}</strong>
-      <span>${escapeHtml(s.botName ?? s.larkAppId ?? '')} · ${escapeHtml(s.parsed?.display ?? '')}</span>
-    </div>
-    <span>${escapeHtml(next)}</span>
-  </li>`;
-}
-
-export async function renderOverviewPage(root: HTMLElement) {
-  root.innerHTML = `<section class="page hero-page">
-    <div class="page-heading">
-      <div>
-        <p class="eyebrow">${t('app.subtitle')}</p>
-        <h1>${t('overview.title')}</h1>
-        <p>${t('overview.subtitle')}</p>
-      </div>
-    </div>
-    <div class="metric-grid" id="overview-metrics"></div>
-    <div class="overview-grid">
-      <section class="panel">
-        <header class="panel-header">
-          <div>
-            <h2>${t('overview.recentSessions')}</h2>
-            <p>${t('sessions.subtitle')}</p>
-          </div>
-          <a class="btn-link" href="#/sessions">${t('nav.sessions')}</a>
-        </header>
-        <ul class="overview-list" id="recent-sessions"></ul>
-      </section>
-      <section class="panel">
-        <header class="panel-header">
-          <div>
-            <h2>${t('overview.nextSchedules')}</h2>
-            <p>${t('schedules.subtitle')}</p>
-          </div>
-          <a class="btn-link" href="#/schedules">${t('nav.schedules')}</a>
-        </header>
-        <ul class="overview-list" id="next-schedules"></ul>
-      </section>
-    </div>
-  </section>`;
-
-  const metricsEl = root.querySelector<HTMLElement>('#overview-metrics')!;
-  const sessionsEl = root.querySelector<HTMLElement>('#recent-sessions')!;
-  const schedulesEl = root.querySelector<HTMLElement>('#next-schedules')!;
-
-  function rerender() {
-    const sessions = [...store.sessions.values()];
-    const schedules = [...store.schedules.values()];
-    const active = sessions.filter(s => s.status !== 'closed');
-    const working = sessions.filter(s => s.status === 'working' || s.status === 'analyzing' || s.status === 'starting');
-    const enabledSchedules = schedules.filter(s => s.enabled);
-    const onlineBots = groupsSnapshot.bots?.length || new Set(sessions.map(s => s.larkAppId).filter(Boolean)).size;
-    const cards = [
-      { label: t('overview.openSessions'), value: active.length, meta: `${sessions.length} ${t('overview.total')}` },
-      { label: t('overview.workingSessions'), value: working.length, meta: `${active.length} ${t('overview.active')}` },
-      { label: t('overview.onlineBots'), value: onlineBots, meta: t('overview.daemonRegistry') },
-      { label: t('overview.schedules'), value: schedules.length, meta: `${enabledSchedules.length} ${t('overview.enabledSchedules')}` },
-      { label: t('overview.groups'), value: groupsSnapshot.chats?.length ?? 0, meta: t('overview.chatMatrix') },
-    ];
-    metricsEl.innerHTML = cards.map(card => `<article class="metric-card">
-      <span>${escapeHtml(card.label)}</span>
-      <strong>${card.value}</strong>
-      <small>${escapeHtml(card.meta)}</small>
-    </article>`).join('');
-
-    const recent = sessions
-      .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0))
-      .slice(0, 6);
-    sessionsEl.innerHTML = recent.length
-      ? recent.map(s => renderSessionMini({ ...s, title: s.title ?? `${relTime(s.lastMessageAt)} · ${s.sessionId}` })).join('')
-      : `<li class="empty">${t('overview.noSessions')}</li>`;
-
-    const upcoming = schedules
-      .filter(s => s.nextRunAt)
-      .sort((a, b) => Date.parse(a.nextRunAt) - Date.parse(b.nextRunAt))
-      .slice(0, 6);
-    schedulesEl.innerHTML = upcoming.length
-      ? upcoming.map(renderScheduleMini).join('')
-      : `<li class="empty">${t('overview.noSchedules')}</li>`;
+/** 把会话按 bot 聚合成"数字员工"卡片数据；在线 bot 没会话也要出现（待命）。
+ *  以 larkAppId 为身份键（部分会话缺 botName，按名字聚会裂成两张卡）；
+ *  显示名优先 daemon 注册表，其次会话上的 botName。只剩历史 closed 会话、
+ *  又不在注册表里的 bot 不出卡（避免一排灰色离线噪音）。 */
+export function buildBotCards(sessions: any[]): BotCard[] {
+  const byKey = new Map<string, BotCard>();
+  const ensure = (key: string): BotCard => {
+    let card = byKey.get(key);
+    if (!card) {
+      card = {
+        botName: key, larkAppId: key, cliId: 'unknown', online: false,
+        sessions: [], active: [], busy: [], attention: [], lastActiveAt: 0,
+      };
+      byKey.set(key, card);
+    }
+    return card;
+  };
+  for (const b of groupsSnapshot.bots ?? []) {
+    const card = ensure(b.larkAppId ?? b.botName ?? '-');
+    card.online = true;
+    if (b.botName) card.botName = b.botName;
+    if (b.botAvatarUrl) card.botAvatarUrl = b.botAvatarUrl;
+    if (b.cliId) card.cliId = b.cliId;
+    if (b.brand) card.brand = b.brand;
   }
-
-  store.on(rerender);
-  rerender();
-  void loadGroupsSnapshot().then(rerender);
+  // 两遍：先 active 建卡，再让 closed 会话只补充已有卡（不为其单独出卡）
+  const ordered = [...sessions].sort((a, b) => Number(a.status === 'closed') - Number(b.status === 'closed'));
+  for (const s of ordered) {
+    const key = s.larkAppId ?? s.botName ?? '-';
+    if (s.status === 'closed' && !byKey.has(key)) continue;
+    const card = ensure(key);
+    if (s.botName && (card.botName === card.larkAppId || !card.botName)) card.botName = s.botName;
+    card.sessions.push(s);
+    if (s.cliId && card.cliId === 'unknown') card.cliId = s.cliId;
+    card.lastActiveAt = Math.max(card.lastActiveAt, Number(s.lastMessageAt ?? 0));
+    if (s.status !== 'closed') {
+      card.active.push(s);
+      if (BUSY_STATUSES.has(s.status)) card.busy.push(s);
+      if (attentionReason(s)) card.attention.push(s);
+    }
+  }
+  for (const card of byKey.values()) {
+    // 首屏 /api/groups 还没回来时 botName 只能是 larkAppId（cli_xxx）——
+    // 用 localStorage 回灌的名字缓存先把人话名字顶上，避免每次刷新闪 id。
+    if (card.botName === card.larkAppId) {
+      const cached = botNameForAppId(card.larkAppId);
+      if (cached) card.botName = cached;
+    }
+  }
+  return [...byKey.values()].sort((a, b) => {
+    // 等你的排最前，其次干活中，再按最近活跃
+    const rank = (c: BotCard) => (c.attention.length ? 0 : c.busy.length ? 1 : c.online || c.active.length ? 2 : 3);
+    if (rank(a) !== rank(b)) return rank(a) - rank(b);
+    return b.lastActiveAt - a.lastActiveAt;
+  });
 }

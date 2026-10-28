@@ -7,14 +7,35 @@
  * Run:  pnpm vitest run test/session-store.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'fs';
-import { join } from 'path';
+import { execFileSync } from 'node:child_process';
+import {
+  mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync, rmSync, statSync,
+} from 'fs';
+import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
+const fsControl = vi.hoisted(() => ({ failReaddir: false }));
+const costCalculatorMock = vi.hoisted(() => ({
+  getSessionTokenUsage: vi.fn(() => null),
+}));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    readdirSync: (...args: Parameters<typeof actual.readdirSync>) => {
+      // Simulates the CLI file sandbox: per-bot files readable, data dir
+      // enumeration denied (EPERM-like failure).
+      if (fsControl.failReaddir) throw new Error('simulated readdir denial');
+      return actual.readdirSync(...args);
+    },
+  };
+});
+
 // Mock config so we can point session.dataDir at a temp directory
 let tempDir: string;
+let testWorktreeDirs = new Set<string>();
 
 vi.mock('../src/config.js', () => ({
   config: {
@@ -40,17 +61,76 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   deleteFrozenCards: (...args: any[]) => mockDeleteFrozenCards(...args),
 }));
 
+vi.mock('../src/core/cost-calculator.js', () => costCalculatorMock);
+
 // Import the module under test after mocks are set up
 import {
+  __testOnly_setBeforeRowPersist,
+  __testOnly_setBeforePrincipalLaneCreateTransaction,
+  __testOnly_setBeforePrincipalLaneWorktreeCommit,
+  __testOnly_setAfterPrincipalLaneWorktreeCommit,
   init,
   createSession,
+  createSessionWithOwnedMutation,
   getSession,
+  getSessionFresh,
+  getOwnedSession,
   listSessions,
+  listSessionsStrict,
+  SessionStoreBusyError,
+  SessionStoreUnavailableError,
+  beginMojoCloseJournal,
+  markMojoClosePrepared,
+  finishMojoCloseAbort,
   closeSession,
+  reactivateClosedSession,
   updateSession,
   updateSessionPid,
+  persistActiveRemoteLineageExact,
+  persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
+  findActiveSessionsByWorkingDirStrict,
+  findActiveSessionsByChatStrict,
+  SessionStoreUnmigratedError,
+  repairMissingChatScope,
+  loadAllSessionsSnapshot,
+  applySessionCommandUnowned,
+  mutateOwnedSessionsAtomically,
+  readSessionRowUnowned,
+  readSessionRowFromDisk,
+  readSessionRowCopiesAcrossStores,
+  countActiveSessionsOnDisk,
+  ensurePrincipalLaneSource,
+  bootstrapPrincipalLaneSourceForIngress,
+  ensureShadowPrincipalLane,
+  hydratePrincipalLaneForIngress,
+  retirePrincipalLane,
+  prepareShadowPrincipalLaneForIngress,
+  readPrincipalLaneSource,
+  beginMessageProvenanceTrustAttempt,
+  completeMessageProvenanceTrustAttempt,
+  abortMessageProvenanceTrustAttempt,
+  __testOnly_setAfterProvenanceDenyFence,
+  markMessageProvenanceUntrusted,
+  recordMessageProvenance,
+  readTrustedMessageProvenance,
 } from '../src/services/session-store.js';
+import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
+import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
+import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import {
+  clearCodexInstanceBots,
+  registerCodexInstanceBot,
+} from '../src/services/codex-instance-pool.js';
+import {
+  principalWorkspaceGroupIdV2,
+} from '../src/core/principal-workspace-admission.js';
+import {
+  __testOnly_setBeforePrincipalLaneGitIdentity,
+  principalLaneWorktreeMaterializationId,
+  type PrincipalLaneWorktreeMaterialization,
+} from '../src/core/principal-lane-worktree.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -58,26 +138,2112 @@ function makeTempDir(): string {
   return mkdtempSync(join(tmpdir(), 'session-store-test-'));
 }
 
+// db-else-json 读盘夹具：引擎替换后，daemon store 的持久化状态落在 sessions*.db
+// （既有 JSON 冻结不再更新）；混合窗口场景仍可能只有 .json。读断言统一走这里。
+import { DatabaseSync } from 'node:sqlite';
+
+function persistedStorePath(dir: string, appId: string): string | undefined {
+  const dbPath = join(dir, 'session-stores', appId, 'sessions.db');
+  if (existsSync(dbPath)) return dbPath;
+  const jsonPath = join(dir, `sessions-${appId}.json`);
+  return existsSync(jsonPath) ? jsonPath : undefined;
+}
+
+function persistedStoreExists(dir: string, appId: string): boolean {
+  return persistedStorePath(dir, appId) !== undefined;
+}
+
+function readPersistedRows(dir: string, appId: string): Record<string, any> {
+  const path = persistedStorePath(dir, appId);
+  if (!path) throw new Error(`no persisted session store in ${dir} (appId=${appId})`);
+  if (path.endsWith('.db')) {
+    const db = new DatabaseSync(path);
+    try {
+      const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
+      return Object.fromEntries(rows.map(r => [r.session_id, JSON.parse(r.row)]));
+    } finally {
+      db.close();
+    }
+  }
+  return JSON.parse(readFileSync(path, 'utf-8'));
+}
+
 // ─── Setup / Teardown ─────────────────────────────────────────────────────
 
 beforeEach(() => {
   tempDir = makeTempDir();
+  testWorktreeDirs = new Set();
+  fsControl.failReaddir = false;
+  costCalculatorMock.getSessionTokenUsage.mockReset();
+  costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
+  __testOnly_setBeforeRowPersist(undefined);
+  __testOnly_setBeforePrincipalLaneCreateTransaction(undefined);
+  __testOnly_setBeforePrincipalLaneWorktreeCommit(undefined);
+  __testOnly_setAfterPrincipalLaneWorktreeCommit(undefined);
+  __testOnly_setBeforePrincipalLaneGitIdentity(undefined);
+  clearCodexInstanceBots();
   mockDeleteFrozenCards.mockReset();
   // Reset module state for each test
-  init();
+  init('test-app');
 });
 
 afterEach(() => {
+  for (const dir of testWorktreeDirs) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+describe('principal lane durable store', () => {
+  const appId = 'app-principal-lanes';
+  const now = '2026-09-19T08:00:00.000Z';
+
+  function sourceSession(root: string, unionId: string, openId: string) {
+    init(appId);
+    const session = createSession(`chat-${root}`, root, `source-${root}`, 'group', 'thread');
+    session.larkAppId = appId;
+    session.ownerUnionId = unionId;
+    session.ownerOpenId = openId;
+    session.workingDir = tempDir;
+    updateSession(session);
+    return session;
+  }
+
+  function initializeSourceGitRepository(): void {
+    if (existsSync(join(tempDir, '.git'))) return;
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
+    };
+    execFileSync('git', ['init', '-b', 'master'], { cwd: tempDir, env: gitEnv });
+    writeFileSync(join(tempDir, '.principal-lane-fixture'), 'fixture\n');
+    execFileSync('git', ['add', '.principal-lane-fixture'], { cwd: tempDir, env: gitEnv });
+    execFileSync('git', ['commit', '-m', 'fixture'], { cwd: tempDir, env: gitEnv });
+  }
+
+  function worktreeMaterialization(args: {
+    sourceSessionId: string;
+    principalKey?: string;
+    workspaceEpoch?: number;
+    suffix?: string;
+    createdAt?: string;
+  }): PrincipalLaneWorktreeMaterialization {
+    const sourceCanonicalCwd = realpathSync(tempDir);
+    const principalKey = args.principalKey ?? 'user:union:on_b';
+    const workspaceEpoch = args.workspaceEpoch ?? 1;
+    const suffix = args.suffix ?? 'b';
+    const worktreeRoot = `${sourceCanonicalCwd}-wt-${suffix}`;
+    const gitEnv = {
+      ...process.env,
+      GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t',
+      GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
+    };
+    initializeSourceGitRepository();
+    const branch = `wt/principal-lane-${suffix}`;
+    execFileSync('git', ['worktree', 'add', '-b', branch, worktreeRoot, 'HEAD'], {
+      cwd: sourceCanonicalCwd,
+      env: gitEnv,
+    });
+    const commonDir = realpathSync(resolve(
+      sourceCanonicalCwd,
+      execFileSync('git', ['rev-parse', '--git-common-dir'], {
+        cwd: sourceCanonicalCwd, encoding: 'utf8', env: gitEnv,
+      }).trim(),
+    ));
+    testWorktreeDirs.add(worktreeRoot);
+    return {
+      version: 1,
+      materializationId: principalLaneWorktreeMaterializationId({
+        sourceSessionId: args.sourceSessionId,
+        principalKey,
+        workspaceEpoch,
+        sourceCanonicalCwd,
+      }),
+      sourceSessionId: args.sourceSessionId,
+      principalKey,
+      workspaceEpoch,
+      sourceCanonicalCwd,
+      sourceRepoRoot: sourceCanonicalCwd,
+      sourceGitCommonDir: commonDir,
+      sourceRelativeCwd: '',
+      worktreeRoot: realpathSync(worktreeRoot),
+      worktreeGitCommonDir: commonDir,
+      workingDir: realpathSync(worktreeRoot),
+      branch,
+      baseRef: 'HEAD',
+      createdAt: args.createdAt ?? '2026-09-19T08:00:30.000Z',
+    };
+  }
+
+  it('atomically binds a proven owner as source lane 0 and restores it idempotently', () => {
+    const session = sourceSession('root-a', 'on_a', 'ou_a');
+    const first = ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_a' },
+      now,
+    });
+    expect(first).toMatchObject({
+      status: 'ready',
+      source: {
+        sourcePrincipalKey: 'user:union:on_a',
+        workspaceEpoch: 1,
+        phase: 'active',
+        displayTarget: {
+          scope: 'thread', larkAppId: appId, chatId: 'chat-root-a', rootMessageId: 'root-a',
+        },
+      },
+      lane: { laneId: 'source', sourceSessionId: session.sessionId },
+    });
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      principalLane: { laneId: 'source' },
+      principalLaneSource: { sourcePrincipalKey: 'user:union:on_a' },
+    });
+
+    init(appId);
+    expect(readPrincipalLaneSource(session.sessionId)).toMatchObject({
+      status: 'ready', lane: { laneId: 'source' },
+    });
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+      now,
+    })).toMatchObject({ status: 'ready' });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_sources').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_migration_audit').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_workspace_groups').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_workspace_members').get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('shares one v2 group across sources with the same canonical cwd', () => {
+    const first = sourceSession('root-shared-group-a', 'on_a', 'ou_a');
+    const second = sourceSession('root-shared-group-b', 'on_b', 'ou_b');
+    const firstReady = ensurePrincipalLaneSource({
+      sourceSessionId: first.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_a' },
+      now,
+    });
+    const secondReady = ensurePrincipalLaneSource({
+      sourceSessionId: second.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+      now: '2026-09-19T08:00:01.000Z',
+    });
+    if (firstReady.status !== 'ready' || secondReady.status !== 'ready') {
+      throw new Error('expected ready sources');
+    }
+    expect(firstReady.source.workspaceGroupId).toBe(secondReady.source.workspaceGroupId);
+    expect(firstReady.source.workspaceGroupKeyVersion).toBe(2);
+    expect(secondReady.source.workspaceGroupKeyVersion).toBe(2);
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_workspace_groups')
+        .get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_workspace_members')
+        .get() as { n: number }).n).toBe(2);
+    } finally { db.close(); }
+  });
+
+  it('rolls back new source sidecars, group, member and Session when membership creation fails', () => {
+    const source = sourceSession('root-source-membership-rollback', 'on_source', 'ou_source');
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TRIGGER fail_source_workspace_member BEFORE INSERT ON principal_workspace_members
+        BEGIN SELECT RAISE(ABORT, 'synthetic source member failure'); END;
+      `);
+    } finally { db.close(); }
+    expect(() => ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    })).toThrow('synthetic source member failure');
+
+    const verify = new DatabaseSync(dbPath);
+    try {
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lane_sources')
+        .get() as { n: number }).n).toBe(0);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lanes')
+        .get() as { n: number }).n).toBe(0);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_workspace_groups')
+        .get() as { n: number }).n).toBe(0);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_workspace_members')
+        .get() as { n: number }).n).toBe(0);
+      const row = JSON.parse((verify.prepare('SELECT row FROM sessions WHERE session_id = ?')
+        .get(source.sessionId) as { row: string }).row);
+      expect(row.principalLane).toBeUndefined();
+      expect(row.principalLaneSource).toBeUndefined();
+    } finally { verify.close(); }
+  });
+
+  it('durably disables only principal lanes when the legacy owner is unproven', () => {
+    const session = sourceSession('root-disabled', 'on_a', 'ou_a');
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+      now,
+    })).toEqual({ status: 'disabled', reason: 'caller_identity_unproven' });
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      principalLaneDisabledReason: 'caller_identity_unproven',
+    });
+    expect(getOwnedSession(session.sessionId)?.principalLane).toBeUndefined();
+
+    // No later first-speaker retry can silently replace the durable decision.
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_a' },
+      now,
+    })).toEqual({ status: 'disabled', reason: 'caller_identity_unproven' });
+  });
+
+  it('does not let a B first message consume source bootstrap or fall back to A', () => {
+    const session = sourceSession('root-bootstrap-owner', 'on_a', 'ou_a');
+    expect(bootstrapPrincipalLaneSourceForIngress({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+      now,
+    })).toEqual({ status: 'retry', reason: 'source_owner_mismatch' });
+    expect(getOwnedSession(session.sessionId)?.principalLaneDisabledReason).toBeUndefined();
+    expect(readPrincipalLaneSource(session.sessionId)).toBeUndefined();
+
+    expect(bootstrapPrincipalLaneSourceForIngress({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_a' },
+      now,
+    })).toMatchObject({ status: 'ready', lane: { laneId: 'source' } });
+  });
+
+  it('never lets a bot inbound disable or initialize a human source lane', () => {
+    const session = sourceSession('root-bot', 'on_a', 'ou_a');
+    expect(() => ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'bot', kind: 'union', unionId: 'on_bot' },
+      now,
+    })).toThrow('bot principal cannot initialize');
+    expect(getOwnedSession(session.sessionId)?.principalLaneDisabledReason).toBeUndefined();
+    expect(readPrincipalLaneSource(session.sessionId)).toBeUndefined();
+  });
+
+  it('durably quarantines malformed source scope without closing the legacy session', () => {
+    const session = sourceSession('root-scope', 'on_scope', 'ou_scope');
+    session.scope = 'invalid' as any;
+    updateSession(session);
+    init(appId);
+    expect(readPrincipalLaneSource(session.sessionId)).toEqual({
+      status: 'quarantined', reason: 'invalid_source_display_target',
+    });
+    expect(getOwnedSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      principalLaneQuarantineReason: 'invalid_source_display_target',
+    });
+
+    init(appId);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_scope' },
+      now,
+    })).toEqual({
+      status: 'quarantined', reason: 'invalid_source_display_target',
+    });
+  });
+
+  it('quarantines one malformed lane while another source remains restorable', () => {
+    const first = sourceSession('root-q1', 'on_q1', 'ou_q1');
+    const second = sourceSession('root-q2', 'on_q2', 'ou_q2');
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: first.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_q1' },
+      now,
+    }).status).toBe('ready');
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: second.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_q2' },
+      now,
+    }).status).toBe('ready');
+
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      const hit = db.prepare(
+        "SELECT row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+      ).get(first.sessionId) as { row: string };
+      const malformed = JSON.parse(hit.row);
+      delete malformed.principal;
+      db.prepare(
+        "UPDATE principal_lanes SET row = ? WHERE source_session_id = ? AND lane_id = 'source'",
+      ).run(JSON.stringify(malformed), first.sessionId);
+    } finally { db.close(); }
+
+    expect(readPrincipalLaneSource(first.sessionId)).toEqual({
+      status: 'quarantined', reason: 'lane:invalid_principal',
+    });
+    expect(readPrincipalLaneSource(first.sessionId)).toEqual({
+      status: 'quarantined', reason: 'lane:stored_quarantine',
+    });
+    expect(readPrincipalLaneSource(second.sessionId)).toMatchObject({ status: 'ready' });
+
+    const verify = new DatabaseSync(dbPath);
+    try {
+      expect((verify.prepare(
+        "SELECT phase FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+      ).get(first.sessionId) as { phase: string }).phase).toBe('quarantined');
+      expect((verify.prepare(
+        'SELECT phase FROM principal_lane_sources WHERE source_session_id = ?',
+      ).get(first.sessionId) as { phase: string }).phase).toBe('active');
+      expect((verify.prepare(
+        "SELECT phase FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+      ).get(second.sessionId) as { phase: string }).phase).toBe('active');
+    } finally { verify.close(); }
+  });
+
+  it('fails closed when indexed lane authority disagrees with the durable JSON', () => {
+    const session = sourceSession('root-index', 'on_index', 'ou_index');
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_index' },
+      now,
+    }).status).toBe('ready');
+
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.prepare(
+        "UPDATE principal_lanes SET principal_key = ? WHERE source_session_id = ? AND lane_id = 'source'",
+      ).run('user:union:on_other', session.sessionId);
+    } finally { db.close(); }
+
+    expect(readPrincipalLaneSource(session.sessionId)).toEqual({
+      status: 'quarantined', reason: 'lane:indexed_value_mismatch',
+    });
+  });
+
+  it('atomically creates an idempotent shadow lane from a strict runtime whitelist', () => {
+    const source = sourceSession('root-shadow', 'on_source', 'ou_source');
+    source.cliId = 'codex';
+    source.backendType = 'tmux';
+    source.model = 'gpt-5';
+    source.reasoningEffort = 'high';
+    source.cliConfigDir = '~/.claude-api';
+    source.sandbox = true;
+    source.sandboxPaths = { readWrite: [tempDir], readOnly: ['/tmp/read-only'] };
+    source.mojoIdentity = { controlPlane: 'host', endpoint: 'https://runtime.example' } as any;
+    source.persistentBackendTarget = { type: 'tmux', name: 'source-pane' } as any;
+    source.cliSessionId = 'must-not-copy';
+    source.replyTargets = {
+      turn: { senderOpenId: 'ou_source', updatedAt: now },
+    };
+    source.crossPrincipalInterruptions = [{
+      id: 'xpi-source',
+      state: 'pending',
+      createdAt: now,
+      updatedAt: now,
+      proposer: { openId: 'ou_source' },
+      message: { turnId: 'turn-source', text: 'private source input' },
+    } as any];
+    source.adoptedFrom = { source: 'tmux', tmuxTarget: 'source-pane', cwd: tempDir };
+    source.xpiSharedCwdAdmissionGroupId = 'source-runtime-group';
+    (source as any).liveCardMessageId = 'card-source';
+    (source as any).schedule = { id: 'schedule-source' };
+    updateSession(source);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    }).status).toBe('ready');
+
+    const first = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      title: 'B 独立任务',
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    expect(first).toMatchObject({
+      status: 'ready',
+      created: true,
+      lane: {
+        principalKey: 'user:union:on_b',
+        sourceSessionId: source.sessionId,
+        displayTarget: {
+          larkAppId: appId,
+          scope: 'thread',
+          chatId: 'chat-root-shadow',
+          rootMessageId: 'root-shadow',
+        },
+      },
+      session: {
+        ownerUnionId: 'on_b',
+        ownerOpenId: 'ou_b',
+        creatorOpenId: 'ou_b',
+        lastCallerOpenId: 'ou_b',
+        cliId: 'codex',
+        backendType: 'tmux',
+        model: 'gpt-5',
+        reasoningEffort: 'high',
+        cliConfigDir: '~/.claude-api',
+        sandbox: true,
+        mojoIdentity: { controlPlane: 'host', endpoint: 'https://runtime.example' },
+      },
+    });
+    if (first.status !== 'ready') throw new Error('expected ready shadow lane');
+    expect(first.session.workingDir).toBe(realpathSync(tempDir));
+    expect(first.lane.routingAnchor).toMatch(/^principal-lane:[a-f0-9]{32}$/);
+    expect(first.lane.routingAnchor).not.toContain('on_b');
+    expect(first.lane.routingAnchor).not.toContain('ou_b');
+    expect(first.lane.routingAnchor).not.toBe(first.lane.displayTarget.rootMessageId);
+    expect(first.session.cliSessionId).toBeUndefined();
+    expect(first.session.replyTargets).toBeUndefined();
+    expect(first.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(first.session.adoptedFrom).toBeUndefined();
+    expect(first.session.persistentBackendTarget).toBeUndefined();
+    expect(first.session.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect((first.session as any).liveCardMessageId).toBeUndefined();
+    expect((first.session as any).schedule).toBeUndefined();
+
+    const second = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      title: 'ignored on reuse',
+      now: '2026-09-19T08:02:00.000Z',
+    });
+    expect(second).toMatchObject({
+      status: 'ready', created: false,
+      lane: { laneId: first.lane.laneId },
+      session: { sessionId: first.session.sessionId },
+    });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(2);
+      expect((db.prepare(
+        'SELECT COUNT(*) AS n FROM principal_lane_aliases WHERE source_session_id = ? AND lane_id = ?',
+      ).get(source.sessionId, first.lane.laneId) as { n: number }).n).toBe(2);
+      expect((db.prepare(
+        "SELECT COUNT(*) AS n FROM principal_lane_identity_audit WHERE event = 'created'",
+      ).get() as { n: number }).n).toBe(1);
+      expect((db.prepare(
+        'SELECT COUNT(*) AS n FROM principal_workspace_members WHERE source_session_id = ?',
+      ).get(source.sessionId) as { n: number }).n).toBe(2);
+    } finally { db.close(); }
+  });
+
+  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+    const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
+    source.backendType = 'pty';
+    source.sandbox = true;
+    source.sandboxNetwork = true;
+    source.sandboxNetworkPolicy = {
+      version: 1, public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
+      dnsServers: ['1.1.1.1'],
+    };
+    const frozen = structuredClone(source.sandboxNetworkPolicy);
+    updateSession(source);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' }, now,
+    }).status).toBe('ready');
+    const shadow = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
+    });
+    if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
+    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    // Mutate the actual stored source, including nested arrays: copying only
+    // the outer object must not weaken the child policy.
+    const storedSource = getOwnedSession(source.sessionId)!;
+    storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
+    storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
+    updateSession(storedSource);
+    expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    init(appId);
+    expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
+  });
+
+  it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {
+    const source = sourceSession('root-worktree', 'on_source', 'ou_source');
+    const sourceReady = ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    if (sourceReady.status !== 'ready') throw new Error('expected ready source');
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    expect(created).toMatchObject({
+      status: 'ready', created: true,
+      session: {
+        workingDir: materialization.workingDir,
+        principalLaneWorktree: {
+          materializationId: materialization.materializationId,
+          sourceCanonicalCwd: realpathSync(tempDir),
+          worktreeRoot: materialization.worktreeRoot,
+        },
+      },
+      worktree: { materializationId: materialization.materializationId },
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    expect(await hydratePrincipalLaneForIngress(
+      source.sessionId, created.lane.laneId,
+    )).toMatchObject({
+      status: 'ready',
+      runtimeRoutingAnchor: created.lane.routingAnchor,
+      session: { sessionId: created.session.sessionId, workingDir: materialization.workingDir },
+      worktree: { materializationId: materialization.materializationId },
+    });
+    expect(await hydratePrincipalLaneForIngress(source.sessionId, 'source')).toMatchObject({
+      status: 'ready', lane: { laneId: 'source' }, session: { sessionId: source.sessionId },
+    });
+
+    const reused = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: { ...materialization, baseRef: materialization.branch },
+      now: '2026-09-19T08:02:00.000Z',
+    });
+    expect(reused).toMatchObject({
+      status: 'ready', created: false,
+      lane: { laneId: created.lane.laneId },
+      session: { sessionId: created.session.sessionId },
+      worktree: { materializationId: materialization.materializationId, baseRef: 'HEAD' },
+    });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_worktrees')
+        .get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('retires only a closed shadow lane while preserving its closed session audit row', async () => {
+    const source = sourceSession('root-retire-worktree', 'on_source', 'ou_source');
+    const sourceReady = ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    if (sourceReady.status !== 'ready') throw new Error('expected ready source');
+    const materialization = worktreeMaterialization({
+      sourceSessionId: source.sessionId,
+      suffix: 'retire',
+    });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready' || !created.worktree) {
+      throw new Error('expected materialized lane');
+    }
+    const retireArgs = {
+      sourceSessionId: source.sessionId,
+      laneId: created.lane.laneId,
+      sessionId: created.session.sessionId,
+      materializationId: created.worktree.materializationId,
+    };
+    expect(retirePrincipalLane({ ...retireArgs, dryRun: true })).toEqual({ status: 'ready' });
+    expect(retirePrincipalLane(retireArgs)).toEqual({
+      status: 'retry', reason: 'session_not_closed',
+    });
+
+    closeSession(created.session.sessionId);
+    expect(retirePrincipalLane(retireArgs)).toEqual({ status: 'retired' });
+    expect(getOwnedSession(created.session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(await hydratePrincipalLaneForIngress(source.sessionId, created.lane.laneId)).toEqual({
+      status: 'missing', reason: 'lane_missing',
+    });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      for (const table of ['principal_lanes', 'principal_lane_aliases', 'principal_lane_worktrees', 'principal_workspace_members']) {
+        expect((db.prepare(
+          `SELECT COUNT(*) AS n FROM ${table} WHERE source_session_id = ? AND lane_id = ?`,
+        ).get(source.sessionId, created.lane.laneId) as { n: number }).n).toBe(0);
+      }
+      expect((db.prepare(
+        'SELECT status FROM sessions WHERE session_id = ?',
+      ).get(created.session.sessionId) as { status: string }).status).toBe('closed');
+    } finally { db.close(); }
+  });
+
+  it('refuses retirement when the materialization proof is tampered under the same id', () => {
+    const source = sourceSession('root-retire-tampered-proof', 'on_source', 'ou_source');
+    const sourceReady = ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    if (sourceReady.status !== 'ready') throw new Error('expected ready source');
+    const materialization = worktreeMaterialization({
+      sourceSessionId: source.sessionId,
+      suffix: 'retire-tampered',
+    });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready' || !created.worktree) {
+      throw new Error('expected materialized lane');
+    }
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      const hit = db.prepare(
+        'SELECT row FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(created.worktree.materializationId) as { row: string };
+      const tampered = JSON.parse(hit.row) as Record<string, unknown>;
+      tampered.branch = 'wt/tampered-under-same-materialization-id';
+      db.prepare(
+        'UPDATE principal_lane_worktrees SET row = ? WHERE materialization_id = ?',
+      ).run(JSON.stringify(tampered), created.worktree.materializationId);
+    } finally { db.close(); }
+
+    closeSession(created.session.sessionId);
+    expect(retirePrincipalLane({
+      sourceSessionId: source.sessionId,
+      laneId: created.lane.laneId,
+      sessionId: created.session.sessionId,
+      materializationId: created.worktree.materializationId,
+    })).toEqual({ status: 'quarantined', reason: 'lane_retirement_authority_mismatch' });
+
+    const verify = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((verify.prepare(
+        'SELECT COUNT(*) AS n FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(created.worktree.materializationId) as { n: number }).n).toBe(1);
+      expect((verify.prepare(
+        'SELECT COUNT(*) AS n FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+      ).get(source.sessionId, created.lane.laneId) as { n: number }).n).toBe(1);
+    } finally { verify.close(); }
+  });
+
+  it('keeps the event loop and another lane admission moving during a slow Git probe', async () => {
+    const source = sourceSession('root-slow-git-probe', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    let releaseGit!: () => void;
+    let reportEntered!: () => void;
+    const gitGate = new Promise<void>(resolve => { releaseGit = resolve; });
+    const gitEntered = new Promise<void>(resolve => { reportEntered = resolve; });
+    __testOnly_setBeforePrincipalLaneGitIdentity(async () => {
+      reportEntered();
+      await gitGate;
+    });
+    const hydration = hydratePrincipalLaneForIngress(source.sessionId, created.lane.laneId);
+    await gitEntered;
+    let timerAdvanced = false;
+    await new Promise<void>(resolveTimer => setTimeout(() => {
+      timerAdvanced = true;
+      resolveTimer();
+    }, 0));
+    const otherLane = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_c', openId: 'ou_c' },
+      now: '2026-09-19T08:01:30.000Z',
+    });
+    expect(timerAdvanced).toBe(true);
+    expect(otherLane).toMatchObject({ status: 'ready', created: true });
+    releaseGit();
+    try {
+      expect(await hydration).toMatchObject({ status: 'ready' });
+    } finally {
+      __testOnly_setBeforePrincipalLaneGitIdentity(undefined);
+    }
+  });
+
+  it('refuses on-demand hydration of a legacy shadow that still shares source cwd', async () => {
+    const source = sourceSession('root-legacy-hydrate', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const legacy = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (legacy.status !== 'ready') throw new Error('expected legacy shadow');
+    expect(await hydratePrincipalLaneForIngress(source.sessionId, legacy.lane.laneId)).toEqual({
+      status: 'retry', reason: 'worktree_not_materialized',
+    });
+  });
+
+  it('migrates the parent worktree schema without guessing proof for old rows', async () => {
+    const source = sourceSession('root-old-worktree-schema', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const ordinary = createSession('chat-ordinary', 'root-ordinary', 'ordinary-session');
+    ordinary.larkAppId = appId;
+    updateSession(ordinary);
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    init(appId);
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const old = new DatabaseSync(dbPath);
+    try {
+      const proofHit = old.prepare(
+        'SELECT row FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId) as { row: string };
+      const oldProof = JSON.parse(proofHit.row);
+      delete oldProof.sourceGitCommonDir;
+      delete oldProof.worktreeGitCommonDir;
+      old.prepare('UPDATE principal_lane_worktrees SET row = ? WHERE materialization_id = ?')
+        .run(JSON.stringify(oldProof), materialization.materializationId);
+      const childHit = old.prepare('SELECT row FROM sessions WHERE session_id = ?')
+        .get(created.session.sessionId) as { row: string };
+      const oldChild = JSON.parse(childHit.row);
+      delete oldChild.principalLaneWorktree.sourceGitCommonDir;
+      delete oldChild.principalLaneWorktree.worktreeGitCommonDir;
+      old.prepare('UPDATE sessions SET row = ? WHERE session_id = ?')
+        .run(JSON.stringify(oldChild), created.session.sessionId);
+      old.exec(`
+        ALTER TABLE principal_lane_worktrees RENAME TO principal_lane_worktrees_newer;
+        CREATE TABLE principal_lane_worktrees (
+          materialization_id TEXT PRIMARY KEY,
+          source_session_id TEXT NOT NULL,
+          lane_id TEXT NOT NULL,
+          session_id TEXT NOT NULL UNIQUE,
+          principal_key TEXT NOT NULL,
+          workspace_epoch INTEGER NOT NULL CHECK(workspace_epoch >= 1),
+          source_repo_root TEXT NOT NULL,
+          worktree_root TEXT NOT NULL UNIQUE,
+          working_dir TEXT NOT NULL UNIQUE,
+          branch TEXT NOT NULL,
+          phase TEXT NOT NULL CHECK(phase IN ('ready', 'quarantined')),
+          revision INTEGER NOT NULL CHECK(revision >= 1),
+          row TEXT NOT NULL,
+          UNIQUE(source_session_id, lane_id),
+          UNIQUE(source_session_id, principal_key)
+        );
+        INSERT INTO principal_lane_worktrees (
+          materialization_id, source_session_id, lane_id, session_id, principal_key,
+          workspace_epoch, source_repo_root, worktree_root, working_dir, branch,
+          phase, revision, row
+        ) SELECT
+          materialization_id, source_session_id, lane_id, session_id, principal_key,
+          workspace_epoch, source_repo_root, worktree_root, working_dir, branch,
+          phase, revision, row
+        FROM principal_lane_worktrees_newer;
+        DROP TABLE principal_lane_worktrees_newer;
+      `);
+    } finally { old.close(); }
+
+    init(appId);
+    expect(getSession(ordinary.sessionId)).toMatchObject({ sessionId: ordinary.sessionId });
+    const migrated = new DatabaseSync(dbPath);
+    try {
+      const columns = migrated.prepare('PRAGMA table_info(principal_lane_worktrees)')
+        .all() as Array<{ name: string }>;
+      expect(columns.map(column => column.name)).toEqual(expect.arrayContaining([
+        'source_git_common_dir', 'worktree_git_common_dir',
+      ]));
+      expect(migrated.prepare(
+        'SELECT source_git_common_dir, worktree_git_common_dir '
+        + 'FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId)).toMatchObject({
+        source_git_common_dir: null,
+        worktree_git_common_dir: null,
+      });
+    } finally { migrated.close(); }
+    expect(await hydratePrincipalLaneForIngress(
+      source.sessionId, created.lane.laneId,
+    )).toMatchObject({ status: 'quarantined', reason: expect.stringContaining('worktree:') });
+  });
+
+  it('reports malformed worktree proof during hydration without quarantine writes', async () => {
+    const source = sourceSession('root-proof-readonly', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const writer = new DatabaseSync(dbPath);
+    try {
+      const hit = writer.prepare(
+        'SELECT row FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId) as { row: string };
+      const row = JSON.parse(hit.row);
+      row.workingDir = `${row.workingDir}-tampered`;
+      writer.prepare(
+        'UPDATE principal_lane_worktrees SET row = ? WHERE materialization_id = ?',
+      ).run(JSON.stringify(row), materialization.materializationId);
+    } finally { writer.close(); }
+    const observer = new DatabaseSync(dbPath);
+    try {
+      const dataVersion = (observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version;
+      expect(await hydratePrincipalLaneForIngress(
+        source.sessionId, created.lane.laneId,
+      )).toMatchObject({ status: 'quarantined', reason: expect.stringContaining('worktree:') });
+      expect((observer.prepare(
+        'SELECT phase FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId) as { phase: string }).phase).toBe('ready');
+      expect((observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version).toBe(dataVersion);
+    } finally { observer.close(); }
+  });
+
+  it('fails hydration read-only when the published worktree path is replaced by another repo', async () => {
+    const source = sourceSession('root-worktree-replaced', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    rmSync(materialization.worktreeRoot, { recursive: true, force: true });
+    mkdirSync(materialization.worktreeRoot, { recursive: true });
+    execFileSync('git', ['init', '-b', materialization.branch], {
+      cwd: materialization.worktreeRoot,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const observer = new DatabaseSync(dbPath);
+    try {
+      const dataVersion = (observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version;
+      expect(await hydratePrincipalLaneForIngress(
+        source.sessionId, created.lane.laneId,
+      )).toMatchObject({ status: 'quarantined', reason: 'worktree_session_sidecar_mismatch' });
+      expect((observer.prepare(
+        'SELECT phase FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId) as { phase: string }).phase).toBe('ready');
+      expect((observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version).toBe(dataVersion);
+    } finally { observer.close(); }
+  });
+
+  it('fails hydration read-only when the linked worktree leaves its published branch', async () => {
+    const source = sourceSession('root-worktree-branch', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected materialized lane');
+    execFileSync('git', ['switch', '-c', 'wt/principal-lane-other'], {
+      cwd: materialization.worktreeRoot,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const observer = new DatabaseSync(dbPath);
+    try {
+      const dataVersion = (observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version;
+      expect(await hydratePrincipalLaneForIngress(
+        source.sessionId, created.lane.laneId,
+      )).toMatchObject({ status: 'quarantined', reason: 'worktree_session_sidecar_mismatch' });
+      expect((observer.prepare(
+        'SELECT phase FROM principal_lane_worktrees WHERE materialization_id = ?',
+      ).get(materialization.materializationId) as { phase: string }).phase).toBe('ready');
+      expect((observer.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version).toBe(dataVersion);
+    } finally { observer.close(); }
+  });
+
+  it('returns retry only after a proven pre-commit rollback with zero lane, proof, or cache publication', () => {
+    const source = sourceSession('root-worktree-rollback', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    __testOnly_setBeforePrincipalLaneWorktreeCommit(() => {
+      throw new Error('synthetic pre-commit failure');
+    });
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      worktree: materialization,
+      now: '2026-09-19T08:01:00.000Z',
+    })).toEqual({ status: 'retry', reason: 'worktree_not_committed' });
+    __testOnly_setBeforePrincipalLaneWorktreeCommit(undefined);
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_worktrees')
+        .get() as { n: number }).n).toBe(0);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_identity_audit')
+        .get() as { n: number }).n).toBe(0);
+    } finally { db.close(); }
+  });
+
+  it('reports a created directory as an orphan when integrated publication rolls back', async () => {
+    execFileSync('git', ['init', '-b', 'master'], { cwd: tempDir });
+    execFileSync('git', ['commit', '--allow-empty', '-m', 'init'], {
+      cwd: tempDir,
+      env: {
+        ...process.env,
+        GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t',
+        GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t',
+      },
+    });
+    const source = sourceSession('root-worktree-orphan', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    __testOnly_setBeforePrincipalLaneWorktreeCommit(() => {
+      throw new Error('synthetic publication rollback');
+    });
+    const result = await prepareShadowPrincipalLaneForIngress({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    __testOnly_setBeforePrincipalLaneWorktreeCommit(undefined);
+    expect(result).toMatchObject({
+      status: 'retry', reason: 'worktree_not_committed',
+      orphan: {
+        worktreePath: expect.stringContaining('-wt-principal-lane-'),
+        branch: expect.stringMatching(/^wt\/principal-lane-/),
+      },
+    });
+    if (!('orphan' in result) || !result.orphan) throw new Error('expected orphan report');
+    expect(existsSync(result.orphan.worktreePath)).toBe(true);
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_worktrees')
+        .get() as { n: number }).n).toBe(0);
+    } finally { db.close(); }
+    rmSync(result.orphan.worktreePath, { recursive: true, force: true });
+  });
+
+  it('converges a post-commit exception by asynchronous read-only proof recovery', async () => {
+    initializeSourceGitRepository();
+    const source = sourceSession('root-worktree-unknown', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    __testOnly_setAfterPrincipalLaneWorktreeCommit(() => {
+      throw new Error('synthetic commit outcome unknown');
+    });
+    let recovered;
+    try {
+      recovered = await prepareShadowPrincipalLaneForIngress({
+        sourceSessionId: source.sessionId,
+        identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+        now: '2026-09-19T08:01:00.000Z',
+      });
+    } finally {
+      __testOnly_setAfterPrincipalLaneWorktreeCommit(undefined);
+    }
+    expect(recovered).toMatchObject({
+      status: 'ready', created: false,
+      worktree: { materializationId: expect.stringMatching(/^principal-lane-worktree:v1:/) },
+      session: { workingDir: expect.stringContaining('-wt-principal-lane-') },
+    });
+  });
+
+  it('keeps commit outcome unknown when read-only recovery sees partial proof traces', async () => {
+    initializeSourceGitRepository();
+    const source = sourceSession('root-worktree-unproven', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    __testOnly_setAfterPrincipalLaneWorktreeCommit(() => {
+      const tamper = new DatabaseSync(dbPath);
+      try {
+        tamper.prepare('DELETE FROM principal_lane_worktrees').run();
+      } finally { tamper.close(); }
+      throw new Error('synthetic unprovable commit outcome');
+    });
+    try {
+      expect(await prepareShadowPrincipalLaneForIngress({
+        sourceSessionId: source.sessionId,
+        identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+        now: '2026-09-19T08:01:00.000Z',
+      })).toMatchObject({ status: 'unknown', reason: 'worktree_publication_unknown' });
+    } finally {
+      __testOnly_setAfterPrincipalLaneWorktreeCommit(undefined);
+    }
+  });
+
+  it.each([
+    ['lane session index is rebound', (db: DatabaseSync) => {
+      const proof = db.prepare(
+        'SELECT source_session_id, lane_id, session_id FROM principal_lane_worktrees '
+        + 'LIMIT 1',
+      ).get() as {
+        source_session_id: string; lane_id: string; session_id: string;
+      };
+      const hit = db.prepare('SELECT status, row FROM sessions WHERE session_id = ?')
+        .get(proof.session_id) as { status: string; row: string };
+      const wrongSessionId = `${proof.session_id}-wrong`;
+      const wrong = JSON.parse(hit.row);
+      wrong.sessionId = wrongSessionId;
+      db.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?)')
+        .run(wrongSessionId, hit.status, JSON.stringify(wrong));
+      db.prepare(
+        'UPDATE principal_lanes SET session_id = ? WHERE source_session_id = ? AND lane_id = ?',
+      ).run(wrongSessionId, proof.source_session_id, proof.lane_id);
+    }],
+    ['embedded lane is rebound', (db: DatabaseSync) => {
+      const proof = db.prepare(
+        'SELECT session_id FROM principal_lane_worktrees LIMIT 1',
+      ).get() as { session_id: string };
+      const hit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+        .get(proof.session_id) as { row: string };
+      const row = JSON.parse(hit.row);
+      row.principalLane.routingAnchor = 'principal-lane:v1:wrong';
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?')
+        .run(JSON.stringify(row), proof.session_id);
+    }],
+    ['workspace member is missing', (db: DatabaseSync) => {
+      const proof = db.prepare(
+        'SELECT source_session_id, lane_id FROM principal_lane_worktrees LIMIT 1',
+      ).get() as { source_session_id: string; lane_id: string };
+      db.prepare(
+        'DELETE FROM principal_workspace_members WHERE source_session_id = ? AND lane_id = ?',
+      ).run(proof.source_session_id, proof.lane_id);
+    }],
+  ])('keeps commit outcome unknown when %s', async (_name, tamper) => {
+    initializeSourceGitRepository();
+    const source = sourceSession(`root-recovery-${_name}`, 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    let observer: DatabaseSync | undefined;
+    let postTamperDataVersion: number | undefined;
+    __testOnly_setAfterPrincipalLaneWorktreeCommit(() => {
+      const db = new DatabaseSync(dbPath);
+      try { tamper(db); }
+      finally { db.close(); }
+      observer = new DatabaseSync(dbPath);
+      postTamperDataVersion = (observer.prepare('PRAGMA data_version').get() as {
+        data_version: number;
+      }).data_version;
+      throw new Error('synthetic commit outcome with partial authority');
+    });
+    try {
+      expect(await prepareShadowPrincipalLaneForIngress({
+        sourceSessionId: source.sessionId,
+        identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+        now: '2026-09-19T08:01:00.000Z',
+      })).toMatchObject({ status: 'unknown', reason: 'worktree_publication_unknown' });
+      expect((observer!.prepare('PRAGMA data_version').get() as { data_version: number })
+        .data_version).toBe(postTamperDataVersion);
+      expect((observer!.prepare(
+        'SELECT phase FROM principal_lane_worktrees LIMIT 1',
+      ).get() as { phase: string }).phase).toBe('ready');
+    } finally {
+      observer?.close();
+      __testOnly_setAfterPrincipalLaneWorktreeCommit(undefined);
+    }
+  });
+
+  it('rolls back both the child Session and lane when either write fails', () => {
+    const source = sourceSession('root-rollback', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    const db = new DatabaseSync(dbPath);
+    try {
+      db.exec(`
+        CREATE TRIGGER fail_shadow_lane BEFORE INSERT ON principal_lanes
+        WHEN NEW.lane_id <> 'source'
+        BEGIN SELECT RAISE(ABORT, 'synthetic lane failure'); END;
+      `);
+    } finally { db.close(); }
+
+    expect(() => ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_lane_fail', openId: 'ou_lane_fail' },
+      now: '2026-09-19T08:01:00.000Z',
+    })).toThrow('synthetic lane failure');
+    let verify = new DatabaseSync(dbPath);
+    try {
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lane_aliases').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_workspace_members')
+        .get() as { n: number }).n).toBe(1);
+      verify.exec('DROP TRIGGER fail_shadow_lane;');
+    } finally { verify.close(); }
+
+    __testOnly_setBeforeRowPersist(sessionId => {
+      if (sessionId !== source.sessionId) throw new Error('synthetic child session failure');
+    });
+    expect(() => ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_session_fail', openId: 'ou_session_fail' },
+      now: '2026-09-19T08:02:00.000Z',
+    })).toThrow('synthetic child session failure');
+    __testOnly_setBeforeRowPersist(undefined);
+
+    verify = new DatabaseSync(dbPath);
+    try {
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_lane_aliases').get() as { n: number }).n).toBe(1);
+      expect((verify.prepare('SELECT COUNT(*) AS n FROM principal_workspace_members')
+        .get() as { n: number }).n).toBe(1);
+      expect((verify.prepare(
+        "SELECT COUNT(*) AS n FROM principal_lane_identity_audit WHERE event = 'created'",
+      ).get() as { n: number }).n).toBe(0);
+    } finally { verify.close(); }
+  });
+
+  it('atomically upgrades app-open identity evidence to union without duplicating a lane', () => {
+    const source = sourceSession('root-upgrade', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const openOnly = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    expect(openOnly).toMatchObject({
+      status: 'ready', created: true,
+      lane: { principalKey: `user:app:${appId}:open:ou_b` },
+    });
+    if (openOnly.status !== 'ready') throw new Error('expected open-id lane');
+
+    const upgraded = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:02:00.000Z',
+    });
+    expect(upgraded).toMatchObject({
+      status: 'ready', created: false,
+      lane: { laneId: openOnly.lane.laneId, principalKey: 'user:union:on_b' },
+      session: {
+        sessionId: openOnly.session.sessionId,
+        ownerUnionId: 'on_b',
+        ownerOpenId: 'ou_b',
+      },
+    });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(2);
+      expect((db.prepare(
+        'SELECT COUNT(*) AS n FROM principal_lane_aliases WHERE source_session_id = ? AND lane_id = ?',
+      ).get(source.sessionId, openOnly.lane.laneId) as { n: number }).n).toBe(2);
+      expect((db.prepare(
+        "SELECT COUNT(*) AS n FROM principal_lane_identity_audit WHERE event = 'upgraded'",
+      ).get() as { n: number }).n).toBe(1);
+      expect(db.prepare(
+        'SELECT session_id, group_id, workspace_epoch FROM principal_workspace_members '
+        + 'WHERE source_session_id = ? AND lane_id = ?',
+      ).get(source.sessionId, openOnly.lane.laneId)).toMatchObject({
+        session_id: openOnly.session.sessionId,
+        workspace_epoch: 1,
+      });
+    } finally { db.close(); }
+  });
+
+  it('persistently fails closed when union and app-open evidence resolve to different lanes', () => {
+    const source = sourceSession('root-conflict', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const openLane = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    const unionLane = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b' },
+      now: '2026-09-19T08:02:00.000Z',
+    });
+    expect(openLane).toMatchObject({ status: 'ready', created: true });
+    expect(unionLane).toMatchObject({ status: 'ready', created: true });
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:03:00.000Z',
+    })).toEqual({ status: 'identity_conflict', reason: 'identity_evidence_conflict' });
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, openId: 'ou_b' },
+      now: '2026-09-19T08:04:00.000Z',
+    })).toEqual({ status: 'identity_conflict', reason: 'identity_evidence_conflict' });
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b' },
+      now: '2026-09-19T08:05:00.000Z',
+    })).toEqual({ status: 'identity_conflict', reason: 'identity_evidence_conflict' });
+
+    init(appId);
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:06:00.000Z',
+    })).toEqual({ status: 'identity_conflict', reason: 'identity_evidence_conflict' });
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare(
+        'SELECT COUNT(*) AS n FROM principal_lane_identity_conflicts WHERE source_session_id = ?',
+      ).get(source.sessionId) as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(3);
+    } finally { db.close(); }
+  });
+
+  it('returns retry without a half-created lane when source authority changes after snapshot', () => {
+    const source = sourceSession('root-authority', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    __testOnly_setBeforePrincipalLaneCreateTransaction(() => {
+      const db = new DatabaseSync(dbPath);
+      try {
+        const hit = db.prepare(
+          'SELECT revision, row FROM principal_lane_sources WHERE source_session_id = ?',
+        ).get(source.sessionId) as { revision: number; row: string };
+        const row = JSON.parse(hit.row);
+        row.revision = hit.revision + 1;
+        row.updatedAt = '2026-09-19T08:00:30.000Z';
+        db.prepare(
+          'UPDATE principal_lane_sources SET revision = ?, row = ? WHERE source_session_id = ?',
+        ).run(row.revision, JSON.stringify(row), source.sessionId);
+        const sessionHit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+          .get(source.sessionId) as { row: string };
+        const sourceRow = JSON.parse(sessionHit.row);
+        sourceRow.principalLaneSource = row;
+        db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?')
+          .run(JSON.stringify(sourceRow), source.sessionId);
+      } finally { db.close(); }
+    });
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    })).toEqual({ status: 'retry', reason: 'source_authority_changed' });
+    __testOnly_setBeforePrincipalLaneCreateTransaction(undefined);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_aliases').get() as { n: number }).n).toBe(1);
+      expect((db.prepare(
+        'SELECT phase FROM principal_lane_sources WHERE source_session_id = ?',
+      ).get(source.sessionId) as { phase: string }).phase).toBe('active');
+    } finally { db.close(); }
+  });
+
+  it.each([
+    ['source lane revision', 'lane-revision'],
+    ['source workspace group', 'workspace-group'],
+  ])('rechecks the complete pre-transaction %s authority snapshot', (_label, mutation) => {
+    const source = sourceSession(`root-${mutation}`, 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const dbPath = join(tempDir, 'session-stores', appId, 'sessions.db');
+    __testOnly_setBeforePrincipalLaneCreateTransaction(() => {
+      const db = new DatabaseSync(dbPath);
+      try {
+        const sessionHit = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+          .get(source.sessionId) as { row: string };
+        const sourceRow = JSON.parse(sessionHit.row);
+        if (mutation === 'lane-revision') {
+          const laneHit = db.prepare(
+            "SELECT revision, row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+          ).get(source.sessionId) as { revision: number; row: string };
+          const laneRow = JSON.parse(laneHit.row);
+          laneRow.revision = laneHit.revision + 1;
+          laneRow.updatedAt = '2026-09-19T08:00:30.000Z';
+          db.prepare(
+            "UPDATE principal_lanes SET revision = ?, row = ? WHERE source_session_id = ? AND lane_id = 'source'",
+          ).run(laneRow.revision, JSON.stringify(laneRow), source.sessionId);
+          sourceRow.principalLane = laneRow;
+        } else {
+          const stateHit = db.prepare(
+            'SELECT row FROM principal_lane_sources WHERE source_session_id = ?',
+          ).get(source.sessionId) as { row: string };
+          const stateRow = JSON.parse(stateHit.row);
+          stateRow.canonicalCwd = realpathSync(dirname(tempDir));
+          stateRow.workspaceGroupId = principalWorkspaceGroupIdV2(appId, stateRow.canonicalCwd);
+          db.prepare(
+            'UPDATE principal_lane_sources SET canonical_cwd = ?, workspace_group_id = ?, row = ? '
+            + 'WHERE source_session_id = ?',
+          ).run(
+            stateRow.canonicalCwd, stateRow.workspaceGroupId,
+            JSON.stringify(stateRow), source.sessionId,
+          );
+          sourceRow.principalLaneSource = stateRow;
+        }
+        db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?')
+          .run(JSON.stringify(sourceRow), source.sessionId);
+      } finally { db.close(); }
+    });
+
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    })).toEqual({ status: 'retry', reason: 'source_authority_changed' });
+    __testOnly_setBeforePrincipalLaneCreateTransaction(undefined);
+
+    const db = new DatabaseSync(dbPath);
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_aliases').get() as { n: number }).n).toBe(1);
+      expect((db.prepare(
+        'SELECT phase FROM principal_lane_sources WHERE source_session_id = ?',
+      ).get(source.sessionId) as { phase: string }).phase).toBe('active');
+      expect((db.prepare(
+        "SELECT phase FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+      ).get(source.sessionId) as { phase: string }).phase).toBe('active');
+    } finally { db.close(); }
+  });
+
+  it.each([
+    ['source revision', { sourceRevision: 99 }],
+    ['source lane revision', { sourceLaneRevision: 99 }],
+  ])('refuses materialization under a stale ingress %s fence', (_label, override) => {
+    const source = sourceSession(`root-stale-${_label.replaceAll(' ', '-')}`, 'on_source', 'ou_source');
+    const ready = ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    if (ready.status !== 'ready') throw new Error('expected ready source lane');
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+      expectedSource: {
+        sourcePrincipalKey: ready.source.sourcePrincipalKey,
+        sourceRevision: ready.source.revision,
+        sourceLaneRevision: ready.lane.revision,
+        workspaceEpoch: ready.source.workspaceEpoch,
+        canonicalCwd: ready.source.canonicalCwd,
+        workspaceGroupId: ready.source.workspaceGroupId,
+        workspaceGroupKeyVersion: ready.source.workspaceGroupKeyVersion,
+        displayTarget: ready.source.displayTarget,
+        ...override,
+      },
+    })).toEqual({ status: 'retry', reason: 'source_authority_changed' });
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(1);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_aliases').get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('serializes concurrent creators and makes the loser validate and reuse the winner', async () => {
+    const source = sourceSession('root-concurrent', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    // Release this process's connection before the two independent creators race.
+    init(appId);
+    const code = `
+      import { init, ensureShadowPrincipalLane } from './src/services/session-store.js';
+      init(${JSON.stringify(appId)});
+      const result = ensureShadowPrincipalLane({
+        sourceSessionId: ${JSON.stringify(source.sessionId)},
+        identity: { larkAppId: ${JSON.stringify(appId)}, unionId: 'on_b', openId: 'ou_b' },
+        title: 'B concurrent lane',
+        now: '2026-09-19T08:01:00.000Z',
+      });
+      console.log('SHADOW_RESULT=' + JSON.stringify(result));
+    `;
+    const runCreator = () => new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawnTsEvalWithRepoImports(code, {
+        env: { ...process.env, SESSION_DATA_DIR: tempDir },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 20_000,
+      });
+      let output = '';
+      child.stdout?.on('data', chunk => { output += chunk; });
+      child.stderr?.on('data', chunk => { output += chunk; });
+      child.on('error', reject);
+      child.on('close', exitCode => resolve({ code: exitCode, output }));
+    });
+    const outcomes = await Promise.all([runCreator(), runCreator()]);
+    for (const outcome of outcomes) {
+      expect(outcome.code, outcome.output).toBe(0);
+      expect(outcome.output).toContain('SHADOW_RESULT=');
+    }
+    const results = outcomes.map(outcome => JSON.parse(
+      outcome.output.split('SHADOW_RESULT=')[1]!.trim().split('\n')[0]!,
+    ));
+    expect(results.map(result => result.status)).toEqual(['ready', 'ready']);
+    expect(new Set(results.map(result => result.lane.laneId)).size).toBe(1);
+    expect(new Set(results.map(result => result.session.sessionId)).size).toBe(1);
+    expect(results.filter(result => result.created).length).toBe(1);
+
+    init(appId);
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(2);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(2);
+      expect((db.prepare(
+        "SELECT COUNT(*) AS n FROM principal_lane_identity_audit WHERE event = 'created'",
+      ).get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('converges two-process worktree publication to one lane, session, and proof', async () => {
+    const source = sourceSession('root-concurrent-worktree', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const materialization = worktreeMaterialization({ sourceSessionId: source.sessionId });
+    init(appId);
+    const code = `
+      import { init, ensureShadowPrincipalLane } from './src/services/session-store.js';
+      init(${JSON.stringify(appId)});
+      const result = ensureShadowPrincipalLane({
+        sourceSessionId: ${JSON.stringify(source.sessionId)},
+        identity: { larkAppId: ${JSON.stringify(appId)}, unionId: 'on_b', openId: 'ou_b' },
+        worktree: ${JSON.stringify(materialization)},
+        now: '2026-09-19T08:01:00.000Z',
+      });
+      console.log('WORKTREE_RESULT=' + JSON.stringify(result));
+    `;
+    const runCreator = () => new Promise<{ code: number | null; output: string }>((resolve, reject) => {
+      const child = spawnTsEvalWithRepoImports(code, {
+        env: { ...process.env, SESSION_DATA_DIR: tempDir },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 20_000,
+      });
+      let output = '';
+      child.stdout?.on('data', chunk => { output += chunk; });
+      child.stderr?.on('data', chunk => { output += chunk; });
+      child.on('error', reject);
+      child.on('close', exitCode => resolve({ code: exitCode, output }));
+    });
+    const outcomes = await Promise.all([runCreator(), runCreator()]);
+    const results = outcomes.map(outcome => {
+      expect(outcome.code, outcome.output).toBe(0);
+      return JSON.parse(
+        outcome.output.split('WORKTREE_RESULT=')[1]!.trim().split('\n')[0]!,
+      );
+    });
+    expect(results.map(result => result.status)).toEqual(['ready', 'ready']);
+    expect(new Set(results.map(result => result.lane.laneId)).size).toBe(1);
+    expect(new Set(results.map(result => result.session.sessionId)).size).toBe(1);
+    expect(new Set(results.map(result => result.worktree.materializationId)).size).toBe(1);
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((db.prepare('SELECT COUNT(*) AS n FROM sessions').get() as { n: number }).n).toBe(2);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(2);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lane_worktrees')
+        .get() as { n: number }).n).toBe(1);
+    } finally { db.close(); }
+  });
+
+  it('quarantines only a corrupt existing shadow lane when the reuse loser validates it', () => {
+    const source = sourceSession('root-corrupt-shadow', 'on_source', 'ou_source');
+    ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' },
+      now,
+    });
+    const created = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:01:00.000Z',
+    });
+    if (created.status !== 'ready') throw new Error('expected ready shadow lane');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      const child = db.prepare('SELECT row FROM sessions WHERE session_id = ?')
+        .get(created.session.sessionId) as { row: string };
+      const row = JSON.parse(child.row);
+      row.chatId = 'chat-other';
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?')
+        .run(JSON.stringify(row), created.session.sessionId);
+    } finally { db.close(); }
+
+    expect(ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' },
+      now: '2026-09-19T08:02:00.000Z',
+    })).toEqual({ status: 'quarantined', reason: 'lane_session_mismatch' });
+    const verify = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((verify.prepare(
+        'SELECT phase FROM principal_lanes WHERE source_session_id = ? AND lane_id = ?',
+      ).get(source.sessionId, created.lane.laneId) as { phase: string }).phase).toBe('quarantined');
+      expect((verify.prepare(
+        'SELECT phase FROM principal_lane_sources WHERE source_session_id = ?',
+      ).get(source.sessionId) as { phase: string }).phase).toBe('active');
+    } finally { verify.close(); }
+  });
+
+  it('records provenance idempotently and refuses conflicts or trust elevation', () => {
+    const session = sourceSession('root-p', 'on_p', 'ou_p');
+    const ready = ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_p' },
+      now,
+    });
+    expect(ready.status).toBe('ready');
+    const trusted = {
+      messageId: 'om_out',
+      larkAppId: appId,
+      chatId: 'chat-root-p',
+      displayRootId: 'root-p',
+      sourceSessionId: session.sessionId,
+      laneId: 'source',
+      sessionId: session.sessionId,
+      turnId: 'om_turn',
+      principalKey: 'user:union:on_p',
+      workerGeneration: 1,
+      direction: 'outbound' as const,
+      trustState: 'trusted' as const,
+      createdAt: now,
+      updatedAt: now,
+    };
+    expect(recordMessageProvenance(trusted)).toEqual(trusted);
+    expect(recordMessageProvenance(trusted)).toEqual(trusted);
+    expect(readTrustedMessageProvenance('om_out', session.sessionId)).toEqual(trusted);
+    const retriedCreatedAt = '2026-09-19T08:00:00.016Z';
+    expect(recordMessageProvenance({
+      ...trusted,
+      createdAt: retriedCreatedAt,
+      updatedAt: retriedCreatedAt,
+    })).toEqual({
+      ...trusted,
+      updatedAt: retriedCreatedAt,
+    });
+    expect(readTrustedMessageProvenance('om_out', session.sessionId)).toEqual({
+      ...trusted,
+      updatedAt: retriedCreatedAt,
+    });
+    const newerUpdatedAt = '2026-09-19T09:00:00.000Z';
+    expect(recordMessageProvenance({ ...trusted, updatedAt: newerUpdatedAt })).toMatchObject({
+      updatedAt: newerUpdatedAt,
+    });
+    expect(recordMessageProvenance(trusted)).toMatchObject({ updatedAt: newerUpdatedAt });
+    expect(() => recordMessageProvenance({ ...trusted, chatId: 'chat-other' }))
+      .toThrow('display target mismatch');
+    expect(() => recordMessageProvenance({ ...trusted, turnId: 'om_other' }))
+      .toThrow('identity conflict');
+    expect(readTrustedMessageProvenance('om_out', session.sessionId)).toBeUndefined();
+
+    init(appId);
+    expect(readTrustedMessageProvenance('om_out', session.sessionId)).toBeUndefined();
+    const afterConflict = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((afterConflict.prepare(
+        'SELECT trust_state, updated_at FROM message_provenance WHERE message_id = ?',
+      ).get('om_out') as { trust_state: string; updated_at: string })).toEqual({
+        trust_state: 'untrusted', updated_at: newerUpdatedAt,
+      });
+      expect((afterConflict.prepare(
+        'SELECT COUNT(*) AS n FROM message_provenance_conflicts WHERE message_id = ?',
+      ).get('om_out') as { n: number }).n).toBe(1);
+    } finally { afterConflict.close(); }
+
+    const authorityCases = [
+      {
+        messageId: 'om_principal_conflict',
+        mutation: { principalKey: 'user:union:on_other' },
+        error: 'lane authority mismatch',
+      },
+      {
+        messageId: 'om_lane_conflict',
+        mutation: { laneId: 'lane_other' },
+        error: 'lane authority mismatch',
+      },
+      {
+        messageId: 'om_session_conflict',
+        mutation: { sessionId: 'session_other' },
+        error: 'session authority mismatch',
+      },
+      {
+        messageId: 'om_generation_conflict',
+        mutation: { workerGeneration: 2 },
+        error: 'identity conflict',
+      },
+    ] as const;
+    for (const { messageId, mutation, error } of authorityCases) {
+      const base = {
+        ...trusted,
+        messageId,
+        turnId: `${messageId}_turn`,
+      };
+      expect(recordMessageProvenance(base)).toEqual(base);
+      expect(() => recordMessageProvenance({
+        ...base,
+        ...mutation,
+        updatedAt: newerUpdatedAt,
+      })).toThrow(error);
+    }
+
+    const untrusted = {
+      ...trusted,
+      messageId: 'om_untrusted',
+      trustState: 'untrusted' as const,
+    };
+    recordMessageProvenance(untrusted);
+    expect(readTrustedMessageProvenance('om_untrusted', session.sessionId)).toBeUndefined();
+    expect(() => recordMessageProvenance({ ...untrusted, trustState: 'trusted' }))
+      .toThrow('trust elevation refused');
+
+    const confirmed = { ...trusted, messageId: 'om_confirmed' };
+    settlePrincipalLaneOutboundProvenance(confirmed, {
+      beginTrustAttempt: beginMessageProvenanceTrustAttempt,
+      recordTrusted: recordMessageProvenance,
+      completeTrustAttempt: completeMessageProvenanceTrustAttempt,
+      abortTrustAttempt: abortMessageProvenanceTrustAttempt,
+      markUntrusted: markMessageProvenanceUntrusted,
+      warn: () => {},
+    });
+    expect(readTrustedMessageProvenance('om_confirmed', session.sessionId))
+      .toMatchObject({ messageId: 'om_confirmed', trustState: 'trusted' });
+
+    settlePrincipalLaneOutboundProvenance(confirmed, {
+      beginTrustAttempt: beginMessageProvenanceTrustAttempt,
+      recordTrusted: () => { throw new SessionStoreBusyError(new Error('synthetic busy')); },
+      completeTrustAttempt: completeMessageProvenanceTrustAttempt,
+      abortTrustAttempt: abortMessageProvenanceTrustAttempt,
+      markUntrusted: markMessageProvenanceUntrusted,
+      warn: () => {},
+    });
+    expect(readTrustedMessageProvenance('om_confirmed', session.sessionId))
+      .toMatchObject({ messageId: 'om_confirmed', trustState: 'trusted' });
+    const busyRetryDb = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((busyRetryDb.prepare(
+        'SELECT COUNT(*) AS n FROM message_provenance_trust_fences WHERE message_id = ?',
+      ).get('om_confirmed') as { n: number }).n).toBe(0);
+    } finally { busyRetryDb.close(); }
+
+    const exactAttempt = { ...trusted, messageId: 'om_exact_attempt' };
+    const exactAttemptId = beginMessageProvenanceTrustAttempt(exactAttempt);
+    expect(() => completeMessageProvenanceTrustAttempt(exactAttempt, 'wrong-attempt'))
+      .toThrow('fenced by an unresolved trust attempt');
+    expect(() => recordMessageProvenance(exactAttempt))
+      .toThrow('fenced by an unresolved trust attempt');
+    recordMessageProvenance(exactAttempt, exactAttemptId);
+    completeMessageProvenanceTrustAttempt(exactAttempt, exactAttemptId);
+    expect(readTrustedMessageProvenance('om_exact_attempt', session.sessionId))
+      .toMatchObject({ trustState: 'trusted' });
+
+    const busyAttempt = { ...trusted, messageId: 'om_busy_attempt' };
+    const busyAttemptId = beginMessageProvenanceTrustAttempt(busyAttempt);
+    const busyWriter = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    busyWriter.exec('PRAGMA busy_timeout = 0;');
+    busyWriter.exec('BEGIN IMMEDIATE;');
+    try {
+      expect(() => recordMessageProvenance(busyAttempt, busyAttemptId))
+        .toThrow(SessionStoreBusyError);
+    } finally {
+      busyWriter.exec('ROLLBACK;');
+      busyWriter.close();
+    }
+    abortMessageProvenanceTrustAttempt(busyAttempt, busyAttemptId);
+    expect(readTrustedMessageProvenance('om_busy_attempt', session.sessionId)).toBeUndefined();
+
+    const deliveredButUnproved = { ...trusted, messageId: 'om_commit_unknown' };
+    settlePrincipalLaneOutboundProvenance(deliveredButUnproved, {
+      beginTrustAttempt: beginMessageProvenanceTrustAttempt,
+      recordTrusted: (value, attemptId) => {
+        recordMessageProvenance(value, attemptId);
+        throw new Error('simulated trusted COMMIT unknown');
+      },
+      completeTrustAttempt: completeMessageProvenanceTrustAttempt,
+      abortTrustAttempt: abortMessageProvenanceTrustAttempt,
+      markUntrusted: value => {
+        __testOnly_setAfterProvenanceDenyFence(() => {
+          throw new Error('simulated downgrade write failure');
+        });
+        try { markMessageProvenanceUntrusted(value); }
+        finally { __testOnly_setAfterProvenanceDenyFence(undefined); }
+      },
+      warn: () => {},
+    });
+    const uncertainDb = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((uncertainDb.prepare(
+        'SELECT trust_state FROM message_provenance WHERE message_id = ?',
+      ).get('om_commit_unknown') as { trust_state: string }).trust_state).toBe('trusted');
+      expect((uncertainDb.prepare(
+        'SELECT COUNT(*) AS n FROM message_provenance_trust_fences WHERE message_id = ?',
+      ).get('om_commit_unknown') as { n: number }).n).toBe(1);
+    } finally { uncertainDb.close(); }
+    expect(readTrustedMessageProvenance('om_commit_unknown', session.sessionId)).toBeUndefined();
+    init(appId);
+    expect(readTrustedMessageProvenance('om_commit_unknown', session.sessionId)).toBeUndefined();
+    expect(() => beginMessageProvenanceTrustAttempt(deliveredButUnproved))
+      .toThrow('fenced by an unresolved trust attempt');
+    // A stale retry and its compensation must neither release the old fence
+    // nor downgrade the already-committed trusted row.
+    markMessageProvenanceUntrusted({ ...deliveredButUnproved, trustState: 'untrusted' });
+    const stillFencedDb = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      expect((stillFencedDb.prepare(
+        'SELECT trust_state FROM message_provenance WHERE message_id = ?',
+      ).get('om_commit_unknown') as { trust_state: string }).trust_state).toBe('trusted');
+      expect((stillFencedDb.prepare(
+        'SELECT COUNT(*) AS n FROM message_provenance_trust_fences WHERE message_id = ?',
+      ).get('om_commit_unknown') as { n: number }).n).toBe(1);
+    } finally { stillFencedDb.close(); }
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      db.prepare(
+        "UPDATE principal_lanes SET phase = 'quarantined' WHERE source_session_id = ? AND lane_id = 'source'",
+      ).run(session.sessionId);
+    } finally { db.close(); }
+    expect(readTrustedMessageProvenance('om_out', session.sessionId)).toBeUndefined();
+    expect(() => recordMessageProvenance({ ...trusted, messageId: 'om_after_quarantine' }))
+      .toThrow('principal-lane source is not ready');
+  });
+
+  it.each([
+    ['stale workspace epoch', 'epoch'],
+    ['closed phase', 'closed'],
+  ])('refuses trusted provenance authority from a %s lane', (_label, mutation) => {
+    const session = sourceSession(`root-${mutation}`, `on_${mutation}`, `ou_${mutation}`);
+    ensurePrincipalLaneSource({
+      sourceSessionId: session.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: `on_${mutation}` },
+      now,
+    });
+    const provenance = {
+      messageId: `om_${mutation}`,
+      larkAppId: appId,
+      chatId: `chat-root-${mutation}`,
+      displayRootId: `root-${mutation}`,
+      sourceSessionId: session.sessionId,
+      laneId: 'source',
+      sessionId: session.sessionId,
+      turnId: `om_turn_${mutation}`,
+      principalKey: `user:union:on_${mutation}`,
+      workerGeneration: 1,
+      direction: 'outbound' as const,
+      trustState: 'trusted' as const,
+      createdAt: now,
+      updatedAt: now,
+    };
+    recordMessageProvenance(provenance);
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', appId, 'sessions.db'));
+    try {
+      const hit = db.prepare(
+        "SELECT row FROM principal_lanes WHERE source_session_id = ? AND lane_id = 'source'",
+      ).get(session.sessionId) as { row: string };
+      const row = JSON.parse(hit.row);
+      if (mutation === 'epoch') {
+        row.workspaceEpoch = 2;
+        db.prepare(
+          "UPDATE principal_lanes SET workspace_epoch = 2, row = ? WHERE source_session_id = ? AND lane_id = 'source'",
+        ).run(JSON.stringify(row), session.sessionId);
+      } else {
+        row.phase = 'closed';
+        db.prepare(
+          "UPDATE principal_lanes SET phase = 'closed', row = ? WHERE source_session_id = ? AND lane_id = 'source'",
+        ).run(JSON.stringify(row), session.sessionId);
+      }
+    } finally { db.close(); }
+
+    expect(readTrustedMessageProvenance(provenance.messageId, session.sessionId)).toBeUndefined();
+    expect(() => recordMessageProvenance({ ...provenance, messageId: `${provenance.messageId}_new` }))
+      .toThrow(/principal-lane source is not ready|lane is not admissible/);
+  });
+});
+
+describe('mutateOwnedSessionsAtomically()', () => {
+  it('publishes a multi-row authority change only after every row commits', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const second = createSession('chat-b', 'root-b', 'B');
+
+    const outcome = mutateOwnedSessionsAtomically([first.sessionId, second.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      rows.get(second.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      return 'committed' as const;
+    });
+
+    expect(outcome.result).toBe('committed');
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    init('test-app');
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBe(second.sessionId);
+  });
+
+  it('rolls back disk and cache together when the second row cannot persist', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const second = createSession('chat-b', 'root-b', 'B');
+    __testOnly_setBeforeRowPersist(sessionId => {
+      if (sessionId === second.sessionId) throw new Error('synthetic second-row failure');
+    });
+
+    expect(() => mutateOwnedSessionsAtomically([first.sessionId, second.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+      rows.get(second.sessionId)!.xpiSharedCwdAdmissionCoordinatorSessionId = second.sessionId;
+    })).toThrow('synthetic second-row failure');
+
+    expect(first.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    expect(second.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+    expect(getOwnedSession(second.sessionId)?.xpiSharedCwdAdmissionCoordinatorSessionId).toBeUndefined();
+  });
+
+  it('fails fast without publishing cache or disk when nonblocking lock acquisition is busy', () => {
+    const first = createSession('chat-a', 'root-a', 'A');
+    const writer = new DatabaseSync(sessionStorePath(tempDir, 'test-app'));
+    writer.exec('PRAGMA busy_timeout = 0;');
+    writer.exec('BEGIN IMMEDIATE;');
+    const startedAt = performance.now();
+    try {
+      expect(() => mutateOwnedSessionsAtomically([first.sessionId], rows => {
+        rows.get(first.sessionId)!.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+      }, { nonblocking: true })).toThrow(SessionStoreBusyError);
+      expect(performance.now() - startedAt).toBeLessThan(500);
+      expect(first.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    } finally {
+      writer.exec('ROLLBACK;');
+      writer.close();
+    }
+
+    mutateOwnedSessionsAtomically([first.sessionId], rows => {
+      rows.get(first.sessionId)!.xpiSharedCwdAdmissionGroupId = 'after-lock-release';
+    }, { nonblocking: true });
+    expect(first.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
+    init('test-app');
+    expect(getOwnedSession(first.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('after-lock-release');
+  });
+});
+
+describe('createSessionWithOwnedMutation()', () => {
+  it('publishes the child and parent-side authority in one commit', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    const created = createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, (rows, child) => {
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+      child.xpiSharedCwdAdmissionGroupId = 'group-a';
+      return child.sessionId;
+    });
+
+    expect(created.result).toBe(created.session.sessionId);
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    init('test-app');
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+    expect(getOwnedSession(created.session.sessionId)?.xpiSharedCwdAdmissionGroupId).toBe('group-a');
+  });
+
+  it('captures group model defaults through the atomic child creation path', () => {
+    init('atomic-model-defaults', {
+      groupDefaultModels: chatId => chatId === 'chat-a' ? { codex: 'gpt-5.6-sol' } : undefined,
+    });
+    const parent = createSession('chat-a', 'root-a', 'parent');
+
+    const created = createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      chatType: 'group',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, rows => {
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+    });
+
+    expect(created.session.groupDefaultModels).toEqual({ codex: 'gpt-5.6-sol' });
+    expect(getOwnedSession(created.session.sessionId)?.groupDefaultModels)
+      .toEqual({ codex: 'gpt-5.6-sol' });
+  });
+
+  it('rolls back the parent when the child insert fails after the parent write', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    let childId: string | undefined;
+    __testOnly_setBeforeRowPersist(sessionId => {
+      if (sessionId === childId) throw new Error('synthetic child insert failure');
+    });
+
+    expect(() => createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'root-child',
+      title: 'child',
+      scope: 'thread',
+      ownedSessionIds: [parent.sessionId],
+    }, (rows, child) => {
+      childId = child.sessionId;
+      rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'group-a';
+      child.xpiSharedCwdAdmissionGroupId = 'group-a';
+    })).toThrow('synthetic child insert failure');
+
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect(childId && getOwnedSession(childId)).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getOwnedSession(parent.sessionId)?.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+    expect(childId && getOwnedSession(childId)).toBeUndefined();
+  });
+
+  it('does not publish a child or parent mutation when nonblocking BEGIN is busy', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    const beforeIds = listSessionsStrict().map(session => session.sessionId);
+    const writer = new DatabaseSync(sessionStorePath(tempDir, 'test-app'));
+    writer.exec('PRAGMA busy_timeout = 0;');
+    writer.exec('BEGIN IMMEDIATE;');
+    const startedAt = performance.now();
+    try {
+      expect(() => createSessionWithOwnedMutation({
+        chatId: 'chat-a',
+        rootMessageId: 'root-child',
+        title: 'child',
+        scope: 'thread',
+        ownedSessionIds: [parent.sessionId],
+        nonblocking: true,
+      }, (rows, child) => {
+        rows.get(parent.sessionId)!.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+        child.xpiSharedCwdAdmissionGroupId = 'must-not-publish';
+      })).toThrow(SessionStoreBusyError);
+      expect(performance.now() - startedAt).toBeLessThan(500);
+      expect(parent.xpiSharedCwdAdmissionGroupId).toBeUndefined();
+      expect(listSessionsStrict().map(session => session.sessionId)).toEqual(beforeIds);
+    } finally {
+      writer.exec('ROLLBACK;');
+      writer.close();
+    }
+  });
 });
 
 // ─── init() ───────────────────────────────────────────────────────────────
 
 describe('init()', () => {
+  it('migrates legacy stores by creating principal-lane sidecars without rewriting session rows', () => {
+    const legacy = createSession('chat-legacy', 'root-legacy', 'legacy');
+    const before = JSON.stringify(readPersistedRows(tempDir, 'test-app')[legacy.sessionId]);
+
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'test-app', 'sessions.db'));
+    try {
+      const tables = new Set((db.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table'",
+      ).all() as Array<{ name: string }>).map(row => row.name));
+      for (const table of [
+        'sessions',
+        'principal_lane_sources',
+        'principal_lanes',
+        'principal_lane_aliases',
+        'principal_lane_identity_audit',
+        'principal_lane_identity_conflicts',
+        'message_provenance',
+        'message_provenance_conflicts',
+        'principal_lane_migration_audit',
+      ]) expect(tables.has(table)).toBe(true);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM principal_lanes').get() as { n: number }).n).toBe(0);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM message_provenance').get() as { n: number }).n).toBe(0);
+    } finally {
+      db.close();
+    }
+
+    expect(JSON.stringify(readPersistedRows(tempDir, 'test-app')[legacy.sessionId])).toBe(before);
+    expect(getOwnedSession(legacy.sessionId)?.principalLane).toBeUndefined();
+    expect(getOwnedSession(legacy.sessionId)?.principalLaneSource).toBeUndefined();
+  });
+
+  it('keeps cross-file discovery read-only and exposes owner-scoped lookup separately', () => {
+    init('app-A');
+    const ownedByA = createSession('chat1', 'root1', 'Bot A');
+
+    init('app-B');
+    expect(getSession(ownedByA.sessionId)?.sessionId).toBe(ownedByA.sessionId);
+    expect(getOwnedSession(ownedByA.sessionId)).toBeUndefined();
+  });
+
   it('should create the data directory on first operation if it does not exist', () => {
     const subDir = join(tempDir, 'nested', 'data');
     tempDir = subDir;
-    init();
+    init('test-app');
     // The directory is created lazily on first load (e.g. createSession)
     createSession('chat1', 'root1', 'Test');
     expect(existsSync(subDir)).toBe(true);
@@ -96,14 +2262,92 @@ describe('init()', () => {
         createdAt: '2026-01-01T00:00:00.000Z',
       },
     };
-    writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify(session));
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), JSON.stringify(session));
 
     // Re-init to pick up the file
-    init();
+    init('test-app');
     const loaded = getSession('s1');
     expect(loaded).toBeDefined();
     expect(loaded!.title).toBe('Pre-existing');
     expect(loaded!.status).toBe('active');
+  });
+
+  it('repairs only the scope-less oc_=root chat corruption signature', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const records = {
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      legacyThread: {
+        sessionId: 'legacyThread',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        title: 'Legacy thread',
+        status: 'active',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    const fp = join(tempDir, 'sessions-test-app.json');
+    writeFileSync(fp, JSON.stringify(records));
+
+    init('test-app');
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('legacyThread')?.scope).toBeUndefined();
+    const persisted = readPersistedRows(tempDir, 'test-app');
+    expect(persisted.broken.scope).toBe('chat');
+    expect(persisted.legacyThread.scope).toBeUndefined();
+  });
+
+  it('ignores malformed entries while repairing healthy sessions', () => {
+    mkdirSync(tempDir, { recursive: true });
+    const fp = join(tempDir, 'sessions-test-app.json');
+    writeFileSync(fp, JSON.stringify({
+      missingChatId: { sessionId: 'missing-chat-id' },
+      primitive: 'not-a-session',
+      broken: {
+        sessionId: 'broken',
+        chatId: 'oc_chat',
+        rootMessageId: 'oc_chat',
+        title: 'Broken repo switch',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+      healthy: {
+        sessionId: 'healthy',
+        chatId: 'oc_chat',
+        rootMessageId: 'om_thread',
+        scope: 'thread',
+        title: 'Healthy thread',
+        status: 'active',
+        createdAt: '2026-07-18T00:00:00.000Z',
+      },
+    }));
+
+    init('test-app');
+
+    expect(getSession('broken')?.scope).toBe('chat');
+    expect(getSession('healthy')?.title).toBe('Healthy thread');
+    expect(listSessions()).toHaveLength(4);
+  });
+
+  it('repairs the corruption signature through the shared deserialization helper', () => {
+    const record: Record<string, unknown> = {
+      sessionId: 'broken',
+      chatId: 'oc_chat',
+      rootMessageId: 'oc_chat',
+    };
+
+    expect(repairMissingChatScope(record)).toBe(true);
+    expect(record.scope).toBe('chat');
+    expect(repairMissingChatScope(record)).toBe(false);
+    expect(repairMissingChatScope(null)).toBe(false);
+    expect(repairMissingChatScope({ sessionId: 'malformed' })).toBe(false);
   });
 
   it('should reset state when called again', () => {
@@ -140,11 +2384,56 @@ describe('createSession()', () => {
 
   it('should persist session to disk', () => {
     const session = createSession('chat1', 'root1', 'Persisted');
-    const fp = join(tempDir, 'sessions.json');
-    expect(existsSync(fp)).toBe(true);
-    const data = JSON.parse(readFileSync(fp, 'utf-8'));
+    expect(persistedStoreExists(tempDir, 'test-app')).toBe(true);
+    const data = readPersistedRows(tempDir, 'test-app');
     expect(data[session.sessionId]).toBeDefined();
     expect(data[session.sessionId].title).toBe('Persisted');
+  });
+
+  it('round-trips provider-neutral remote state and usage across store reloads', () => {
+    const session = createSession('chat-remote', 'root-remote', 'Remote Runner');
+    session.backendType = 'remote-runner';
+    session.remoteBackendState = {
+      version: 1,
+      provider: 'example-provider',
+      generation: 4,
+      remoteSessionId: 'compute-4',
+      agentThreadId: 'thread-stable',
+      providerState: { runtimeSubpath: 'sessions/four' },
+    };
+    session.remoteRunnerUsage = {
+      generation: 4,
+      snapshot: {
+        context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+        tokens: { in: 10, out: 2 },
+        model: 'provider-model',
+        reasoningEffort: 'provider-effort',
+      },
+    };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)).toMatchObject({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'example-provider',
+        generation: 4,
+        remoteSessionId: 'compute-4',
+        agentThreadId: 'thread-stable',
+        providerState: { runtimeSubpath: 'sessions/four' },
+      },
+      remoteRunnerUsage: {
+        generation: 4,
+        snapshot: {
+          context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+          tokens: { in: 10, out: 2 },
+          model: 'provider-model',
+          reasoningEffort: 'provider-effort',
+        },
+      },
+    });
   });
 
   it('should default chatType to undefined when not provided', () => {
@@ -212,9 +2501,162 @@ describe('listSessions()', () => {
   });
 });
 
+describe('listSessionsStrict()', () => {
+  it('returns a healthy empty projection when no store exists', () => {
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a malformed store instead of treating it as safely empty', () => {
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), '{not-json');
+    init('test-app');
+
+    // Preserve the compatibility reader for non-transactional callers.
+    expect(listSessions()).toEqual([]);
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    expect(() => listSessionsStrict()).toThrow(/session store is unavailable/i);
+  });
+
+  it('stays unhealthy until an explicit init reloads the repaired projection', () => {
+    const fp = join(tempDir, 'sessions-test-app.json');
+    writeFileSync(fp, '{not-json');
+    init('test-app');
+
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+    writeFileSync(fp, '{}');
+    expect(() => listSessionsStrict()).toThrow(SessionStoreUnavailableError);
+
+    init('test-app');
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('rejects a JSON value that is not a session-record projection', () => {
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), '[]');
+    init('test-app');
+
+    expect(() => listSessionsStrict()).toThrow(/invalid sessions projection/i);
+  });
+
+  it('does not create a per-bot store when the import source is malformed', () => {
+    // ".db exists" must keep meaning "the import completed": a half-built store
+    // would silently disable the one-shot import gate and drop every
+    // pre-SQLite row. A broken source therefore leaves no .db behind, and the
+    // source file itself is untouched.
+    const fp = join(tempDir, 'sessions-app-A.json');
+    writeFileSync(fp, '{broken-import-source');
+    init('app-A');
+
+    expect(() => createSession('chat-broken', 'root-broken', 'Broken')).toThrow(SessionStoreUnavailableError);
+    expect(existsSync(sessionStorePath(tempDir, 'app-A'))).toBe(false);
+    expect(readFileSync(fp, 'utf-8')).toBe('{broken-import-source');
+  });
+});
+
 // ─── closeSession() ──────────────────────────────────────────────────────
 
+describe('write health gate', () => {
+  const corruptCurrentStore = (): { session: ReturnType<typeof createSession>; fp: string } => {
+    const session = createSession('chat-write-gate', 'root-write-gate', 'Write Gate');
+    session.backendType = 'mojo';
+    updateSession(session);
+    // Close the live SQLite connection before overwriting the active store;
+    // corrupting the frozen JSON would not trip the engine now in use.
+    init('test-app');
+    const fp = persistedStorePath(tempDir, 'test-app');
+    if (!fp) throw new Error('expected a persisted store after createSession');
+    writeFileSync(fp, '{not-json');
+    init('test-app');
+    return { session, fp };
+  };
+
+  it.each([
+    ['createSession', (_session: ReturnType<typeof createSession>) => {
+      createSession('chat-new', 'root-new', 'Must Not Create');
+    }],
+    ['updateSession', (session: ReturnType<typeof createSession>) => {
+      updateSession({ ...session, title: 'Must Not Update' });
+    }],
+    ['updateSessionPid', (session: ReturnType<typeof createSession>) => {
+      updateSessionPid(session.sessionId, 12345);
+    }],
+    ['closeSession', (session: ReturnType<typeof createSession>) => {
+      closeSession(session.sessionId);
+    }],
+    ['reactivateClosedSession', (session: ReturnType<typeof createSession>) => {
+      reactivateClosedSession(session.sessionId);
+    }],
+    ['Mojo close journal', (session: ReturnType<typeof createSession>) => {
+      beginMojoCloseJournal(session.sessionId, 'request-write-gate');
+    }],
+    ['single Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRemoteLineageExact(session.sessionId, 'task-next');
+    }],
+    ['batch Riff lineage CAS', (session: ReturnType<typeof createSession>) => {
+      persistActiveRemoteLineagesExactBatch([{
+        sessionId: session.sessionId,
+        taskId: null,
+        owner: { pid: null, larkAppId: null, backendType: 'mojo' },
+        targetTaskId: 'task-next',
+        expectedCurrentTaskIds: [null],
+      }]);
+    }],
+  ])('rejects %s after a malformed current store load without changing disk or cache', (_name, mutate) => {
+    const { session, fp } = corruptCurrentStore();
+
+    expect(() => mutate(session)).toThrow(SessionStoreUnavailableError);
+    expect(readFileSync(fp, 'utf-8')).toBe('{not-json');
+    expect(listSessions()).toEqual([]);
+  });
+
+  it('keeps the write fence sticky after external repair until init reloads the store', () => {
+    const { fp } = corruptCurrentStore();
+    expect(() => createSession('chat-blocked', 'root-blocked', 'Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+
+    rmSync(fp, { force: true });
+    new DatabaseSync(fp).close();
+    expect(() => createSession('chat-still-blocked', 'root-still-blocked', 'Still Blocked')).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(existsSync(fp)).toBe(true);
+
+    init('test-app');
+    expect(createSession('chat-reloaded', 'root-reloaded', 'Reloaded').status).toBe('active');
+  });
+
+  it('rejects writes after a valid JSON value that is not a session projection', () => {
+    const session = createSession('chat-array', 'root-array', 'Array Projection');
+    init('test-app');
+    const fp = persistedStorePath(tempDir, 'test-app');
+    if (!fp) throw new Error('expected a persisted store after createSession');
+    writeFileSync(fp, '[]');
+    init('test-app');
+
+    expect(() => updateSession({ ...session, title: 'Must Not Overwrite Array' })).toThrow(
+      SessionStoreUnavailableError,
+    );
+    expect(readFileSync(fp, 'utf-8')).toBe('[]');
+  });
+});
+
 describe('closeSession()', () => {
+  it.each(['active', 'closed'] as const)('cancels staged XPI work when closing a %s session', (status) => {
+    const session = createSession('chat-xpi-close', 'root-xpi-close', 'Cancel protocol work');
+    session.status = status;
+    session.crossPrincipalInterruptions = [{
+      version: 1, id: 'xpi_pending', ownerTurnId: 'om_owner', phase: 'awaiting_classification',
+      owner: { requestUserOpenId: 'ou_owner', senderType: 'user' },
+      proposer: { requestUserOpenId: 'ou_peer', senderType: 'bot' }, messages: [],
+    }];
+    updateSession(session);
+
+    closeSession(session.sessionId);
+    init('test-app');
+
+    expect(getSession(session.sessionId)?.status).toBe('closed');
+    expect(getSession(session.sessionId)?.crossPrincipalInterruptions).toBeUndefined();
+  });
+
   it('should set status to closed and add closedAt timestamp', () => {
     const session = createSession('chat1', 'root1', 'To Close');
     closeSession(session.sessionId);
@@ -229,10 +2671,459 @@ describe('closeSession()', () => {
     closeSession(session.sessionId);
 
     // Re-init and reload from disk
-    init();
+    init('test-app');
     const reloaded = getSession(session.sessionId);
     expect(reloaded!.status).toBe('closed');
     expect(reloaded!.closedAt).toBeDefined();
+  });
+
+  it('removes an unread tmux launch file of the closed session only', () => {
+    // The pane normally deletes it on read; one left behind (pane never got
+    // that far, worker gone) still carries the bot's injected env values.
+    const closing = createSession('chat1', 'root1', 'Close With Launch File');
+    const other = createSession('chat1', 'root2', 'Stays Open');
+    const launch = { kind: 'sh' as const, script: 'exec "$@"', argv: ['PROVIDER_TOKEN=secret'] };
+    const unread = writePaneLaunchFile(paneLaunchDir(tempDir, closing.sessionId), launch);
+    const sibling = writePaneLaunchFile(paneLaunchDir(tempDir, other.sessionId), launch);
+
+    closeSession(closing.sessionId);
+
+    expect(existsSync(unread.path)).toBe(false);
+    expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
+    expect(existsSync(sibling.path)).toBe(true);
+  });
+
+  it('snapshots token usage in the same durable close write', () => {
+    const tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'claude-test',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(tokenUsage);
+    const session = createSession('chat1', 'root1', 'Close With Usage');
+    session.cliId = 'claude-code';
+    session.cliSessionId = 'native-1';
+    session.workingDir = '/repo';
+    session.larkAppId = 'cli_app';
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(costCalculatorMock.getSessionTokenUsage).toHaveBeenCalledWith({
+      cliId: 'claude-code',
+      sessionId: session.sessionId,
+      cliSessionId: 'native-1',
+      cwd: '/repo',
+      larkAppId: 'cli_app',
+      fresh: true,
+    });
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(tokenUsage);
+    init('test-app');
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(tokenUsage);
+    expect(readPersistedRows(tempDir, 'test-app')[session.sessionId].tokenUsage).toEqual(tokenUsage);
+  });
+
+  it('preserves existing token usage when close-time usage scan returns empty', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'previous-model',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
+    const session = createSession('chat1', 'root1', 'Close With Existing Usage');
+    session.tokenUsage = existingTokenUsage;
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+    init('test-app');
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(existingTokenUsage);
+  });
+
+  it('does not fail close or overwrite existing token usage when close-time scan throws', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'previous-model',
+    };
+    costCalculatorMock.getSessionTokenUsage.mockImplementation(() => {
+      throw new Error('transcript unavailable');
+    });
+    const session = createSession('chat1', 'root1', 'Close With Throwing Usage');
+    session.tokenUsage = existingTokenUsage;
+    updateSession(session);
+
+    expect(() => closeSession(session.sessionId)).not.toThrow();
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+    init('test-app');
+    expect(getSession(session.sessionId)?.tokenUsage).toEqual(existingTokenUsage);
+  });
+
+  it('clears Riff lineage atomically with the durable closed row', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-prepared';
+    updateSession(session);
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init('test-app');
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('rejects a first retirement marker on an active row without changing memory or disk', () => {
+    const session = createSession('chat1', 'root1', 'Incoming retirement');
+    const retirement = { operationId: 'recycle-incoming', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    expect(() => updateSession({ ...session, workspaceRetirement: retirement })).toThrow('workspace_retired');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+
+    // A normal close and an idempotent retirement of an already closed row remain valid.
+    closeSession(session.sessionId);
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+  });
+
+  it('commits workspace retirement with closed state and refuses stale writers that resurrect or erase it', () => {
+    const session = createSession('chat1', 'root1', 'Retired workspace');
+    const stale = { ...session };
+    const retirement = { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() };
+    closeSession(session.sessionId, { workspaceRetirement: retirement });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', workspaceRetirement: retirement });
+    expect(reactivateClosedSession(session.sessionId)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(() => updateSession({ ...stale, workingDir: tempDir })).toThrow('workspace_retired');
+    updateSession({ ...stale, status: 'closed', title: 'Late metadata' });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed', title: 'Late metadata', workspaceRetirement: retirement });
+  });
+
+  it('leaves no retirement in memory or on disk if the atomic close write fails', () => {
+    const session = createSession('chat1', 'root1', 'Retirement write failure');
+    __testOnly_setBeforeRowPersist(() => { throw new Error('retirement write failure'); });
+    expect(() => closeSession(session.sessionId, {
+      workspaceRetirement: { operationId: 'recycle-1', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+    })).toThrow('retirement write failure');
+    expect(session.status).toBe('active');
+    expect(session.workspaceRetirement).toBeUndefined();
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)?.status).toBe('active');
+    expect(getSession(session.sessionId)?.workspaceRetirement).toBeUndefined();
+  });
+
+  it('restores Riff close state in memory when the atomic save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Riff Save Failure');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task-retry';
+    updateSession(session);
+    // SQLite 行写不经过 node:fs，失败注入改走 store 的 test-only 钩子。
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+    expect(mockDeleteFrozenCards).not.toHaveBeenCalled();
+
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'riff-task-retry',
+    });
+  });
+
+  // `previewTarget` is the literal loopback (host, port) an agent registered
+  // with `botmux preview <port>`; the dashboard proxy dials it by host/port
+  // alone. A closed session owns no port any more, and the OS may hand that
+  // number to an unrelated local server — so it must not survive in the row.
+  it('clears the registered preview target from the closed row data', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+
+    // Atomic with status='closed': neither the parsed row nor the raw file
+    // (read by offline/cross-store row readers) may still carry the target.
+    init('test-app');
+    expect(getSession(session.sessionId)?.previewTarget).toBeUndefined();
+    const persisted = readPersistedRows(tempDir, 'test-app')[session.sessionId];
+    expect(persisted.previewTarget).toBeUndefined();
+    const raw = JSON.stringify(persisted);
+    expect(raw).not.toContain('previewTarget');
+    expect(raw).not.toContain('4173');
+  });
+
+  it('keeps the preview target in memory when the atomic close save fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Preview Save Failure');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
+
+    expect(() => closeSession(session.sessionId))
+      .toThrow(/simulated session repair write failure/);
+
+    // The close did not happen, so the still-active session keeps proxying its
+    // own live port — rollback must restore the field with the rest of the row.
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'active' });
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
+  });
+
+  it('parks an uncancellable mojo lineage in the same transaction as the close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Park');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-1';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-sid-1',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      mojoQuarantinedLineage: 'mojo-sid-1',
+      mojoQuarantineNoticePending: true,
+    });
+    // The active slot is cleared in the same write; the parked slot is the handle.
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+  });
+
+  it('keeps BOTH ids when a different lineage was already parked', () => {
+    // Each id is the only handle left for manual cleanup of its own remote
+    // session, so the second must not overwrite the first.
+    const session = createSession('chat1', 'root1', 'Close Mojo Park Merge');
+    session.backendType = 'mojo';
+    session.mojoQuarantinedLineage = 'mojo-old';
+    session.riffParentTaskId = 'mojo-new';
+    updateSession(session);
+
+    closeSession(session.sessionId, {
+      parkMojoLineage: 'mojo-new',
+      clearRiffParentTaskId: true,
+    });
+
+    expect(getSession(session.sessionId)?.mojoQuarantinedLineage).toBe('mojo-old,mojo-new');
+  });
+
+  it('restores the mojo park fields when the atomic save fails', () => {
+    // The rollback is the whole point of doing the park inside this transaction:
+    // a FAILED close must not leave the row parked, or the next turn treats a
+    // still-live remote session as quarantined and silently starts a new one.
+    const session = createSession('chat1', 'root1', 'Close Mojo Save Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-retry';
+    updateSession(session);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
+
+    expect(() => closeSession(
+      session.sessionId,
+      { parkMojoLineage: 'mojo-sid-retry', clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+
+    const inMemory = getSession(session.sessionId);
+    expect(inMemory).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(inMemory?.mojoQuarantinedLineage).toBeUndefined();
+    expect(inMemory?.mojoQuarantineNoticePending).toBeUndefined();
+
+    // ...and the same must be true of what is actually on disk.
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    const reloaded = getSession(session.sessionId);
+    expect(reloaded).toMatchObject({ status: 'active', riffParentTaskId: 'mojo-sid-retry' });
+    expect(reloaded?.mojoQuarantinedLineage).toBeUndefined();
+    expect(reloaded?.mojoQuarantineNoticePending).toBeUndefined();
+  });
+
+  it('journals Mojo prepare/proof and clears it atomically with close', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'prepared',
+      taskId: 'mojo-sid-journal',
+    });
+
+    closeSession(session.sessionId, { clearRiffParentTaskId: true });
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({ status: 'closed' });
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBeUndefined();
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('never accepts a Mojo close journal as authority for another backend', () => {
+    const session = createSession('chat1', 'root1', 'Non Mojo Journal');
+    session.backendType = 'riff';
+    session.riffParentTaskId = 'riff-task';
+    updateSession(session);
+
+    expect(() => beginMojoCloseJournal(
+      session.sessionId,
+      'request-1',
+      'riff-task',
+    )).toThrow(/non-Mojo session/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      backendType: 'riff',
+      riffParentTaskId: 'riff-task',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+  });
+
+  it('keeps a prepared Mojo journal in memory and on disk when close commit fails', () => {
+    const session = createSession('chat1', 'root1', 'Close Mojo Journal Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    markMojoClosePrepared(session.sessionId, 'request-1', 'mojo-sid-journal');
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
+
+    expect(() => closeSession(
+      session.sessionId,
+      { clearRiffParentTaskId: true },
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'active',
+      riffParentTaskId: 'mojo-sid-journal',
+      mojoCloseJournal: { phase: 'prepared', requestId: 'request-1' },
+    });
+  });
+
+  it('rolls back a failed journal transition without publishing false proof', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Transition Failure');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-sid-journal';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-sid-journal');
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated session repair write failure'); });
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-sid-journal',
+    )).toThrow(/simulated session repair write failure/);
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toMatchObject({
+      phase: 'preparing',
+      requestId: 'request-1',
+    });
+  });
+
+  it('never rewrites a prepared proof to a different remote lineage', () => {
+    const session = createSession('chat1', 'root1', 'Mojo Journal Lineage CAS');
+    session.backendType = 'mojo';
+    session.riffParentTaskId = 'mojo-original';
+    updateSession(session);
+    beginMojoCloseJournal(session.sessionId, 'request-1', 'mojo-original');
+
+    expect(() => markMojoClosePrepared(
+      session.sessionId,
+      'request-1',
+      'mojo-different',
+    )).toThrow(/journal lineage/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-original',
+      mojoCloseJournal: {
+        phase: 'preparing',
+        requestId: 'request-1',
+        taskId: 'mojo-original',
+      },
+    });
+  });
+
+  it('clears a failed prepare only after admission restore, otherwise persists uncertainty', () => {
+    const session = createSession('chat1', 'root1', 'Abort Mojo Journal');
+    session.backendType = 'mojo';
+    updateSession(session);
+
+    beginMojoCloseJournal(session.sessionId, 'request-1');
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: false,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)).toMatchObject({
+      riffParentTaskId: 'mojo-late-id',
+      mojoCloseJournal: { phase: 'uncertain', taskId: 'mojo-late-id' },
+    });
+
+    finishMojoCloseAbort(session.sessionId, 'request-1', {
+      admissionRestored: true,
+      taskId: 'mojo-late-id',
+    });
+    expect(getSession(session.sessionId)?.mojoCloseJournal).toBeUndefined();
+    expect(getSession(session.sessionId)?.riffParentTaskId).toBe('mojo-late-id');
   });
 
   it('should call deleteFrozenCards with the sessionId', () => {
@@ -256,9 +3147,234 @@ describe('closeSession()', () => {
     closeSession(session.sessionId);
     const secondClosedAt = getSession(session.sessionId)!.closedAt;
 
-    // closedAt gets updated on second close
-    expect(secondClosedAt).toBeDefined();
+    // Re-close is a noop: original closedAt is kept.
+    expect(secondClosedAt).toBe(firstClosedAt);
     expect(getSession(session.sessionId)!.status).toBe('closed');
+  });
+
+  it('parks a residual on an already-closed row without refreshing closedAt', () => {
+    const session = createSession('chat1', 'root1', 'Reclose Park Residual');
+    closeSession(session.sessionId);
+    const firstClosedAt = getSession(session.sessionId)!.closedAt;
+
+    closeSession(session.sessionId, {
+      parkLocalResidual: 'local_subtree_boundary_unproven',
+      parkMojoLineage: 'mojo-late',
+    });
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      closedAt: firstClosedAt,
+      mojoLocalResidual: 'local_subtree_boundary_unproven',
+      mojoQuarantinedLineage: 'mojo-late',
+      mojoQuarantineNoticePending: true,
+    });
+  });
+});
+
+describe('reactivateClosedSession()', () => {
+  it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
+    'does not revive %s XPI work left on a legacy closed row', (phase) => {
+      const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');
+      closeSession(session.sessionId);
+      // Older builds persisted this queue on close; resume skips applyClose.
+      const legacy = getSession(session.sessionId)!;
+      legacy.crossPrincipalInterruptions = [{
+        version: 1, id: 'xpi_legacy', ownerTurnId: 'om_owner', phase,
+        owner: { requestUserOpenId: 'ou_owner', senderType: 'user' },
+        proposer: { requestUserOpenId: 'ou_peer', senderType: 'user' },
+        messages: [{ turnId: 'om_legacy', text: 'legacy input', userPrompt: 'legacy input', createdAt: legacy.createdAt }],
+      }];
+      updateSession(legacy);
+      init('test-app');
+
+      const result = reactivateClosedSession(session.sessionId);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.session.crossPrincipalInterruptions).toBeUndefined();
+
+      init('test-app');
+      const reloaded = getSession(session.sessionId)!;
+      expect(reloaded.status).toBe('active');
+      expect(reloaded.crossPrincipalInterruptions).toBeUndefined();
+    },
+  );
+
+  it('sanitizes queued/setup state left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Queue');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.queued = true;
+    legacy.queuedPrompt = 'legacy backlog';
+    legacy.pendingRepoSetup = { mode: 'picker', prompt: 'legacy picker' };
+    legacy.queuedActivationPending = true;
+    legacy.queuedActivationToken = 'legacy-token';
+    legacy.queuedActivationInput = { content: 'legacy head' };
+    legacy.queuedActivationTail = [{
+      id: 'legacy-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'legacy tail' }, turnId: 'tail-turn',
+    }];
+    legacy.queuedActivationTailNextOrder = 2;
+    legacy.principalLaneQueuedTurns = [{
+      version: 1,
+      turnId: 'legacy-lane-tail',
+      caller: { requestUserOpenId: 'ou_b', senderType: 'user' },
+      userPrompt: 'legacy lane tail',
+      title: 'legacy lane tail',
+      cliInput: { content: 'legacy lane tail' },
+      createdAt: '2026-01-01T00:00:00.000Z',
+      resume: true,
+      dispatchState: 'attempting',
+    }];
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init('test-app');
+
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.queued).toBeUndefined();
+    expect(reloaded.pendingRepoSetup).toBeUndefined();
+    expect(reloaded.queuedActivationPending).toBeUndefined();
+    expect(reloaded.queuedActivationToken).toBeUndefined();
+    expect(reloaded.queuedActivationInput).toBeUndefined();
+    expect(reloaded.queuedActivationTail).toBeUndefined();
+    expect(reloaded.principalLaneQueuedTurns).toBeUndefined();
+  });
+
+  it('does not revive a preview target left on a legacy closed row', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Preview');
+    closeSession(session.sessionId);
+    // Rows closed by a build older than the close-path cleanup still carry the
+    // target on disk. Resume starts a new worker generation that has registered
+    // no port, so reactivation must not hand the proxy the old host/port.
+    const legacy = getSession(session.sessionId)!;
+    legacy.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+
+    init('test-app');
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.previewTarget).toBeUndefined();
+  });
+
+  it('clears a closed token usage snapshot when starting a new lifecycle', () => {
+    const session = createSession('chat1', 'root1', 'Legacy Closed Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+
+    init('test-app');
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.status).toBe('active');
+    expect(reloaded.closedAt).toBeUndefined();
+    expect(reloaded.tokenUsage).toBeUndefined();
+  });
+
+  it('restores token usage if reactivation persistence fails', () => {
+    const existingTokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    const session = createSession('chat1', 'root1', 'Legacy Closed Usage Rollback');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = existingTokenUsage;
+    updateSession(legacy);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('simulated reactivate write failure'); });
+
+    expect(() => reactivateClosedSession(session.sessionId)).toThrow(/simulated reactivate write failure/);
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+
+    __testOnly_setBeforeRowPersist(undefined);
+    init('test-app');
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: existingTokenUsage,
+    });
+  });
+
+  it('does not carry a previous lifecycle token snapshot into a second close', () => {
+    const session = createSession('chat1', 'root1', 'Second Lifecycle Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    costCalculatorMock.getSessionTokenUsage.mockReturnValue(null);
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: null,
+    });
+  });
+
+  it('does not restore a previous lifecycle token snapshot when the second close scan throws', () => {
+    const session = createSession('chat1', 'root1', 'Second Lifecycle Throwing Usage');
+    closeSession(session.sessionId);
+    const legacy = getSession(session.sessionId)!;
+    legacy.tokenUsage = {
+      in: 20,
+      out: 5,
+      inputTokens: 18,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheCreateTokens: 0,
+      turns: 2,
+      model: 'closed-lifecycle',
+    };
+    updateSession(legacy);
+
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    costCalculatorMock.getSessionTokenUsage.mockImplementation(() => {
+      throw new Error('new lifecycle transcript unavailable');
+    });
+    closeSession(session.sessionId);
+
+    expect(getSession(session.sessionId)).toMatchObject({
+      status: 'closed',
+      tokenUsage: null,
+    });
   });
 });
 
@@ -282,9 +3398,49 @@ describe('updateSession()', () => {
     updateSession(session);
 
     // Re-init to reload from disk
-    init();
+    init('test-app');
     const reloaded = getSession(session.sessionId);
     expect(reloaded!.webPort).toBe(9999);
+  });
+
+  it('persists the explicitly registered preview target across a store restart', () => {
+    const session = createSession('chat1', 'root1', 'Preview target');
+    session.previewTarget = {
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    };
+    updateSession(session);
+
+    init('test-app');
+    expect(getSession(session.sessionId)?.previewTarget).toEqual({
+      host: '127.0.0.1',
+      port: 4173,
+      registeredAt: '2026-08-11T12:00:00.000Z',
+    });
+  });
+
+  it('skips the disk write when an update produces byte-identical content', () => {
+    // 行级写落在 WAL（append-only），每次 REAL write 都让 sessions.db-wal 变长；
+    // 被跳过的冗余写不开事务，WAL 长度保持不变。
+    const walFp = `${sessionStorePath(tempDir, 'test-app')}-wal`;
+    const session = createSession('chat1', 'root1', 'NoChange');
+    const walAfterCreate = statSync(walFp).size;
+
+    // A redundant update with no field change → must be skipped (WAL stable).
+    updateSession(session);
+    expect(statSync(walFp).size).toBe(walAfterCreate);
+    updateSession(session); // and again — still no write
+    expect(statSync(walFp).size).toBe(walAfterCreate);
+
+    // A real change → the row is rewritten (WAL grows).
+    session.title = 'Changed';
+    updateSession(session);
+    expect(statSync(walFp).size).toBeGreaterThan(walAfterCreate);
+
+    // Content is still correct after the skip/write sequence.
+    init('test-app');
+    expect(getSession(session.sessionId)!.title).toBe('Changed');
   });
 
   it('should allow adding a new session via updateSession', () => {
@@ -340,8 +3496,8 @@ describe('Multi-bot isolation', () => {
     init('app-beta');
     createSession('c2', 'r2', 'Beta Session');
 
-    expect(existsSync(join(tempDir, 'sessions-app-alpha.json'))).toBe(true);
-    expect(existsSync(join(tempDir, 'sessions-app-beta.json'))).toBe(true);
+    expect(persistedStoreExists(tempDir, 'app-alpha')).toBe(true);
+    expect(persistedStoreExists(tempDir, 'app-beta')).toBe(true);
   });
 
   it('should only list sessions belonging to the current appId', () => {
@@ -361,47 +3517,174 @@ describe('Multi-bot isolation', () => {
     expect(listSessions()).toHaveLength(2);
   });
 
-  it('should use legacy sessions.json when no appId is set', () => {
-    init();
-    createSession('c1', 'r1', 'Legacy');
-    expect(existsSync(join(tempDir, 'sessions.json'))).toBe(true);
-  });
-
-  it('should migrate matching sessions from legacy file to per-bot file', () => {
-    // Write a legacy sessions.json with sessions from two different apps
-    mkdirSync(tempDir, { recursive: true });
-    const legacyData = {
-      s1: {
-        sessionId: 's1',
-        chatId: 'c1',
-        rootMessageId: 'r1',
-        title: 'App A Session',
-        status: 'active',
-        createdAt: '2026-01-01T00:00:00.000Z',
-        larkAppId: 'app-A',
-      },
-      s2: {
-        sessionId: 's2',
-        chatId: 'c2',
-        rootMessageId: 'r2',
-        title: 'App B Session',
-        status: 'active',
-        createdAt: '2026-01-01T00:00:00.000Z',
-        larkAppId: 'app-B',
-      },
-    };
-    writeFileSync(join(tempDir, 'sessions.json'), JSON.stringify(legacyData));
-
-    // Init with app-A; should migrate only app-A sessions
-    init('app-A');
-    const sessions = listSessions();
-    expect(sessions).toHaveLength(1);
-    expect(sessions[0].title).toBe('App A Session');
-    expect(existsSync(join(tempDir, 'sessions-app-A.json'))).toBe(true);
-  });
 });
 
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
+
+describe('findActiveSessionsByChatStrict()', () => {
+  it('includes chat and thread sessions across bots but excludes closed and other groups', () => {
+    init('app-A');
+    const a = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    createSession('oc_other', 'oc_other', 'Other', 'group', 'chat');
+    init('app-B');
+    const b = createSession('oc_target', 'om_topic', 'B', 'group', 'thread');
+    const closed = createSession('oc_target', 'om_closed', 'Closed', 'group', 'thread');
+    closeSession(closed.sessionId);
+    expect(findActiveSessionsByChatStrict('oc_target').map(s => s.sessionId).sort()).toEqual([a.sessionId, b.sessionId].sort());
+  });
+  it('refuses incomplete store enumeration', () => {
+    init('app-A'); fsControl.failReaddir = true;
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/simulated readdir denial/);
+  });
+  it('retains the owning bot for legacy peer rows without larkAppId', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      const { larkAppId: _appId, ...legacy } = session;
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run(JSON.stringify(legacy), session.sessionId);
+    } finally { db.close(); }
+    expect(findActiveSessionsByChatStrict('oc_target')).toEqual([
+      expect.objectContaining({ sessionId: session.sessionId, larkAppId: 'app-A' }),
+    ]);
+  });
+  it('refuses malformed active rows in a peer store', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run('{"status":"active","chatId":"oc_target"}', session.sessionId);
+    } finally { db.close(); }
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/malformed active session row/i);
+  });
+
+  it('refuses an unmigrated known peer and an inconclusive bot inventory', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), '{not parsed by cross-process readers');
+    const botsPath = join(tempDir, 'bots.json');
+    const saved = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/cannot read bots\.json/);
+      writeFileSync(botsPath, '{invalid');
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/not valid JSON/);
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-A' }, { larkAppId: 'app-B' }] }));
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(SessionStoreUnmigratedError);
+      // Removed bots' abandoned JSON is not a pending migration.
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-B' }] }));
+      expect(findActiveSessionsByChatStrict('oc_target')).toEqual([]);
+      expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = saved;
+    }
+  });
+});
+
+describe('findActiveSessionsByWorkingDirStrict()', () => {
+  it('finds active sessions across stores by canonical worktree path', () => {
+    const worktree = join(tempDir, 'repo-wt');
+    const nested = join(worktree, 'packages', 'app');
+    mkdirSync(nested, { recursive: true });
+    const alias = nested;
+
+    init('app-A');
+    const sA = createSession('chat1', 'root-a', 'Bot A');
+    sA.workingDir = alias;
+    sA.larkAppId = 'app-A';
+    updateSession(sA);
+
+    init('app-B');
+    const sB = createSession('chat1', 'root-b', 'Bot B');
+    sB.workingDir = worktree;
+    sB.larkAppId = 'app-B';
+    updateSession(sB);
+
+    const found = findActiveSessionsByWorkingDirStrict(worktree);
+    expect(found.map(s => s.sessionId).sort()).toEqual([sA.sessionId, sB.sessionId].sort());
+  });
+
+  it('fails closed when the cross-store inventory cannot be enumerated', () => {
+    init('app-A');
+    fsControl.failReaddir = true;
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/simulated readdir denial/);
+  });
+
+  it('fails closed while another known bot store is still unmigrated (JSON only)', () => {
+    init('app-B');
+    // Cross-process readers never parse JSON: the rows in here are invisible
+    // until app-A's daemon restarts and imports them into its .db.
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      s1: { sessionId: 's1', status: 'active', workingDir: tempDir },
+    }));
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir, { knownAppIds: new Set(['app-A', 'app-B']) }))
+      .toThrow(SessionStoreUnmigratedError);
+    // A leftover JSON of a bot removed from this machine is abandoned data,
+    // not a pending migration — it must not block worktree reclamation.
+    expect(findActiveSessionsByWorkingDirStrict(tempDir, { knownAppIds: new Set(['app-B']) })).toEqual([]);
+  });
+
+  it('resolves the known bots conclusively: an unreadable bots.json fails closed instead of narrowing', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), JSON.stringify({
+      s1: { sessionId: 's1', status: 'active', workingDir: tempDir },
+    }));
+    const botsJsonPath = join(tempDir, 'bots.json');
+    const savedBotsConfig = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsJsonPath;
+    try {
+      // No bots.json at all: which bots exist cannot be told → fail closed.
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(/cannot read bots\.json/);
+      writeFileSync(botsJsonPath, '{not json');
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(/not valid JSON/);
+      // Conclusive answers keep their meaning: app-A still configured → unmigrated
+      // blocks; app-A gone → its leftover JSON is abandoned data.
+      writeFileSync(botsJsonPath, JSON.stringify({ bots: [{ larkAppId: 'app-A' }, { larkAppId: 'app-B' }] }));
+      expect(() => findActiveSessionsByWorkingDirStrict(tempDir)).toThrow(SessionStoreUnmigratedError);
+      writeFileSync(botsJsonPath, JSON.stringify({ bots: [{ larkAppId: 'app-B' }] }));
+      expect(findActiveSessionsByWorkingDirStrict(tempDir)).toEqual([]);
+    } finally {
+      if (savedBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = savedBotsConfig;
+    }
+  });
+
+  it('does not consult the bot list at all when no store is pending migration', () => {
+    init('app-A');
+    const savedBotsConfig = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = join(tempDir, 'absent-bots.json');
+    try {
+      expect(findActiveSessionsByWorkingDirStrict(tempDir)).toEqual([]);
+    } finally {
+      if (savedBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = savedBotsConfig;
+    }
+  });
+
+  it('fails closed when another SQLite store has a malformed active row', () => {
+    init('app-A');
+    const session = createSession('chat1', 'root-a', 'Bot A');
+    const dbPath = persistedStorePath(tempDir, 'app-A');
+    expect(dbPath?.endsWith('.db')).toBe(true);
+    const db = new DatabaseSync(dbPath!);
+    try {
+      db.prepare("UPDATE sessions SET row = ? WHERE session_id = ?")
+        .run('{}', session.sessionId);
+    } finally {
+      db.close();
+    }
+
+    init('app-B');
+
+    expect(() => findActiveSessionsByWorkingDirStrict(tempDir))
+      .toThrow(/malformed active session row/i);
+  });
+});
 
 describe('findActiveSessionsByRoot()', () => {
   it('finds active sessions across per-bot files for the same rootMessageId', () => {
@@ -470,27 +3753,479 @@ describe('findActiveSessionsByRoot()', () => {
 describe('Edge cases', () => {
   it('should handle corrupted JSON gracefully', () => {
     mkdirSync(tempDir, { recursive: true });
-    writeFileSync(join(tempDir, 'sessions.json'), 'NOT VALID JSON!!!');
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), 'NOT VALID JSON!!!');
 
-    init();
+    init('test-app');
     // Should not throw, should start with empty sessions
     const sessions = listSessions();
     expect(sessions).toEqual([]);
   });
 
   it('should survive multiple inits without data loss (same appId)', () => {
-    init();
+    init('test-app');
     createSession('c1', 'r1', 'First');
     createSession('c2', 'r2', 'Second');
 
-    init(); // re-init loads from disk
+    init('test-app'); // re-init loads from disk
     expect(listSessions()).toHaveLength(2);
   });
+});
 
-  it('should handle atomic writes (tmp file rename)', () => {
-    const session = createSession('c1', 'r1', 'Atomic');
-    // The .tmp file should not persist after save
-    const tmpFp = join(tempDir, 'sessions.json.tmp');
-    expect(existsSync(tmpFp)).toBe(false);
+// ─── legacy field sanitization ───────────────────────────────────────────────
+
+describe('import-time convergence', () => {
+  it('strips pendingResponseCard* fields while importing, so no written row carries them', () => {
+    // A session persisted before the「处理中」placeholder card was removed still
+    // carries the three legacy fields. The import drops them once; nothing can
+    // reintroduce them (the fields no longer exist on `Session`), which is why
+    // the write paths no longer re-check.
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), JSON.stringify({
+      s1: {
+        sessionId: 's1', chatId: 'c1', rootMessageId: 'r1', title: 'Legacy',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+        pendingResponseCardId: 'om_old', pendingResponseCardState: 'open',
+        lastPatchedResponseCardId: 'om_prev',
+      },
+    }));
+
+    init('test-app');
+    const loaded = getSession('s1')!;
+    updateSession({ ...loaded, title: 'Touched' });
+
+    const onDisk = readPersistedRows(tempDir, 'test-app');
+    expect(onDisk.s1.title).toBe('Touched');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardId');
+    expect(onDisk.s1).not.toHaveProperty('pendingResponseCardState');
+    expect(onDisk.s1).not.toHaveProperty('lastPatchedResponseCardId');
+  });
+
+  it('never lets a duplicate-sessionId ghost overwrite the live row', () => {
+    // Two entries can carry the SAME sessionId under different file keys.
+    // Importing under `row.sessionId` would collapse them and let whichever
+    // comes last win — a stale closed ghost silently replacing the live row,
+    // irreversibly (the import runs once, the JSON is frozen afterwards).
+    // Rows are imported under their own file key; a mis-keyed row stays inert.
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'sessions-test-app.json'), JSON.stringify({
+      realId: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'CURRENT',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      wrongKey: {
+        sessionId: 'realId', chatId: 'c1', rootMessageId: 'r1', title: 'STALE-DUP',
+        status: 'closed', createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    }));
+
+    init('test-app');
+    expect(getSession('realId')?.title).toBe('CURRENT');
+    expect(getSession('realId')?.status).toBe('active');
+    const onDisk = readPersistedRows(tempDir, 'test-app');
+    expect(onDisk.realId.title).toBe('CURRENT');
+    expect(onDisk.wrongKey.title).toBe('STALE-DUP');
+  });
+});
+
+// ─── cross-process offline access ────────────────────────────────────────────
+// The absorbed CLI-side persistence (formerly cli.ts loadSessions /
+// mutateSessionOffline / saveSession) and the daemon/provenance direct reads.
+
+/** Pre-SQLite JSON — an IMPORT SOURCE only; the store never reads it at runtime. */
+function seedFile(name: string, rows: Record<string, unknown>): void {
+  mkdirSync(tempDir, { recursive: true });
+  writeFileSync(join(tempDir, name), JSON.stringify(rows, null, 2));
+}
+
+/** Seed a real store on disk — what "another bot's daemon already wrote" means. */
+function seedStore(appId: string, rows: Record<string, unknown>): string {
+  return seedPersistedSessionRows(tempDir, appId, rows);
+}
+
+function row(sessionId: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    sessionId, chatId: 'oc_chat', rootMessageId: `om_${sessionId}`, title: sessionId,
+    status: 'active', createdAt: '2026-01-01T00:00:00.000Z', ...extra,
+  };
+}
+
+describe('loadAllSessionsSnapshot()', () => {
+  it('merges per-bot stores and stamps larkAppId from the store identity', () => {
+    // Cross-store duplicate ids have no defined winner in the snapshot (that
+    // is readSessionRowCopiesAcrossStores' job), so none are seeded here.
+    seedStore('appB', { other1: row('other1') });
+    seedStore('appA', { a1: row('a1') });
+
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect(snapshot.size).toBe(2);
+    expect(snapshot.get('other1')?.larkAppId).toBe('appB');
+    expect(snapshot.get('a1')?.larkAppId).toBe('appA');
+  });
+
+  it('skips malformed rows', () => {
+    seedStore('appA', {
+      broken: { notASession: true },
+      ok: row('ok'),
+    });
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()]).toEqual(['ok']);
+  });
+
+  it('falls back to the exact per-bot store when the data dir cannot be enumerated', () => {
+    seedStore('appB', { b1: row('b1') });
+    seedStore('appC', { c1: row('c1') });
+    fsControl.failReaddir = true;
+    try {
+      const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'appB' });
+      // The sandboxed fallback loads only the injected bot's own store.
+      expect([...snapshot.keys()]).toEqual(['b1']);
+      expect(snapshot.get('b1')?.larkAppId).toBe('appB');
+    } finally {
+      fsControl.failReaddir = false;
+    }
+  });
+
+  it('never creates a store it was only asked to read', () => {
+    mkdirSync(tempDir, { recursive: true });
+    // fallbackAppId is the branch that resolves a concrete store path (the
+    // sandbox cannot list data/); a read-write SQLite open there would CREATE
+    // the file, and its mere existence would hide the unmigrated probe.
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, fallbackAppId: 'test-app' }).size).toBe(0);
+    expect(existsSync(sessionStorePath(tempDir, 'test-app'))).toBe(false);
+  });
+
+  it('ignores a pre-existing flat sessions.db / sessions.json left by the first two weeks of the project', () => {
+    // The flat store existed only between 2026-03-11 and 2026-03-22 and never
+    // shipped in a release. Whatever is still on disk is neither a store nor
+    // an unmigrated bot: not enumerated, not counted, not reported.
+    const flatDb = new DatabaseSync(join(tempDir, 'sessions.db'));
+    flatDb.exec('CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT NOT NULL, row TEXT NOT NULL)');
+    flatDb.prepare('INSERT INTO sessions (session_id, status, row) VALUES (?, ?, ?)')
+      .run('flat1', 'active', JSON.stringify(row('flat1')));
+    flatDb.close();
+    seedFile('sessions.json', { flat2: row('flat2') });
+    seedStore('appA', { a1: row('a1') });
+
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()]).toEqual(['a1']);
+    expect(snapshot.unmigratedAppIds).toEqual([]);
+    expect(countActiveSessionsOnDisk(tempDir)).toBe(1);
+  });
+
+  it('marks a leftover JSON store as unmigrated and does not read its rows', () => {
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedStore('appA', { a1: row('a1') });
+    const snapshot = loadAllSessionsSnapshot({ dataDir: tempDir });
+    expect([...snapshot.keys()]).toEqual(['a1']);
+    expect(snapshot.unmigratedAppIds).toEqual(['appB']);
+    expect(applySessionCommandUnowned(
+      { sessionId: 'b1', larkAppId: 'appB' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'unmigrated' });
+  });
+
+  it('reports a leftover JSON as unmigrated only for bots that still exist', () => {
+    // appGone was removed from bots.json long ago; nothing will ever import its
+    // file, so it must not keep telling the operator to restart the daemon.
+    seedFile('sessions-appB.json', { b1: row('b1') });
+    seedFile('sessions-appGone.json', { g1: row('g1') });
+    seedStore('appA', { a1: row('a1') });
+
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir }).unmigratedAppIds).toEqual(['appB', 'appGone']);
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, knownAppIds: new Set(['appA', 'appB']) }).unmigratedAppIds)
+      .toEqual(['appB']);
+    // The bot this process runs under is always known, even if not configured.
+    expect(loadAllSessionsSnapshot({ dataDir: tempDir, knownAppIds: new Set(), fallbackAppId: 'appGone' }).unmigratedAppIds)
+      .toEqual(['appGone']);
+  });
+});
+
+describe('readSessionRowFromDisk()', () => {
+  it('reads only the owning per-bot store', () => {
+    // `larkAppId` is required by type now; there is no other store to fall
+    // back to, so a sibling store holding the same id is never consulted.
+    seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
+    seedStore('appB', { s1: row('s1', { title: 'other' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)?.title).toBe('per-bot');
+    expect(readSessionRowFromDisk('s1', 'appMissing', tempDir)).toBeUndefined();
+    expect(readSessionRowFromDisk('nope', 'appA', tempDir)).toBeUndefined();
+  });
+
+  it('returns undefined when the owning store is corrupt', () => {
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'not a database');
+    seedStore('appB', { s1: row('s1', { title: 'other' }) });
+    expect(readSessionRowFromDisk('s1', 'appA', tempDir)).toBeUndefined();
+  });
+});
+
+describe('readSessionRowCopiesAcrossStores()', () => {
+  it('returns one entry per store that holds the id', () => {
+    seedStore('appC', { s1: row('s1', { title: 'other' }) });
+    seedStore('appA', { s1: row('s1', { title: 'per-bot' }) });
+    seedStore('appB', { other: row('other') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.matches.map(c => c.title).sort()).toEqual(['other', 'per-bot']);
+    expect(copies.unreadableStores).toBe(0);
+    expect(readSessionRowCopiesAcrossStores('other', tempDir).matches).toHaveLength(1);
+    expect(readSessionRowCopiesAcrossStores('missing', tempDir).matches).toHaveLength(0);
+  });
+
+  it('skips corrupt stores and key-mismatched rows without failing the scan', () => {
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    writeFileSync(join(tempDir, 'session-stores', 'appA', 'sessions.db'), 'not a database');
+    seedStore('appB', { s1: row('someOtherId') }); // key ≠ row.sessionId
+    seedStore('appC', { s1: row('s1') });
+    const copies = readSessionRowCopiesAcrossStores('s1', tempDir);
+    expect(copies.matches).toHaveLength(1);
+    expect(copies.unreadableStores).toBe(1);
+  });
+
+  it('throws when the data dir itself cannot be listed (fail-closed identity scan)', () => {
+    expect(() => readSessionRowCopiesAcrossStores('s1', join(tempDir, 'no-such-dir')))
+      .toThrow();
+  });
+});
+
+describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
+  it('applies the command to the FRESH on-disk row, never the caller snapshot (stale-clobber regression)', () => {
+    // The row gained a newer field on disk after the caller took its snapshot.
+    // The old cli.ts saveSession() would have written the stale snapshot back,
+    // erasing workerGeneration; the exclusive row apply must preserve it.
+    seedStore('appA', { s1: row('s1', { workerGeneration: 7, larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed', workerGeneration: 7 } });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.closedAt).toBeTruthy();
+    expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('reads the fresh row without writing', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+    const read = readSessionRowUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { dataDir: tempDir },
+    );
+    expect(read).toMatchObject({ outcome: 'ok', row: { sessionId: 's1', status: 'active' } });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
+  });
+
+  it('a re-applied close is a noop that keeps the original closedAt', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA', status: 'closed', closedAt: '2026-08-13T00:00:00.000Z' }) });
+    const result = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+    expect(result).toMatchObject({ outcome: 'noop', row: { status: 'closed', closedAt: '2026-08-13T00:00:00.000Z' } });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.closedAt).toBe('2026-08-13T00:00:00.000Z');
+  });
+
+  it('refuses with row_changed when the adoption precondition no longer holds', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA', adoptedFrom: { source: 'tmux', tmuxTarget: 'u:1.0' } }) });
+    const result = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir, expectAdopted: false },
+    );
+    expect(result).toMatchObject({ outcome: 'refused', reason: 'row_changed' });
+    expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('active');
+  });
+
+  it('reports missing for an absent row', () => {
+    seedStore('appA', { s1: row('s1') });
+    expect(applySessionCommandUnowned(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'missing' });
+    expect(readSessionRowUnowned(
+      { sessionId: 'ghost', larkAppId: 'appA' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'missing' });
+  });
+
+  it('never creates the store — an empty one would disable the daemon import gate', () => {
+    // A read-write SQLite open CREATES the file. An empty store here would
+    // hide the unmigrated probe for leftover JSON.
+    mkdirSync(join(tempDir, 'session-stores', 'appA'), { recursive: true });
+    expect(applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'missing' });
+    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
+  });
+
+  it('returns unmigrated for a leftover JSON store and never creates a .db', () => {
+    seedFile('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    expect(applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    )).toEqual({ outcome: 'unmigrated' });
+    expect(JSON.parse(readFileSync(join(tempDir, 'sessions-appA.json'), 'utf-8')).s1.status).toBe('active');
+    expect(existsSync(sessionStorePath(tempDir, 'appA'))).toBe(false);
+  });
+});
+
+it('captures group model defaults only for new topics and persists independent snapshots', () => {
+  const groups = { oc_a: { codex: 'first', 'claude-code': 'sonnet' }, oc_b: { codex: 'other' } };
+  init('model-test', { groupDefaultModels: chatId => groups[chatId as keyof typeof groups] });
+  const first = createSession('oc_a', 'root-one', 'one', 'group');
+  const other = createSession('oc_b', 'root-two', 'two', 'group');
+  groups.oc_a.codex = 'changed';
+  const next = createSession('oc_a', 'root-three', 'three', 'group');
+  expect(first.groupDefaultModels?.codex).toBe('first');
+  expect(other.groupDefaultModels?.codex).toBe('other');
+  expect(next.groupDefaultModels?.codex).toBe('changed');
+  expect(createSession('oc_a', 'p2p', 'dm', 'p2p').groupDefaultModels).toBeUndefined();
+  expect(createSession('oc_a', 'chat', 'chat', 'group', 'chat').groupDefaultModels).toBeUndefined();
+  init('model-test');
+  expect(getSession(first.sessionId)?.groupDefaultModels).toEqual({ codex: 'first', 'claude-code': 'sonnet' });
+  expect(createSession('oc_a', 'legacy', 'no resolver', 'group').groupDefaultModels).toBeUndefined();
+});
+
+
+it('deeply snapshots group model and effort without changing runtime identity', () => {
+  const models = {codex:{model:'gpt-5.6-sol',reasoningEffort:'ultra' as const},'claude-code':{model:'sonnet',reasoningEffort:'high' as const}};
+  init('effort-test', {groupDefaultModels:()=>models});
+  const session=createSession('oc_group','root-effort','effort','group');
+  expect(session.reasoningEffort).toBeUndefined();
+  expect(session.cliId).toBeUndefined();
+  models.codex.model='changed';
+  expect(session.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+  init('effort-test');
+  expect(getSession(session.sessionId)?.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
+});
+
+
+describe('session prompt injection snapshot', () => {
+  it('preserves a frozen mode when a whole-row writer holds a stale snapshot', () => {
+    const appId = 'cli_prompt_stale';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'claude-code', promptInjection: 'none' } as any);
+    init(appId);
+    const session = createSession('oc_stale', 'om_stale', 'original');
+    const stale = { ...session };
+    delete stale.promptInjection;
+    stale.title = 'updated title';
+    updateSession(stale);
+    init(appId);
+    expect(getSession(session.sessionId)).toMatchObject({ title: 'updated title', promptInjection: 'none' });
+  });
+
+  it('persists the chosen mode across bot toggles, reload and inherited forks', () => {
+    const appId = 'cli_prompt_snapshot';
+    const bot = { larkAppId: appId, cliId: 'claude-code', promptInjection: 'none' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    const original = createSession('oc_snapshot', 'om_original', 'original');
+    expect(original.promptInjection).toBe('none');
+    bot.promptInjection = 'default';
+    registerCodexInstanceBot(bot);
+    const next = createSession('oc_snapshot', 'om_next', 'next');
+    expect(next.promptInjection).toBe('default');
+    expect(createSession('oc_snapshot', 'om_fork', 'fork', 'group', 'thread', { inherit: original }).promptInjection).toBe('none');
+    bot.promptInjection = 'none';
+    expect(createSession('oc_snapshot', 'om_adopt', 'adopt', 'group', 'thread', { source: 'external' }).promptInjection).toBe('default');
+    init(appId);
+    expect(getSession(original.sessionId)?.promptInjection).toBe('none');
+    expect(getSession(next.sessionId)?.promptInjection).toBe('default');
+  });
+});
+
+describe('session service tier snapshot', () => {
+  it('freezes the Bot tier onto new sessions and defaults a missing tier to inherit', () => {
+    const appId = 'cli_tier_snapshot';
+    const bot = { larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    expect(createSession('oc_tier_p', 'om_tier_p', 'priority').serviceTier).toBe('priority');
+    bot.serviceTier = 'default';
+    registerCodexInstanceBot(bot);
+    expect(createSession('oc_tier_d', 'om_tier_d', 'default').serviceTier).toBe('default');
+    delete bot.serviceTier;
+    registerCodexInstanceBot(bot);
+    expect(createSession('oc_tier_i', 'om_tier_i', 'inherit').serviceTier).toBe('inherit');
+  });
+
+  it('skips non-Codex bots and external sessions', () => {
+    const appId = 'cli_tier_other';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'claude-code', serviceTier: 'priority' } as any);
+    init(appId);
+    expect(createSession('oc_tier_claude', 'om_tier_claude', 'claude').serviceTier).toBeUndefined();
+    registerCodexInstanceBot({ larkAppId: 'cli_tier_ext', cliId: 'codex', serviceTier: 'priority' } as any);
+    init('cli_tier_ext');
+    const external = createSession('oc_tier_ext', 'om_tier_ext', 'external', 'group', 'thread', { source: 'external' });
+    expect(external.serviceTier).toBeUndefined();
+  });
+
+  it('preserves a frozen serviceTier from stale whole-row writers without backfilling legacy rows', () => {
+    const appId = 'cli_tier_legacy';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any);
+    init(appId);
+    const session = createSession('oc_tier_legacy', 'om_tier_legacy', 'legacy');
+    const stale = { ...session };
+    delete stale.serviceTier; // a pre-field writer holding an old whole-row snapshot
+    stale.title = 'legacy updated';
+    updateSession(stale);
+    init(appId);
+    expect(getSession(session.sessionId)).toMatchObject({ title: 'legacy updated' });
+    expect(getSession(session.sessionId)?.serviceTier).toBe('priority');
+
+    const legacyAppId = 'cli_tier_missing';
+    registerCodexInstanceBot({ larkAppId: legacyAppId, cliId: 'codex', serviceTier: 'priority' } as any);
+    const legacyRow = {
+      sessionId: 'tier_legacy_missing',
+      chatId: 'oc_tier_missing',
+      rootMessageId: 'om_tier_missing',
+      title: 'legacy missing',
+      status: 'active',
+      createdAt: new Date().toISOString(),
+      creationSource: 'other',
+    };
+    seedPersistedSessionRows(tempDir, legacyAppId, { tier_legacy_missing: legacyRow });
+    init(legacyAppId);
+    const legacy = getSession('tier_legacy_missing')!;
+    legacy.title = 'legacy missing updated';
+    updateSession(legacy);
+    expect(getSession('tier_legacy_missing')).toMatchObject({ title: 'legacy missing updated' });
+    expect(getSession('tier_legacy_missing')?.serviceTier).toBeUndefined();
+  });
+
+  it('persists an intentional inherit clear across store reloads', () => {
+    const appId = 'cli_tier_intentional_inherit';
+    registerCodexInstanceBot({ larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any);
+    init(appId);
+    const session = createSession('oc_tier_clear', 'om_tier_clear', 'clear');
+    session.serviceTier = 'inherit';
+    updateSession(session);
+    init(appId);
+    expect(getSession(session.sessionId)?.serviceTier).toBe('inherit');
+  });
+
+  it('re-snapshots forks from the target Bot instead of copying the source session', () => {
+    const appId = 'cli_tier_fork';
+    const bot = { larkAppId: appId, cliId: 'codex', serviceTier: 'priority' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    const original = createSession('oc_tier_fork', 'om_tier_original', 'original');
+    expect(original.serviceTier).toBe('priority');
+    bot.serviceTier = 'default';
+    registerCodexInstanceBot(bot);
+    const forked = createSession('oc_tier_fork', 'om_tier_fork', 'fork', 'group', 'thread', { inherit: original });
+    expect(forked.serviceTier).toBe('default');
+    delete bot.serviceTier;
+    registerCodexInstanceBot(bot);
+    const inheritFork = createSession('oc_tier_fork', 'om_tier_inherit', 'inherit fork', 'group', 'thread', { inherit: original });
+    expect(inheritFork.serviceTier).toBe('inherit');
   });
 });

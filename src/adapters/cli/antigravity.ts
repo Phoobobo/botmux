@@ -1,9 +1,19 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { delay } from '../../utils/timing.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
+import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
+import { findAntigravityConversationId, findAntigravityConversationIdByPid } from '../../services/antigravity-discovery.js';
+import {
+  drainAntigravityTranscript,
+  resolveAntigravityTranscriptPath,
+  type AntigravityTranscriptState,
+} from '../../services/antigravity-transcript.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -32,10 +42,12 @@ import type { CliAdapter, PtyHandle } from './types.js';
  *      verification.
  *
  *    - Conversation transcript: `~/.gemini/antigravity-cli/brain/<id>/
- *      .system_generated/logs/transcript.jsonl` (line-delimited JSON, fields:
- *      step_index/source/type/status/created_at/content). Useful for an
- *      `/adopt` bridge later; not consumed for submit verification (the
- *      conversationId rotates per spawn and we don't capture it here).
+ *      .system_generated/logs/transcript_full.jsonl` (line-delimited JSON,
+ *      fields: step_index/source/type/status/created_at/content), next to a
+ *      compact `transcript.jsonl` that cuts long fields (see
+ *      services/antigravity-transcript.ts). Not consumed for submit
+ *      verification (the conversationId rotates per spawn and we don't
+ *      capture it here).
  *
  *    - Bracketed paste (`\e[200~...\e[201~`) does NOT work: agy treats the
  *      markers as literal text. Use sendText + Enter directly.
@@ -54,9 +66,6 @@ import type { CliAdapter, PtyHandle } from './types.js';
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
@@ -114,24 +123,193 @@ function historyDeltaContains(path: string, fromByte: number, marker: string): b
   return false;
 }
 
+const HISTORY_POLL_MS = 100;
+
 async function waitForHistoryAppend(
   path: string, fromByte: number, marker: string, timeoutMs: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  // Count poll attempts, don't use Date.now()+budget. Under load the event
+  // loop slips; a wall deadline expires while `delay()` callbacks are still
+  // queued, so a history line that landed in-budget is missed and the
+  // worker shows a false "submit not confirmed". Same number of delay(100)
+  // waits as the unscaled timeout.
+  const polls = Math.max(1, Math.round(timeoutMs / HISTORY_POLL_MS));
+  for (let i = 0; i < polls; i++) {
     if (historyDeltaContains(path, fromByte, marker)) return true;
-    await delay(100);
+    await delay(HISTORY_POLL_MS);
+  }
+  return historyDeltaContains(path, fromByte, marker);
+}
+
+/** agy ≥1.2 renders the active permission mode INSIDE an otherwise empty
+ *  composer as a placeholder after the prompt marker, e.g.
+ *  `> Accept-edits mode: file edits auto-approved (shift+tab to cycle)`.
+ *  All four modes (Auto / Accept-edits / Plan / Best-of-N) share the
+ *  `(shift+tab to cycle)` suffix; older builds rendered a bare `>`. A real
+ *  draft (including botmux's own <user_message> envelopes) matches neither. */
+function isEmptyComposerRow(row: string): boolean {
+  if (row === '>') return true;
+  return /^> .+\(shift\+tab to cycle\)$/.test(row);
+}
+
+/** Walk the tail of a viewport (ready footer → separators → composer) and
+ *  decide whether agy is parked at an EMPTY composer with its ready footer —
+ *  i.e. the live TUI is demonstrably waiting for input. Returns the index of
+ *  the row immediately above the composer block, or -1 when the tail does not
+ *  match. One walk shared by the interruption and generic idle-composer
+ *  classifiers. */
+function readyComposerRowAbove(plain: string): number {
+  const rows = plain.split('\n').map(row => row.trim());
+  let end = rows.length;
+  const skipBlankRows = (): void => {
+    while (end > 0 && rows[end - 1] === '') end--;
+  };
+  const skipSeparators = (): void => {
+    // PTY rawSnapshot's display cleanup replaces box-drawing rows with blanks;
+    // the /^[─━]*$/ form matches those emptied rows too.
+    while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
+  };
+  skipBlankRows();
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return -1;
+  skipSeparators();
+  if (end === 0 || !isEmptyComposerRow(rows[--end])) return -1;
+  skipSeparators();
+  return end - 1;
+}
+
+/** Cancellation can leave the transcript at a tool result forever. Accept only
+ * the CLI's explicit interruption notice followed immediately by an EMPTY
+ * composer and its ready footer at the end of the current viewport. Old notices
+ * in scrollback, a newer prompt, or a running status must not release input. */
+export function isAntigravityInterruptedScreen(screen: string): boolean {
+  // tmux captureViewport preserves SGR colors and normalizes rows to CRLF;
+  // the PTY renderer already returns plain LF rows. Accept both backends.
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return false;
+  const rowAbove = readyComposerRowAbove(plain);
+  if (rowAbove < 0) return false;
+  return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(plain.split('\n').map(row => row.trim())[rowAbove]);
+}
+
+/** The live viewport ends at an empty composer + ready footer, with no
+ *  in-flight generation marker — regardless of whether an explicit
+ *  "Interrupted" notice was rendered. A resumed conversation (e.g. after
+ *  /close) can be parked at a fresh prompt while its transcript.jsonl still
+ *  ends in a dangling USER_INPUT / PLANNER_RESPONSE(tool_calls) record from
+ *  the killed turn; the transcript-only heuristic would then read "busy"
+ *  forever and never release queued input. The live TUI is the authority: an
+ *  empty composer means input can be delivered. */
+export function isAntigravityIdleComposerScreen(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return false;
+  return readyComposerRowAbove(plain) >= 0;
+}
+
+export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
+  if (!existsSync(transcriptPath)) return false;
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return false;
+
+      // Expand until a lifecycle record is found. A complete checkpoint or
+      // notification is not enough: the preceding tool call may be truncated
+      // at this window's start and still needs a larger read.
+      let chunkSize = Math.min(stats.size, 64 * 1024);
+
+      while (chunkSize <= stats.size) {
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, stats.size - chunkSize);
+        const text = buf.toString('utf-8');
+        const rawLines = text.split('\n');
+        const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        for (let i = candidateLines.length - 1; i >= 0; i--) {
+          const line = candidateLines[i].trim();
+          if (!line) continue;
+          let rec: any;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+
+          const type = rec?.type;
+          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+            return false;
+          }
+          if (type === 'SYSTEM_MESSAGE') {
+            const content = String(rec?.content ?? '');
+            if (/cancell?ed|interrupted|aborted/i.test(content)) {
+              return false;
+            }
+            // Non-cancel notifications do not dictate lifecycle state.
+            continue;
+          }
+          if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
+            continue;
+          }
+          if (type === 'PLANNER_RESPONSE') {
+            return Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0;
+          }
+          if (type === 'GENERIC' || type === 'USER_INPUT') {
+            return true;
+          }
+        }
+        if (chunkSize >= stats.size || chunkSize >= 1024 * 1024) break;
+        chunkSize = Math.min(stats.size, chunkSize * 4);
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
   }
   return false;
 }
 
+/** Antigravity brain transcript. Zero-prompt only (no /adopt bridge). The transcript is
+ *  created lazily after the first submit, so a file born after spawn is the live turn
+ *  (`birth-aware`). Its provisional trailing final lives in driver state that the worker
+ *  commits on the steady-state ingest tick only. Locates the full log first and the compact
+ *  log only when no full log exists (the worker moves a compact bind over at a turn
+ *  boundary once the full log appears). */
+export const antigravityBridgeSpec: StructuredBridgeSpec = {
+  drain: (path, offset, ctx) => drainAntigravityTranscript(
+    path,
+    offset,
+    (ctx.state as AntigravityTranscriptState | undefined) ?? {},
+    { flushTrailingFinal: ctx.flushTrailingFinal },
+  ),
+  stateCommit: 'ingest',
+  locate: {
+    bySessionId: sessionId => resolveAntigravityTranscriptPath(sessionId) ?? undefined,
+    byPid: pid => {
+      const conversationId = findAntigravityConversationIdByPid(pid);
+      return conversationId ? resolveAntigravityTranscriptPath(conversationId) ?? undefined : undefined;
+    },
+  },
+  spawn: { sessionId: 'cli', baseline: 'birth-aware' },
+};
+
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'agy');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'agy';
+  let cachedBin: string | undefined;
   return {
     id: 'antigravity',
-    resolvedBin: bin,
+    bridgeSpec: antigravityBridgeSpec,
+    // Whole ~/.gemini (oauth + antigravity-cli brain transcripts + history):
+    // a directory-level readWrite bind under the sandbox so the host daemon
+    // drains the same transcript the CLI writes. The worker pre-creates the
+    // dir at spawn (bwrap cannot bind a missing source).
+    authPaths: ['~/.gemini'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    modelChoices: CLI_MODEL_CHOICES['antigravity'],
 
-    buildArgs({ resume, resumeSessionId, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -141,6 +319,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // racy when multiple botmux sessions run in parallel.
       if (resume && resumeSessionId) {
         args.push('--conversation', resumeSessionId);
+      }
+      if (model && typeof model === 'string' && model.trim()) {
+        args.push('--model', model.trim());
+      }
+      if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
+        args.push('--effort', reasoningEffort);
       }
       // NOTE: we deliberately do NOT pass `-i` / `--prompt-interactive`.
       // Despite the flag's existence in `agy --help`, empirical testing
@@ -168,6 +352,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       return `agy --conversation ${cliSessionId}`;
     },
 
+    /** Import path: the submit log `~/.gemini/antigravity-cli/history.jsonl`
+     *  records `{display, timestamp, workspace, conversationId}` per submit —
+     *  enough to discover resumable conversations (deduped by conversationId). */
+    listResumableSessions({ limit, exclude }) {
+      return discoverAntigravitySessions(HISTORY_PATH, limit, exclude);
+    },
+
     async writeInput(pty: PtyHandle, content: string) {
       // Two known constraints (verified empirically):
       //
@@ -181,7 +372,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       //    as `{"display":"...","timestamp":...,"workspace":"..."}` —
       //    same pattern as Codex/CoCo. We poll the delta past `baseByte`
       //    for our `display` prefix marker. If unseen after the in-band
-      //    retry budget, return {submitted:false, recheck} so the worker
+      //    poll budget, return {submitted:false, recheck} so the worker
       //    can warn the user.
       const baseByte = currentFileSize(HISTORY_PATH);
       const marker = historyMarker(content);
@@ -201,13 +392,23 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
           const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].length > 0) pty.sendText(lines[i]);
-            if (i < lines.length - 1) {
-              // M-Enter / alt+Enter: documented soft newline. Don't use
-              // `\` + Enter (Claude Code's idiom) — agy doesn't treat
-              // backslash as an escape.
-              pty.sendSpecialKeys('M-Enter');
+          if (typeof pty.sendLines === 'function') {
+            const BATCH_SIZE = 40;
+            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+              const chunk = lines.slice(i, i + BATCH_SIZE);
+              pty.sendLines(chunk, 'M-Enter');
+              if (i + BATCH_SIZE < lines.length) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
+            }
+          } else {
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].length > 0) pty.sendText(lines[i]);
+              if (i < lines.length - 1) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
             }
           }
         } else {
@@ -217,6 +418,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           for (let i = 0; i < lines.length; i++) {
             pty.write(lines[i]);
             if (i < lines.length - 1) pty.write('\x1b\r');
+            await delay(10);
           }
         }
       } catch {
@@ -226,33 +428,67 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       await delay(300);
       if (!trySendEnter()) return { submitted: false };
 
-      // 3 retries × 800ms each, then a final grace check. If the user
-      // concurrently types in the web terminal, a stray Enter may submit
-      // their half-typed text — we only retry when the JSONL is provably
-      // unchanged, so the race window is bounded to genuine submit
-      // failures.
-      for (let attempt = 0; attempt < 3; attempt++) {
-        if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) {
-          return undefined;
-        }
-        if (!trySendEnter()) return { submitted: false };
-      }
-      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 800)) {
-        return undefined;
+      // Single Enter only — do NOT retry it. agy's history.jsonl append can
+      // lag well past a short per-attempt window (cold start, large initial
+      // prompt, network-bound auth), and a retry Enter lands on the
+      // already-submitted composer: the same prompt then gets submitted
+      // multiple times. Poll history once for the full in-band budget; a
+      // genuinely dropped Enter is recovered by the worker's deferred
+      // recheck, not by a second Enter (same pattern as the grok adapter).
+      if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
 
       // In-band budget exhausted. Hand the worker a recheck closure so a
       // slow agy (cold start, large initial prompt, network-bound auth)
       // can still resolve the warning before user-facing Lark notify.
-      const recheck = (): boolean => historyDeltaContains(HISTORY_PATH, baseByte, marker);
+      const recheck = (): SubmitRecheckResult => {
+        if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : true;
+      };
       return { submitted: false, recheck };
     },
 
     completionPattern: undefined,
-    readyPattern: undefined,
+    readyPattern: /\? for shortcuts/,
+    busyPattern: /esc to cancel/,
+    // agy records Enter in history.jsonl immediately while a turn is running:
+    // Queue mode parks the message until turn end (Auto-flush), while
+    // Queued Messages = send-immediately forwards it into the active
+    // conversation without cancelling the in-flight tool. Without
+    // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
+    // a permission dialog where Enter approves and digit keys jump options, so
+    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
+    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
+    // commands (/effort, /compact, /model, /btw, /clear) bypass
+    // runtimePtyInputPolicy, and interactive selection menus that still appear
+    // with bypass enabled (`ask_question`, Plan artifact review) also capture
+    // digit keys + Enter; both belong in one unified screen-based hold
+    // alongside hookReviewInputHold.
+    supportsTypeAhead: true,
+    isSessionBusy({ cliSessionId, getCurrentScreen }) {
+      if (!cliSessionId) return false;
+      const transcriptPath = resolveAntigravityTranscriptPath(cliSessionId);
+      if (!transcriptPath || !isAntigravityTranscriptBusy(transcriptPath)) return false;
+      try {
+        // The transcript lags reality when a turn was killed (e.g. /close
+        // mid tool call, worker crash) and the conversation is later resumed:
+        // its dangling last record reads "busy" forever while the live TUI is
+        // parked at an empty composer. Trust the viewport when it proves the
+        // CLI is waiting for input; stay conservative when no authoritative
+        // screen is available (no getter → non-authoritative backend).
+        const screen = getCurrentScreen?.();
+        if (screen
+          && (isAntigravityIdleComposerScreen(screen)
+            || isAntigravityInterruptedScreen(screen))) {
+          return false;
+        }
+      } catch { /* Missing viewport is not evidence of cancellation. */ }
+      return true;
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
   };
 }
-
-export const create = createAntigravityAdapter;

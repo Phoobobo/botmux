@@ -1,0 +1,302 @@
+#!/usr/bin/env node
+// Minimal stand-in for `codex app-server --listen ws://127.0.0.1:<port>` used by
+// codex-rpc-engine.test.ts. Serves HTTP /readyz AND a JSON-RPC WebSocket on the
+// SAME port (as the real app-server does), answering the handshake + thread/turn
+// requests. Env knobs drive the failure-path tests:
+//   FAKE_HANG_TURN=1     → never answer turn/start (wedged app-server)
+//   FAKE_HANG_TURN_NOTIFY=1 → emit started/completed but lose the ack
+//   FAKE_TERMINAL_BEFORE_RESPONSE=1 → broadcast terminal before turn/start ack
+//   FAKE_ERROR_AFTER_STARTED=1 → emit turn/started, reject the response, then complete
+//   FAKE_DUPLICATE_TERMINAL=1 → broadcast turn/completed twice
+//   FAKE_DIE_AFTER_MS=N  → exit(1) after N ms (crash → engine onDead)
+//   FAKE_THREAD_CONFIG_FILE=path → write the received thread/start params to path
+//                                  (lets a test assert model/effort forwarding)
+//   FAKE_RESUME_CONFIG_FILE=path → write the received thread/resume params to path
+//                                  (lets a test assert model/effort are SUPPRESSED
+//                                   on resume)
+import { createServer } from 'node:http';
+import { WebSocketServer } from 'ws';
+import { appendFileSync, writeFileSync } from 'node:fs';
+
+if (process.env.FAKE_ENV_PROBE_PATH) {
+  const e = process.env;
+  writeFileSync(e.FAKE_ENV_PROBE_PATH, JSON.stringify({
+    hostAbsent: !('UNLISTED_CLOUD_CREDENTIAL' in e),
+    authPresent: e.OPENAI_API_KEY === 'rpc-sentinel',
+    homePinned: e.CODEX_HOME === '/test/rpc/codex',
+    ownerPinned: e.BOTMUX_OWNER_OPEN_ID === 'ou_rpc',
+  }));
+}
+
+const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
+const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
+const port = m ? Number(m[1]) : 0;
+const HANG_TURN = process.env.FAKE_HANG_TURN === '1';
+const TURN_ERROR_CODE = process.env.FAKE_TURN_ERROR_CODE || 'fake_failed';
+const TURN_ERROR_MESSAGE = process.env.FAKE_TURN_ERROR_MESSAGE || 'fake failure';
+const HANG_TURN_NOTIFY = process.env.FAKE_HANG_TURN_NOTIFY === '1';
+const TERMINAL_BEFORE_RESPONSE = process.env.FAKE_TERMINAL_BEFORE_RESPONSE === '1';
+const ERROR_AFTER_STARTED = process.env.FAKE_ERROR_AFTER_STARTED === '1';
+const DUPLICATE_TERMINAL = process.env.FAKE_DUPLICATE_TERMINAL === '1';
+const NO_TURN_TERMINAL = process.env.FAKE_NO_TURN_TERMINAL === '1';
+const TURN_STATUS = process.env.FAKE_TURN_STATUS ?? '';
+const DIE_AFTER = process.env.FAKE_DIE_AFTER_MS ? Number(process.env.FAKE_DIE_AFTER_MS) : 0;
+const PREVIEW_DELAY_READS = Number(process.env.FAKE_PREVIEW_DELAY_READS ?? '0');
+const UPDATED_DELAY_READS = Number(process.env.FAKE_UPDATED_DELAY_READS ?? '0');
+const UPDATED_BEFORE = Number(process.env.FAKE_UPDATED_BEFORE ?? '100');
+const UPDATED_AFTER = Number(process.env.FAKE_UPDATED_AFTER ?? '101');
+let threadReadAttempt = 0;
+let currentThreadName;
+const REQUEST_USER_INPUT = process.env.FAKE_REQUEST_USER_INPUT === '1';
+const SERVER_REQUEST_METHODS = (process.env.FAKE_SERVER_REQUEST_METHODS ?? '')
+  .split(',').map(value => value.trim()).filter(Boolean);
+const serverRequestIds = new Set();
+const userInputRequestId = process.env.FAKE_USER_INPUT_STRING_ID === '1' ? 'native-question' : 900;
+let turnCount = 0;
+
+const httpServer = createServer((req, res) => {
+  if (req.url === '/readyz') { res.writeHead(200); res.end('ok'); return; }
+  res.writeHead(404); res.end();
+});
+const wss = new WebSocketServer({ server: httpServer });
+wss.on('connection', (ws) => {
+  let pendingTurnReply;
+  let pendingNativeTurnId;
+  let pendingThreadId;
+  const emitTurnStarted = (threadId, nativeTurnId) => {
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'turn/started',
+      params: { threadId, turn: { id: nativeTurnId } },
+    }));
+  };
+  const emitTurnCompleted = (threadId, nativeTurnId, status = TURN_STATUS) => {
+    if (NO_TURN_TERMINAL) return;
+    const turn = {
+      id: nativeTurnId,
+      ...(status ? { status } : {}),
+      ...(status === 'failed'
+        ? { error: { code: TURN_ERROR_CODE, message: TURN_ERROR_MESSAGE } }
+        : {}),
+    };
+    const completed = JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId, turn },
+    });
+    ws.send(completed);
+    if (DUPLICATE_TERMINAL) ws.send(completed);
+  };
+  const emitTurnLifecycle = (threadId, nativeTurnId, status = TURN_STATUS) => {
+    emitTurnStarted(threadId, nativeTurnId);
+    emitTurnCompleted(threadId, nativeTurnId, status);
+  };
+  ws.on('message', (data) => {
+    let msg; try { msg = JSON.parse(data.toString()); } catch { return; }
+    if (serverRequestIds.has(msg.id) && (msg.result !== undefined || msg.error !== undefined)) {
+      if (process.env.FAKE_SERVER_RESPONSE_FILE) {
+        try { appendFileSync(process.env.FAKE_SERVER_RESPONSE_FILE, `${JSON.stringify(msg)}\n`); } catch { /* test-only */ }
+      }
+      serverRequestIds.delete(msg.id);
+      return;
+    }
+    if (REQUEST_USER_INPUT && msg.id === userInputRequestId && (msg.result !== undefined || msg.error !== undefined)) {
+      if (!pendingTurnReply) return;
+      // Real traex 0.200.19 normalizes ANY reply to requestUserInput (empty
+      // answers OR a JSON-RPC error) into {answers:{}} and COMPLETES the turn.
+      // Model that: a direct reply always completes the turn. Only an explicit
+      // `turn/interrupt` (below) ends it as interrupted. This keeps the fixture
+      // faithful to the verified product behavior instead of inventing an
+      // "error bubbles up" semantics that traex does not implement.
+      const accepted = msg.result?.answers?.choice?.answers?.[0] === 'Yes';
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0',
+        id: pendingTurnReply,
+        result: { accepted, turn: { id: pendingNativeTurnId, status: 'completed' } },
+      }));
+      emitTurnLifecycle(pendingThreadId, pendingNativeTurnId, 'completed');
+      pendingTurnReply = undefined;
+      pendingNativeTurnId = undefined;
+      pendingThreadId = undefined;
+      return;
+    }
+    if (typeof msg.id !== 'number' || typeof msg.method !== 'string') return;
+    const reply = (result) => ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
+    switch (msg.method) {
+      case 'initialize': return reply({ ok: true });
+      case 'thread/start': {
+        if (process.env.FAKE_THREAD_CONFIG_FILE) {
+          try { writeFileSync(process.env.FAKE_THREAD_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
+        }
+        return reply({ thread: { id: 'thread-fake-1' } });
+      }
+      case 'thread/resume': {
+        if (process.env.FAKE_RESUME_CONFIG_FILE) {
+          try { writeFileSync(process.env.FAKE_RESUME_CONFIG_FILE, JSON.stringify(msg.params ?? {})); } catch { /* test-only */ }
+        }
+        return reply({ thread: { id: msg.params?.threadId ?? 'thread-fake-1' } });
+      }
+      case 'thread/read':
+        threadReadAttempt += 1;
+        return reply({ thread: {
+          id: msg.params?.threadId ?? 'thread-fake-1',
+          name: currentThreadName ?? null,
+          preview: threadReadAttempt > PREVIEW_DELAY_READS ? '<botmux_routing> first message preview' : '',
+          updatedAt: threadReadAttempt > UPDATED_DELAY_READS ? UPDATED_AFTER : UPDATED_BEFORE,
+        } });
+      case 'thread/name/set': currentThreadName = msg.params?.name; return reply({});
+      case 'modelProvider/capabilities/read': {
+        const responseMode = process.env.FAKE_PROVIDER_CAPABILITIES_RESPONSE ?? '';
+        if (responseMode === 'missing-field') return reply({ namespaceTools: true, webSearch: false });
+        if (responseMode === 'malformed-field') {
+          return reply({ namespaceTools: true, webSearch: 'yes', imageGeneration: false });
+        }
+        if (responseMode === 'future-enabled') {
+          return reply({
+            namespaceTools: true,
+            webSearch: false,
+            imageGeneration: false,
+            futureExternalTool: true,
+          });
+        }
+        const capability = process.env.FAKE_PROVIDER_CAPABILITY ?? '';
+        return reply({
+          namespaceTools: true,
+          webSearch: capability === 'web-search',
+          imageGeneration: capability === 'image-generation',
+        });
+      }
+      case 'mcpServerStatus/list': {
+        const responseMode = process.env.FAKE_MCP_RESPONSE ?? '';
+        if (responseMode === 'missing-data') return reply({});
+        if (responseMode === 'malformed-data') return reply({ data: {} });
+        if (responseMode === 'malformed-cursor') return reply({ data: [], nextCursor: 7 });
+        const mcpMode = process.env.FAKE_MCP_CAPABILITY ?? '';
+        return reply({ data: mcpMode === 'tools'
+          ? [{ name: 'fake', tools: { mutate: {} } }]
+          : mcpMode === 'empty' ? [{ name: 'fake', tools: {} }] : [] });
+      }
+      case 'skills/list': {
+        const responseMode = process.env.FAKE_SKILLS_RESPONSE ?? '';
+        if (responseMode === 'missing-data') return reply({});
+        if (responseMode === 'malformed-data') return reply({ data: {} });
+        if (responseMode === 'malformed-entry') return reply({ data: [{}] });
+        if (responseMode === 'errors') return reply({
+          data: [{ cwd: process.cwd(), errors: [{ path: '/fake', message: 'broken' }], skills: [] }],
+        });
+        if (responseMode === 'malformed-skill') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{}] }],
+        });
+        if (responseMode === 'malformed-dependencies') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{ name: 'fake', enabled: true, dependencies: {} }] }],
+        });
+        if (responseMode === 'malformed-tool-dependency') return reply({
+          data: [{ cwd: process.cwd(), errors: [], skills: [{ name: 'fake', enabled: true, dependencies: { tools: ['shell'] } }] }],
+        });
+        const hasToolDependency = process.env.FAKE_SKILL_TOOL_DEPENDENCY === '1';
+        return reply({ data: [{ cwd: process.cwd(), errors: [], skills: hasToolDependency
+          ? [{ name: 'fake', enabled: true, dependencies: { tools: [{ type: 'command', value: 'shell' }] } }]
+          : [] }] });
+      }
+      case 'turn/interrupt': {
+        // FAKE_INTERRUPT_ERROR=1 models an interrupt that itself fails: the
+        // app-server rejects turn/interrupt with a JSON-RPC error. The engine
+        // then has no lever left and must declare itself dead (onDead) rather
+        // than leaking a wedged turn.
+        if (process.env.FAKE_INTERRUPT_ERROR === '1') {
+          return ws.send(JSON.stringify({
+            jsonrpc: '2.0', id: msg.id,
+            error: { code: -32000, message: 'interrupt failed' },
+          }));
+        }
+        // Verified real behavior: interrupt ends the in-flight turn as
+        // 'interrupted' and acks with {}. Resolve the pending turn/start as an
+        // interrupted turn so the engine test can assert the turn stopped
+        // instead of silently completing.
+        if (pendingTurnReply) {
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: pendingTurnReply,
+            result: { turn: { id: pendingNativeTurnId, status: 'interrupted' } },
+          }));
+          emitTurnLifecycle(pendingThreadId, pendingNativeTurnId, 'interrupted');
+          pendingTurnReply = undefined;
+          pendingNativeTurnId = undefined;
+          pendingThreadId = undefined;
+        }
+        return reply({});
+      }
+      case 'turn/start': {
+        turnCount++;
+        const nativeTurnId = `turn-fake-${turnCount}`;
+        const threadId = msg.params?.threadId;
+        if (process.env.FAKE_TURN_CONFIG_FILE) {
+          try { appendFileSync(process.env.FAKE_TURN_CONFIG_FILE, `${JSON.stringify(msg.params ?? {})}\n`); } catch { /* test-only */ }
+        }
+        if (HANG_TURN) {
+          if (HANG_TURN_NOTIFY) emitTurnLifecycle(threadId, nativeTurnId);
+          return;
+        }
+        if (REQUEST_USER_INPUT) {
+          pendingTurnReply = msg.id;
+          pendingNativeTurnId = nativeTurnId;
+          pendingThreadId = threadId;
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: userInputRequestId,
+            method: 'item/tool/requestUserInput',
+            params: {
+              threadId: msg.params?.threadId ?? 'thread-fake-1',
+              turnId: nativeTurnId,
+              itemId: 'item-fake-1',
+              questions: [{
+                id: 'choice', header: 'Test', question: 'Continue?', multiSelect: false,
+                options: [{ label: 'Yes', description: '' }, { label: 'No', description: '' }],
+              }],
+            },
+          }));
+          return;
+        }
+        if (SERVER_REQUEST_METHODS.length > 0) {
+          pendingTurnReply = msg.id;
+          pendingNativeTurnId = nativeTurnId;
+          pendingThreadId = threadId;
+          const requestId = 1900 + turnCount;
+          const method = SERVER_REQUEST_METHODS[(turnCount - 1) % SERVER_REQUEST_METHODS.length];
+          serverRequestIds.add(requestId);
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: requestId,
+            method,
+            params: { threadId, turnId: nativeTurnId, itemId: `item-fake-${turnCount}` },
+          }));
+          // Deliberately acknowledge after the server request. WebSocket frame
+          // ordering locks the pre-response ownership race under test.
+          reply({ turn: { id: nativeTurnId } });
+          return;
+        }
+        if (ERROR_AFTER_STARTED) {
+          emitTurnStarted(threadId, nativeTurnId);
+          ws.send(JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32000, message: 'fake response failure after turn/started' },
+          }));
+          setTimeout(() => emitTurnCompleted(threadId, nativeTurnId), 100);
+          return;
+        }
+        if (TERMINAL_BEFORE_RESPONSE) {
+          emitTurnLifecycle(threadId, nativeTurnId);
+          reply({ turn: { id: nativeTurnId } });
+        } else {
+          reply({ turn: { id: nativeTurnId } });
+          emitTurnLifecycle(threadId, nativeTurnId);
+        }
+        return;
+      }
+      default: return reply({});
+    }
+  });
+});
+httpServer.listen(port, '127.0.0.1');
+if (DIE_AFTER > 0) setTimeout(() => process.exit(1), DIE_AFTER);

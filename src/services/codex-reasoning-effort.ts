@@ -1,0 +1,153 @@
+export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
+export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
+export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
+export const TRAEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 3);
+/** Remote providers validate what they support. BotMux transports its generic
+ * reasoning vocabulary without borrowing any one provider's model catalog. */
+export const REMOTE_RUNNER_REASONING_EFFORTS = CODEX_REASONING_EFFORTS;
+/** Claude Code's `--effort` flag parses exactly low|medium|high|xhigh|max —
+ *  `ultra` is codex/traex-only and Claude answers it with an unknown-value
+ *  warning. Spelled out rather than sliced off CODEX_REASONING_EFFORTS: the two
+ *  lists agree today by coincidence, and a level inserted mid-list upstream
+ *  would silently drop `max` here and admit a level Claude rejects.
+ *
+ *  Flag parsing is model-independent (opus-5 / sonnet-5 / haiku-4.5 all print
+ *  the same `Valid values:`), but *honouring* a level is not — the Claude docs'
+ *  effort page lists no Haiku model at all. See claudeReasoningEffortsForModel. */
+const CLAUDE_ALL_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** Exported for the adapter's arg filter: the widest set any Claude model takes. */
+export const CLAUDE_REASONING_EFFORTS = CLAUDE_ALL_REASONING_EFFORTS;
+
+/** Only Haiku is withheld: it takes no effort parameter at all, yet the adapter
+ *  lists it in `modelChoices` (both `haiku` and the pinned `claude-haiku-4-5-…`),
+ *  so it is the one selectable pairing that would be accepted and never honoured.
+ *
+ *  Everything else — including gateway-mapped names such as `model_hub/…` that
+ *  cannot be matched to a row, and models released after this table — gets the
+ *  full set. Withholding levels from an unrecognised name would silently cap
+ *  relay users at `high` on a model that may well honour `max`, and an
+ *  unsupported level costs only a warning on the CLI, while a missing one is
+ *  unrecoverable from config. */
+export function claudeReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
+  if (model?.trim().toLowerCase().includes('haiku')) return [];
+  return CLAUDE_ALL_REASONING_EFFORTS;
+}
+
+export type CodexReasoningEffort = typeof CODEX_REASONING_EFFORTS[number];
+
+const SIX_LEVEL_MODELS = new Set([
+  'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol',
+  'gpt-5.6-sol', 'gpt-5.6-terra',
+]);
+const FIVE_LEVEL_MODELS = new Set(['gpt-6-luna', 'gpt-5.6-luna']);
+const GROK_XHIGH_MODELS = new Set(['grok-4.6']);
+const TRAEX_REASONING_EFFORTS_BY_MODEL = new Map<string, readonly CodexReasoningEffort[]>([
+  ['gpt-6-astra', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-6.1-sol', CODEX_COMMON_REASONING_EFFORTS],
+  ['seed-evolving', []],
+  ['seed-2.1-pro', []],
+  ['seed-2.1-turbo', []],
+  ['openrouter-3o', CODEX_REASONING_EFFORTS.slice(0, 5)],
+  ['openrouter-2o', CODEX_REASONING_EFFORTS.slice(0, 5)],
+  ['gpt-5.6-sol', ['low', 'medium', 'high', 'xhigh', 'ultra']],
+  ['gpt-5.6-terra', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.6-luna', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.5', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.4', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.4-mini', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.3-codex', CODEX_COMMON_REASONING_EFFORTS],
+  ['gpt-5.2', CODEX_COMMON_REASONING_EFFORTS],
+  ['codex-auto-review', CODEX_COMMON_REASONING_EFFORTS],
+  ['deepseek-v4-pro', TRAEX_COMMON_REASONING_EFFORTS],
+  ['deepseek-v4-flash', TRAEX_COMMON_REASONING_EFFORTS],
+  ['seed-dogfooding-2.0', TRAEX_COMMON_REASONING_EFFORTS],
+  ['seed-code', []],
+  ['openrouter-1o', ['low', 'medium', 'high', 'max']],
+  ['openrouter-1', ['low', 'medium', 'high', 'max']],
+  ['gemini-3.1-pro-preview', TRAEX_COMMON_REASONING_EFFORTS],
+  ['gemini-3-flash-preview', TRAEX_COMMON_REASONING_EFFORTS],
+]);
+
+export function isCodexReasoningCliId(cliId: string | undefined): boolean {
+  return cliId === 'codex' || cliId === 'codex-app';
+}
+
+/** Backend variants are a TraeX launch capability, either local or delegated
+ * through the provider-neutral Remote Runner start/resume contract. */
+export function isBackendVariantCliId(cliId: string | undefined): boolean {
+  return cliId === 'traex' || cliId === 'remote-runner';
+}
+
+export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
+  return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
+    || cliId === 'claude-code' || cliId === 'kimi'
+    // ZCode's per-model levels are declared in its own provider catalog and can
+    // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
+    // a switch). The launch path resolves the closest supported level, so the
+    // whole vocabulary is offered here instead of a per-model subset.
+    || cliId === 'zcode';
+}
+
+export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+  return typeof value === 'string' && CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort);
+}
+
+/** Unknown models get only the catalog-wide safe intersection. */
+export function codexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
+  const normalized = model?.trim().toLowerCase() ?? '';
+  if (SIX_LEVEL_MODELS.has(normalized)) return CODEX_REASONING_EFFORTS;
+  if (FIVE_LEVEL_MODELS.has(normalized)) return CODEX_REASONING_EFFORTS.slice(0, 5);
+  return CODEX_COMMON_REASONING_EFFORTS;
+}
+
+export function codexModelSupportsReasoningEffort(model: string | undefined, effort: CodexReasoningEffort): boolean {
+  return codexReasoningEffortsForModel(model).includes(effort);
+}
+
+/** Unknown Grok models get the verified catalog-wide safe intersection. */
+export function grokReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
+  const normalized = model?.trim().toLowerCase() ?? '';
+  if (GROK_XHIGH_MODELS.has(normalized)) return GROK_REASONING_EFFORTS;
+  return GROK_COMMON_REASONING_EFFORTS;
+}
+
+export function knownTraexReasoningEffortsForModel(model: string): readonly CodexReasoningEffort[] | undefined {
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(model.trim().toLowerCase());
+}
+
+export function traexReasoningEffortsForModel(model: string | undefined): readonly CodexReasoningEffort[] {
+  const normalized = model?.trim().toLowerCase() ?? '';
+  if (!normalized) return TRAEX_COMMON_REASONING_EFFORTS;
+  return TRAEX_REASONING_EFFORTS_BY_MODEL.get(normalized) ?? TRAEX_COMMON_REASONING_EFFORTS;
+}
+
+/** Reasoning choices exposed by a CLI's Botmux control plane. */
+export function reasoningEffortsForCliModel(
+  cliId: string | undefined,
+  model: string | undefined,
+): readonly CodexReasoningEffort[] {
+  if (cliId === 'grok') return grokReasoningEffortsForModel(model);
+  if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
+  if (cliId === 'traex') return traexReasoningEffortsForModel(model);
+  if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
+  if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
+  // ZCode: every level is accepted here and narrowed to the model's real
+  // capability at launch (services/zcode-model-config.ts), which keeps the
+  // chooser model-independent while the card still shows what actually ran.
+  if (cliId === 'zcode') return CODEX_REASONING_EFFORTS;
+  if (cliId === 'kimi') {
+    // Kimi 的 effort 环境变量只作用于 kimi provider，不猜测自定义别名的能力。
+    return model?.trim() === 'kimi-code/k3' || model?.trim() === 'kimi-code/k3-256k'
+      ? ['low', 'high', 'max'] : [];
+  }
+  return [];
+}
+
+export function cliModelSupportsReasoningEffort(
+  cliId: string | undefined,
+  model: string | undefined,
+  effort: CodexReasoningEffort,
+): boolean {
+  return reasoningEffortsForCliModel(cliId, model).includes(effort);
+}

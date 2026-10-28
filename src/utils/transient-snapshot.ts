@@ -22,9 +22,8 @@
  */
 import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
-import { TmuxPipeBackend } from '../adapters/backend/tmux-pipe-backend.js';
+import { isObserveBackend } from '../adapters/backend/types.js';
 import { readViewportText } from './terminal-renderer.js';
-import { captureToPng } from './screenshot-renderer.js';
 import { clamp, MIN_RENDER_COLS, MAX_RENDER_COLS, MIN_RENDER_ROWS, MAX_RENDER_ROWS } from './render-dimensions.js';
 
 export interface TransientSnapshot {
@@ -34,16 +33,16 @@ export interface TransientSnapshot {
   ansi: string;
 }
 
-/** Attempt to capture a fresh ANSI snapshot from a TmuxPipeBackend. Returns
- *  null if the backend isn't a pipe backend, the pane has gone away, or
- *  tmux refuses to answer. Callers should fall back to the legacy renderer
+/** Attempt to capture a fresh ANSI snapshot from an observe backend. Returns
+ *  null if the backend isn't observe-capable, the pane has gone away, or
+ *  the external backend refuses to answer. Callers should fall back to the legacy renderer
  *  path on null. */
 export function tryCapturePipeSnapshot(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
 ): TransientSnapshot | null {
-  if (!(backend instanceof TmuxPipeBackend)) return null;
+  if (!isObserveBackend(backend)) return null;
   const live = backend.getPaneSize();
   const cols = clamp(live?.cols ?? fallbackCols, MIN_RENDER_COLS, MAX_RENDER_COLS);
   const rows = clamp(live?.rows ?? fallbackRows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
@@ -52,6 +51,40 @@ export function tryCapturePipeSnapshot(
   const ansi = backend.captureViewport();
   if (!ansi) return null;
   return { cols, rows, ansi };
+}
+
+/**
+ * True when the backend's screen can change WITHOUT bumping the worker's
+ * onPtyData activity watermark — i.e. an observe backend that has paused its
+ * change-emission poller for a live web-attach (ZellijObserveBackend). In that
+ * window the watermark is not a sound snapshot-invalidation source.
+ */
+export function isScreenSelfDriven(backend: unknown): boolean {
+  return (
+    isObserveBackend(backend) &&
+    typeof backend.isLiveAttachActive === 'function' &&
+    backend.isLiveAttachActive()
+  );
+}
+
+/**
+ * Whether startScreenUpdates must (re)capture the pane this tick.
+ *
+ * Steady state: the screen is reconstructed only when `lastPtyActivityAtMs`
+ * advances — onPtyData is the single point that both bumps it and feeds the
+ * renderer, so an unchanged watermark means a byte-identical screen and a
+ * capture would be pure waste. That invariant fails when `screenSelfDriven` is
+ * true (observe backend with emission paused for a live attach): the pane keeps
+ * changing but the watermark is frozen, so we must capture unconditionally —
+ * the pre-optimization behaviour — until the attach drops and the poller (hence
+ * the watermark) resumes.
+ */
+export function shouldCaptureScreen(opts: {
+  ptyActivity: number;
+  lastCapturedPtyActivity: number;
+  screenSelfDriven: boolean;
+}): boolean {
+  return opts.screenSelfDriven || opts.ptyActivity !== opts.lastCapturedPtyActivity;
 }
 
 /** Feed an ANSI snapshot into a transient xterm-headless and yield the
@@ -73,7 +106,7 @@ export async function snapshotToPng(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
-): Promise<{ png: Buffer; ansi: string; content: string } | null> {
+): Promise<{ png: Buffer; ansi: string; content: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -83,9 +116,13 @@ export async function snapshotToPng(
     // the *current* visible rows, not buffer rows 0..N-1 which may be
     // stale scrollback after that scroll.
     const startY = terminal.buffer.active.baseY;
-    const png = captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
+    // Loaded lazily: @napi-rs/canvas is a native addon that a compiled binary may
+    // lack. A static import here would fail the worker at module init instead of
+    // only failing this screenshot.
+    const { captureToPng } = await import('./screenshot-renderer.js');
+    const png = await captureToPng(terminal, { cols: snap.cols, rows: snap.rows, startY });
     const content = readViewportText(terminal, { filter: true, startY, rows: snap.rows });
-    return { png, ansi: snap.ansi, content };
+    return { png, ansi: snap.ansi, content, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }
@@ -99,7 +136,7 @@ export async function snapshotToText(
   fallbackCols: number,
   fallbackRows: number,
   opts: { filter: boolean },
-): Promise<{ content: string; ansi: string } | null> {
+): Promise<{ content: string; ansi: string; cols: number; rows: number } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -107,7 +144,7 @@ export async function snapshotToText(
     // Read from the actual current viewport (see snapshotToPng comment).
     const startY = terminal.buffer.active.baseY;
     const content = readViewportText(terminal, { filter: opts.filter, startY, rows: snap.rows });
-    return { content, ansi: snap.ansi };
+    return { content, ansi: snap.ansi, cols: snap.cols, rows: snap.rows };
   } finally {
     terminal.dispose();
   }

@@ -1,0 +1,525 @@
+/**
+ * Linux bwrap e2e: compile a real FsPolicy → bwrap argv, launch real processes
+ * under bubblewrap, and assert the three access tiers hold at the KERNEL level
+ * (not just in the pure accessForPath model). Skipped off Linux and when bwrap
+ * / unprivileged user namespaces are unavailable.
+ *
+ * Guards the blocker-1 findings from the 2026-07-24 review:
+ *  (a) DIRECTORY deny masked with `--tmpfs` was WRITABLE inside the sandbox —
+ *      hid contents but let the CLI write into the "denied" path. Fixed with a
+ *      read-only bind of a mode-000 empty source.
+ *  (b) A nonexistent deny was SKIPPED, leaving the path inside the read-write
+ *      parent bind: the sandbox could mkdir+write it onto the host, and the
+ *      host creating a secret there mid-session became readable (stat→exec
+ *      TOCTOU). Fixed by ALWAYS masking a reachable deny (worker pre-creates
+ *      the mountpoint so the empty mask always binds).
+ *  (c) 0755/0644 masks were themselves listable (`ls`/`cat` succeeded on the
+ *      empty mask). Fixed with mode 000 → for a NON-root uid the access command
+ *      fails; a root uid (CAP_DAC_OVERRIDE) can still list, but the mask is empty
+ *      so no real content leaks either way (emptiness is the guarantee).
+ *
+ * This runs the compiler exactly as the worker does: resolve symlinks, split
+ * file- vs dir-shaped denies, mode-000 the empty sources, pre-create missing
+ * mask mountpoints, then invoke bwrap.
+ */
+import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { spawn, spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, rmdirSync, writeFileSync, mkdirSync, chmodSync, realpathSync, existsSync, statSync, lstatSync, readlinkSync, readFileSync, symlinkSync } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { tmpdir, homedir } from 'node:os';
+import { join, dirname } from 'node:path';
+import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
+import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
+import { sessionSkillSnapshotRoot, snapshotSessionSkills, type SkillSnapshotTrust } from '../src/core/skills/snapshot.js';
+
+const bwrapUsable = process.platform === 'linux'
+  && spawnSync('sh', ['-c', 'command -v bwrap'], { stdio: 'ignore' }).status === 0
+  && spawnSync('bwrap', [
+    '--tmpfs', '/', '--proc', '/proc', '--dev', '/dev',
+    '--ro-bind', '/usr', '/usr', '--ro-bind', '/bin', '/bin',
+    ...(existsSync('/lib') ? ['--ro-bind', '/lib', '/lib'] : []),
+    ...(existsSync('/lib64') ? ['--ro-bind', '/lib64', '/lib64'] : []),
+    '--unshare-user', '--unshare-pid', '/bin/true',
+  ], { stdio: 'ignore' }).status === 0;
+
+const d = bwrapUsable ? describe : describe.skip;
+
+const USRMERGE = ['/bin', '/lib', '/lib64', '/sbin', '/lib32', '/libx32'];
+
+d('bwrap three-tier enforcement (real bubblewrap)', () => {
+  let S: string;
+  const canonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+
+  // Build the bwrap argv the SAME way the worker does (deny masks: mode-000
+  // empty sources, missing mountpoints pre-created). Returns the created-mask
+  // list too so cleanup tests can assert rmdir-if-empty.
+  function build(userPaths: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }, opts: { larkCliLinuxStore?: string; larkTransportEnabled?: boolean; botHome?: string; mandatoryReadOnlyPaths?: string[]; sessionOwnedReadonlyRoots?: string[] } = {}) {
+    const emptiesDir = join(S, 'sbx/empties');
+    const emptyDir = join(S, 'sbx/empty');
+    mkdirSync(emptiesDir, { recursive: true });
+    mkdirSync(emptyDir, { recursive: true });
+
+    const policy = buildFsPolicy({
+      platform: 'linux', homeDir: canonical(homedir()),
+      botmuxHome: join(S, 'botmux-home'), sessionDataDir: join(S, 'botmux-home/data'),
+      sessionId: 'e2e-session',
+      workingDir: join(S, 'proj'), currentAppId: 'cli_e2e', botHome: opts.botHome ?? join(S, 'botmux-home/bots/cli_e2e'),
+      redirectedCliData: true,
+      execPaths: [dirname(canonical(process.execPath))],
+      userPaths: { readOnly: [join(S, 'ref'), ...(userPaths.readOnly ?? [])], readWrite: userPaths.readWrite, deny: userPaths.deny },
+      larkCliLinuxStore: opts.larkCliLinuxStore,
+      larkTransportEnabled: opts.larkTransportEnabled,
+      mandatoryReadOnlyPaths: opts.mandatoryReadOnlyPaths,
+      sessionOwnedReadonlyRoots: opts.sessionOwnedReadonlyRoots,
+      net: true, writeRegexes: [],
+    });
+    policy.rules = policy.rules.filter(r => r.access === 'deny' || existsSync(r.path));
+
+    const symlinks: { path: string; target: string }[] = [];
+    for (const p of USRMERGE) {
+      try { if (lstatSync(p).isSymbolicLink()) symlinks.push({ path: p, target: readlinkSync(p) }); } catch { /* */ }
+    }
+    const filePaths = new Set<string>();
+    for (const r of policy.rules) {
+      if (r.access !== 'deny') continue;
+      try { if (statSync(r.path).isFile()) filePaths.add(r.path); } catch { /* absent → dir mask */ }
+    }
+    const compiled = compileToBwrap(policy, { symlinks, emptyDir, emptiesDir, filePaths, chdir: join(S, 'proj') });
+    chmodSync(emptyDir, 0o000);
+    for (const f of compiled.emptyFiles) writeFileSync(f.path, '', { mode: 0o000 });
+    // Mirror the worker: pre-create missing mask mountpoints (leaf + ancestors).
+    const created: { path: string; kind: 'dir' | 'file' }[] = [];
+    for (const m of compiled.maskMounts) {
+      if (existsSync(m.path)) continue;
+      if (m.kind === 'file') { mkdirSync(dirname(m.path), { recursive: true }); writeFileSync(m.path, ''); }
+      else mkdirSync(m.path, { recursive: true });
+      created.push(m);
+    }
+    return { args: compiled.args, created };
+  }
+
+  function run(args: string[], cmd: string) {
+    const r = spawnSync('bwrap', [...args, '/bin/sh', '-c', cmd], { encoding: 'utf8' });
+    return { status: r.status, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+  }
+
+  beforeAll(() => {
+    S = canonical(mkdtempSync(join(tmpdir(), 'fsp-bwrap-e2e-')));
+    for (const dir of ['proj/secrets', 'proj/work', 'botmux-home/data', 'botmux-home/bots/cli_e2e', 'ref']) {
+      mkdirSync(join(S, dir), { recursive: true });
+    }
+    writeFileSync(join(S, 'proj/readme.md'), 'proj');
+    writeFileSync(join(S, 'proj/secrets/key.txt'), 'TOPSECRET');
+    writeFileSync(join(S, 'proj/.env'), 'API_KEY=zzz');
+    writeFileSync(join(S, 'ref/doc.md'), 'ref');
+  });
+  // `build()` chmods the deny-mask sources to 000 (mirroring the worker), and a
+  // 000 DIRECTORY cannot be traversed — so a plain recursive delete throws
+  // `EACCES: permission denied, rm` for any NON-root uid, failing this file in an
+  // unnamed afterAll while every real case is already green. See the helper for
+  // the measurements (root hides it; Node and Bun fail alike).
+  afterAll(() => rmSandboxScratch(S));
+
+  it('readWrite: reads AND writes the project', () => {
+    const { args } = build({});
+    expect(run(args, `cat ${JSON.stringify(join(S, 'proj/readme.md'))}`).status).toBe(0);
+    expect(run(args, `echo hi > ${JSON.stringify(join(S, 'proj/work/new.txt'))}`).status).toBe(0);
+  });
+
+  it('readOnly: reads but cannot write', () => {
+    const { args } = build({});
+    expect(run(args, `cat ${JSON.stringify(join(S, 'ref/doc.md'))}`).status).toBe(0);
+    expect(run(args, `echo x > ${JSON.stringify(join(S, 'ref/hack'))}`).status).not.toBe(0);
+  });
+
+  it('per-session ready-signal trail: OWN file is writable at the kernel level, a sibling trail is not', () => {
+    // The generated dsh-tui wrapper plugin appends its ready-dispatch diagnostics
+    // from INSIDE the sandbox, so the per-session file grant has to hold at the
+    // kernel level, not just in accessForPath. The worker pre-creates the file
+    // (bwrap cannot bind a missing source), which is also why this builds the
+    // policy against an existing file.
+    const own = join(S, 'botmux-home/data/ready-signal/e2e-session.log');
+    const sibling = join(S, 'botmux-home/data/ready-signal/other.log');
+    mkdirSync(dirname(own), { recursive: true });
+    writeFileSync(own, '');
+    writeFileSync(sibling, 'SIBLING-SECRET\n');
+    const { args } = build({});
+    const wrote = run(args, `printf '{"event":"ready-dispatch-attempted"}\\n' >> ${JSON.stringify(own)}`);
+    expect(wrote.status).toBe(0);
+    expect(readFileSync(own, 'utf8')).toContain('ready-dispatch-attempted');
+    // A sibling session's trail is NOT bound: its real content is unreachable from
+    // inside, and an append aimed at it never reaches the host — the sandbox root
+    // is an empty tmpfs, so that redirect can only create a throwaway file in a
+    // sandbox-only parent dir (which is why the exit status alone proves nothing).
+    const read = run(args, `cat ${JSON.stringify(sibling)}`);
+    expect(read.out).not.toContain('SIBLING-SECRET');
+    run(args, `printf 'pwned' >> ${JSON.stringify(sibling)}`);
+    expect(readFileSync(sibling, 'utf8')).toBe('SIBLING-SECRET\n');
+  });
+
+  it('sandbox=true × `botmux skill show` (KERNEL-level): own manifest + own snapshot readable, not writable; sibling session + store unreachable', () => {
+    // The worker grants the session's own manifest as a mandatory read-only FILE
+    // and its skill SNAPSHOT root through sessionOwnedReadonlyRoots. Before the
+    // fix both reads hit an unmounted path (ENOENT) inside bwrap.
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    for (const [name, body] of [['deploy', 'DEPLOY-BODY'], ['payroll', 'PAYROLL-BODY']]) {
+      mkdirSync(join(store, name), { recursive: true });
+      writeFileSync(join(store, name, 'SKILL.md'), `${body}\n`);
+    }
+    const trust: SkillSnapshotTrust = { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') };
+    const snap = (sessionId: string, name: string) => snapshotSessionSkills({
+      sessionId, cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: name, name, tags: [], rootDir: join(store, name), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, name) }, priorityReason: 'bot:include' }],
+    }, { trust, dataDir }).manifest;
+    const own = snap('e2e-session', 'deploy');
+    snap('other-session', 'payroll');
+    const ownManifest = sessionSkillManifestPath('e2e-session', dataDir);
+    const otherManifest = sessionSkillManifestPath('other-session', dataDir);
+    mkdirSync(dirname(ownManifest), { recursive: true });
+    writeFileSync(ownManifest, '{"own":true}\n');
+    writeFileSync(otherManifest, 'OTHER-MANIFEST\n');
+    const ownSnapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const otherSnapshot = sessionSkillSnapshotRoot('other-session', dataDir);
+    expect(own.prioritySkills[0].rootDir).toBe(join(ownSnapshot, 'deploy'));
+
+    const { args } = build({}, {
+      mandatoryReadOnlyPaths: [ownManifest],
+      sessionOwnedReadonlyRoots: [ownSnapshot],
+    });
+    const manifest = run(args, `cat ${JSON.stringify(ownManifest)}`);
+    expect(manifest.status).toBe(0);
+    expect(manifest.out).toContain('"own":true');
+    const body = run(args, `cat ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(body.status).toBe(0);
+    expect(body.out).toContain('DEPLOY-BODY');
+
+    for (const [path, secret] of [
+      [otherManifest, 'OTHER-MANIFEST'],
+      [join(otherSnapshot, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+      [join(store, 'deploy/SKILL.md'), 'DEPLOY-BODY'],
+      [join(store, 'payroll/SKILL.md'), 'PAYROLL-BODY'],
+    ]) {
+      const r = run(args, `cat ${JSON.stringify(path)}`);
+      expect(r.status, path).not.toBe(0);
+      expect(r.out, path).not.toContain(secret);
+    }
+    // Read-only at the kernel: neither the manifest nor the snapshot can be rewritten.
+    run(args, `echo PWNED > ${JSON.stringify(ownManifest)}; echo PWNED > ${JSON.stringify(join(ownSnapshot, 'deploy/SKILL.md'))}`);
+    expect(readFileSync(ownManifest, 'utf8')).toBe('{"own":true}\n');
+    expect(readFileSync(join(ownSnapshot, 'deploy/SKILL.md'), 'utf8')).toBe('DEPLOY-BODY\n');
+  });
+
+  it('a LIVE sandbox keeps reading its skill snapshot while the store copy is deleted and recreated (updateInstalledSkill shape)', async () => {
+    const dataDir = join(S, 'botmux-home/data');
+    const store = join(S, 'botmux-home/skills/store');
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V1\n');
+    snapshotSessionSkills({
+      sessionId: 'e2e-session', cliId: 'codex', workingDir: join(S, 'proj'), policyMode: 'priority', diagnostics: [],
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      prioritySkills: [{ id: 'live', name: 'live', tags: [], rootDir: join(store, 'live'), entrypoint: 'SKILL.md',
+        source: { type: 'local-copy', originalPath: join(store, 'live') }, priorityReason: 'bot:include' }],
+    }, { trust: { storeDir: store, pluginsDir: join(S, 'botmux-home/plugins'), sessionDataDir: dataDir, botsDirs: [join(S, 'botmux-home/bots')], workingDir: join(S, 'proj') }, dataDir });
+    const snapshot = sessionSkillSnapshotRoot('e2e-session', dataDir);
+    const go = join(S, 'proj/work/go-live');
+    rmSync(go, { force: true });
+    const { args } = build({}, { sessionOwnedReadonlyRoots: [snapshot] });
+    const child = spawn('bwrap', [...args, '/bin/sh', '-c',
+      `while [ ! -e ${JSON.stringify(go)} ]; do sleep 0.05; done; cat ${JSON.stringify(join(snapshot, 'live/SKILL.md'))}`]);
+    let out = '';
+    child.stdout.on('data', d => { out += d; });
+    child.stderr.on('data', d => { out += d; });
+    // Sandbox is up and bound; now replace the store copy underneath it.
+    await new Promise(r => setTimeout(r, 300));
+    rmSync(join(store, 'live'), { recursive: true, force: true });
+    mkdirSync(join(store, 'live'), { recursive: true });
+    writeFileSync(join(store, 'live', 'SKILL.md'), 'LIVE-V2\n');
+    writeFileSync(go, '');
+    const code = await new Promise<number | null>(r => child.on('close', r));
+    expect(code).toBe(0);
+    expect(out).toContain('LIVE-V1');
+  });
+
+  it('deny DIR (existing): real content unreadable, and mask empty/unlistable for non-root (root may list but sees nothing real)', () => {
+    const dir = join(S, 'proj/secrets');
+    const { args } = build({ deny: [dir] });
+    const read = run(args, `cat ${JSON.stringify(join(dir, 'key.txt'))}`);
+    expect(read.status).not.toBe(0);
+    expect(read.out).not.toContain('TOPSECRET');
+    // The mask is a mode-000 empty tmpfs. For a NON-root uid the kernel's DAC check
+    // makes `ls` itself fail; but root bypasses DAC (CAP_DAC_OVERRIDE) and can still
+    // traverse a 000 dir — and the sandboxed process here is root (no uid drop). The
+    // real guarantee in BOTH cases is that no real entry leaks: the mask replaced the
+    // host dir with an empty one, so key.txt must be absent regardless of ls status.
+    const ls = run(args, `ls -A ${JSON.stringify(dir)}`);
+    if (process.getuid?.() === 0) {
+      expect(ls.status).toBe(0);            // root traverses the 000 mask…
+      expect(ls.out).not.toContain('key.txt'); // …but the mask is empty — no real content
+    } else {
+      expect(ls.status).not.toBe(0);        // non-root: DAC blocks listing the 000 dir
+    }
+  });
+
+  it('deny DIR (existing): NOT writable — regression guard for the writable-tmpfs bug', () => {
+    const dir = join(S, 'proj/secrets');
+    const evil = join(dir, 'evil.txt');
+    const { args } = build({ deny: [dir] });
+    expect(run(args, `echo PWNED > ${JSON.stringify(evil)}`).status).not.toBe(0);
+    expect(existsSync(evil)).toBe(false); // nothing leaked to the host
+  });
+
+  it('deny FILE (existing): content hidden, cat fails (000), write rejected', () => {
+    const f = join(S, 'proj/.env');
+    const { args } = build({ deny: [f] });
+    const r = run(args, `cat ${JSON.stringify(f)}; echo x > ${JSON.stringify(f)} && echo WROTE`);
+    expect(r.out).not.toContain('API_KEY');
+    expect(r.out).not.toContain('WROTE');
+  });
+
+  it('NONEXISTENT deny under a RW parent: sandbox mkdir/write is REJECTED and nothing lands on the host', () => {
+    const ghost = join(S, 'proj/ghost'); // never created as a real secret
+    expect(existsSync(join(ghost, 'x'))).toBe(false);
+    const { args } = build({ deny: [ghost] });
+    const r = run(args, `mkdir -p ${JSON.stringify(join(ghost, 'sub'))} 2>&1; echo LEAK > ${JSON.stringify(join(ghost, 'secret'))} 2>&1 && echo WROTE`);
+    expect(r.out).not.toContain('WROTE');
+    expect(existsSync(join(ghost, 'secret'))).toBe(false);
+    expect(existsSync(join(ghost, 'sub'))).toBe(false);
+  });
+
+  it('RO parent + deny created by the HOST mid-session: sandbox still cannot read it', () => {
+    // ref/ is readOnly; ref/private does NOT exist at build time. The mask must
+    // still be installed so a host-created secret is unreadable in-sandbox.
+    const priv = join(S, 'ref/private');
+    rmSync(priv, { recursive: true, force: true });
+    const { args } = build({ deny: [priv] });
+    // simulate the host/another process creating the secret AFTER the mask was
+    // installed (the compiler is stat-free; the worker pre-created the mount).
+    // Under the mask, the in-sandbox view is the mode-000 empty source, so even
+    // if the host writes into the REAL dir, the sandbox sees EPERM.
+    writeFileSync(join(priv, 'k'), 'LATESECRET');
+    const r = run(args, `cat ${JSON.stringify(join(priv, 'k'))}`);
+    expect(r.status).not.toBe(0);
+    expect(r.out).not.toContain('LATESECRET');
+    rmSync(priv, { recursive: true, force: true });
+  });
+
+  it('cleanup: rmdir-if-empty removes a pre-created empty mount, KEEPS one the host wrote into', () => {
+    const ghostEmpty = join(S, 'proj/ghost-empty');
+    const ghostFilled = join(S, 'proj/ghost-filled');
+    rmSync(ghostEmpty, { recursive: true, force: true });
+    rmSync(ghostFilled, { recursive: true, force: true });
+    const { created } = build({ deny: [ghostEmpty, ghostFilled] });
+    expect(created.map(m => m.path).sort()).toEqual([ghostFilled, ghostEmpty].sort());
+    // host writes into one of them during the session
+    writeFileSync(join(ghostFilled, 'hostdata'), 'x');
+    // reclaim: rmdir only empty ones (mirrors reclaimMaskMounts semantics)
+    for (const m of created) {
+      try { rmdirSync(m.path); } catch { /* ENOTEMPTY → kept */ }
+    }
+    expect(existsSync(ghostEmpty)).toBe(false); // empty → reclaimed
+    expect(existsSync(ghostFilled)).toBe(true); // non-empty → preserved, never rm -rf
+    rmSync(ghostFilled, { recursive: true, force: true });
+  });
+
+  it('white-in-black: RW → deny → RW carve-out launches, carve-out readable+writable, denied root hidden+unwritable', () => {
+    // The bug: a mode-000 ro-bind mask at /proj/wib can't host the nested
+    // /proj/wib/self mountpoint (bwrap: "Can't mkdir … Read-only file system").
+    // Fix: tmpfs mask + deferred --remount-ro.
+    const denied = join(S, 'proj/wib');
+    const self = join(denied, 'self');
+    mkdirSync(self, { recursive: true });
+    writeFileSync(join(denied, 'secret'), 'DENIEDSECRET');
+    writeFileSync(join(self, 'ok'), 'SELF');
+    const { args } = build({ deny: [denied], readWrite: [self] });
+    // carve-out reads
+    expect(run(args, `cat ${JSON.stringify(join(self, 'ok'))}`).out).toContain('SELF');
+    // carve-out writes (lands on host)
+    expect(run(args, `echo w > ${JSON.stringify(join(self, 'w'))}`).status).toBe(0);
+    expect(existsSync(join(self, 'w'))).toBe(true);
+    // denied root: real content hidden
+    expect(run(args, `cat ${JSON.stringify(join(denied, 'secret'))}`).out).not.toContain('DENIEDSECRET');
+    // denied root: not writable (remount-ro sealed the tmpfs parent)
+    expect(run(args, `echo x > ${JSON.stringify(join(denied, 'evil'))} && echo WROTE`).out).not.toContain('WROTE');
+    expect(existsSync(join(denied, 'evil'))).toBe(false);
+    rmSync(denied, { recursive: true, force: true });
+  });
+
+  it('OMP state stays writable while only the current transcript directory is carved through the sessions mask', () => {
+    const realHome = join(S, 'omp-real-home');
+    const linkedHome = join(S, 'omp-linked-home');
+    mkdirSync(realHome);
+    symlinkSync(realHome, linkedHome, 'dir');
+    vi.stubEnv('HOME', linkedHome);
+    try {
+      const agentRoot = join(realpathSync(realHome), '.omp', 'agent');
+      const sessionsRoot = join(agentRoot, 'sessions');
+      const own = ompSessionDir('self');
+      const sibling = join(sessionsRoot, 'botmux/sibling');
+      const legacy = join(sessionsRoot, '-legacy-project');
+      const terminalSessions = join(agentRoot, 'terminal-sessions');
+      const siblingTranscript = join(sibling, 'secret.jsonl');
+      const legacyTranscript = join(legacy, 'legacy.jsonl');
+      const migratedTranscript = join(own, 'migrated.jsonl');
+      const breadcrumb = join(terminalSessions, 'pane');
+      expect(own).toBe(join(sessionsRoot, 'botmux/self'));
+      mkdirSync(own, { recursive: true });
+      mkdirSync(legacy, { recursive: true });
+      writeFileSync(legacyTranscript, 'LEGACY_SECRET');
+      writeFileSync(migratedTranscript, 'MIGRATED_EXACT');
+      const adapterArgs = createOhMyPiAdapter('/usr/bin/omp').buildArgs({ sessionId: 'self', resume: true });
+      expect(adapterArgs[adapterArgs.indexOf('--session-dir') + 1]).toBe(own);
+      expect(adapterArgs[adapterArgs.indexOf('--resume') + 1]).toBe(migratedTranscript);
+
+      mkdirSync(sibling, { recursive: true });
+      mkdirSync(terminalSessions, { recursive: true });
+      writeFileSync(join(agentRoot, 'agent.db'), 'state');
+      writeFileSync(join(agentRoot, 'agent.db-wal'), 'wal');
+      writeFileSync(join(agentRoot, 'config.yml'), 'config');
+      writeFileSync(siblingTranscript, 'SIBLING_SECRET');
+      writeFileSync(breadcrumb, `${join(S, 'proj')}\n${siblingTranscript}\nfresh\n`);
+
+      const { args } = build({
+        readWrite: [agentRoot, own],
+        deny: [sessionsRoot],
+      });
+      expect(args).toContain(own);
+
+      expect(run(args, `printf updated >> ${JSON.stringify(join(agentRoot, 'agent.db'))}`).status).toBe(0);
+      expect(readFileSync(join(agentRoot, 'agent.db'), 'utf8')).toContain('updated');
+      expect(run(args, `cat ${JSON.stringify(migratedTranscript)}`).out).toContain('MIGRATED_EXACT');
+      expect(run(args, `printf own > ${JSON.stringify(join(own, 'new.jsonl'))}`).status).toBe(0);
+      expect(readFileSync(join(own, 'new.jsonl'), 'utf8')).toBe('own');
+
+      const breadcrumbRead = run(args, `cat ${JSON.stringify(breadcrumb)}`);
+      expect(breadcrumbRead.status).toBe(0);
+      expect(breadcrumbRead.out).toContain(siblingTranscript);
+      const siblingRead = run(args, `cat ${JSON.stringify(siblingTranscript)}`);
+      expect(siblingRead.status).not.toBe(0);
+      expect(siblingRead.out).not.toContain('SIBLING_SECRET');
+      const legacyRead = run(args, `cat ${JSON.stringify(legacyTranscript)}`);
+      expect(legacyRead.status).not.toBe(0);
+      expect(legacyRead.out).not.toContain('LEGACY_SECRET');
+
+      const other = join(sessionsRoot, 'botmux/other');
+      expect(run(args, `mkdir ${JSON.stringify(other)}`).status).not.toBe(0);
+      expect(existsSync(other)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('deny → allow → deny (4 layers): the DEEPEST deny is masked, secret unreadable+unwritable, middle carve-out still works', () => {
+    // Security regression: an ancestor deny must NOT make a deeper deny look
+    // redundant when an allow re-exposed the tree between them. outer denied,
+    // self re-allowed, secret denied again → secret must be a real mask.
+    const outer = join(S, 'proj/dad-outer');
+    const self = join(outer, 'self');
+    const secret = join(self, 'secret');
+    mkdirSync(secret, { recursive: true });
+    writeFileSync(join(secret, 'key'), 'TOPSECRET');
+    writeFileSync(join(self, 'ok'), 'SELF');
+    const { args } = build({ deny: [outer, secret], readWrite: [self] });
+    // middle carve-out reads + writes
+    expect(run(args, `cat ${JSON.stringify(join(self, 'ok'))}`).out).toContain('SELF');
+    expect(run(args, `echo w > ${JSON.stringify(join(self, 'w'))}`).status).toBe(0);
+    // deepest deny: real content NOT readable (was leaking TOPSECRET before the fix)
+    const read = run(args, `cat ${JSON.stringify(join(secret, 'key'))}`);
+    expect(read.status).not.toBe(0);
+    expect(read.out).not.toContain('TOPSECRET');
+    // deepest deny: not writable
+    expect(run(args, `echo x > ${JSON.stringify(join(secret, 'evil'))} && echo WROTE`).out).not.toContain('WROTE');
+    rmSync(outer, { recursive: true, force: true });
+  });
+
+  it('redundant nested deny (deny /a + deny /a/b) launches — inner deny skipped, still fully denied', () => {
+    // Two stacked denies with no allow between would fail: the inner mask can't
+    // mount on the outer mode-000 RO mask. The compiler skips the redundant
+    // inner deny; the outer mask still hides everything below.
+    const a = join(S, 'proj/rr');
+    const b = join(a, 'b');
+    mkdirSync(b, { recursive: true });
+    writeFileSync(join(b, 'secret'), 'INNERSECRET');
+    const { args } = build({ deny: [a, b] });
+    // launches (would exit non-zero on the mkdir failure otherwise) and the
+    // inner path is still denied by the ancestor mask
+    const r = run(args, `cat ${JSON.stringify(join(b, 'secret'))} 2>&1; echo "---"; ls ${JSON.stringify(a)} 2>&1`);
+    expect(r.out).not.toContain('INNERSECRET');
+    expect(r.out).toContain('---'); // process actually ran
+    rmSync(a, { recursive: true, force: true });
+  });
+
+  it('LINUX lark-cli keystore (KERNEL-level): own key readable, SIBLING ciphertext + master.key hidden, store not writable', () => {
+    // The whole point of the fix, proven at the kernel (not just accessForPath):
+    // the store sits under a read-only parent (production: baseline ro(~/.local/share)),
+    // is DENIED, and ONLY this bot's own master.key + appsecret_<self>.enc are carved
+    // back read-only. A sandboxed bot must NOT be able to read a sibling's appsecret
+    // or the shared master.key — that was the cross-bot impersonation leak. This is a
+    // white-in-black shape (ro parent → deny store → ro own-keys), so it exercises the
+    // tmpfs-mask + deferred --remount-ro carve-out path at the mount level.
+    const xdg = join(S, 'xdg');            // exposed read-only parent (stands in for ~/.local/share)
+    const store = join(xdg, 'lark-cli');
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, 'master.key'), 'MASTERKEY');
+    writeFileSync(join(store, 'appsecret_cli_e2e.enc'), 'OWNSECRET');       // this bot
+    writeFileSync(join(store, 'appsecret_cli_other.enc'), 'SIBLINGSECRET'); // a sibling bot
+    writeFileSync(join(store, 'cli_other_ou_x.enc'), 'SIBLINGTOKEN');       // a sibling user token
+    // parent is user-readOnly (mirrors baseline ro(~/.local/share)); store path is
+    // frozen via larkCliLinuxStore so the policy denies it + carves out own keys.
+    const { args } = build({ readOnly: [xdg] }, { larkCliLinuxStore: store });
+
+    // own appsecret + master.key ARE readable (needed to authenticate)
+    expect(run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_e2e.enc'))}`).out).toContain('OWNSECRET');
+    expect(run(args, `cat ${JSON.stringify(join(store, 'master.key'))}`).out).toContain('MASTERKEY');
+    // SIBLING ciphertext + token are HIDDEN at the kernel level (the leak)
+    const sib = run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_other.enc'))}`);
+    expect(sib.status).not.toBe(0);
+    expect(sib.out).not.toContain('SIBLINGSECRET');
+    const tok = run(args, `cat ${JSON.stringify(join(store, 'cli_other_ou_x.enc'))}`);
+    expect(tok.status).not.toBe(0);
+    expect(tok.out).not.toContain('SIBLINGTOKEN');
+    // a directory listing must not surface the sibling files either (the carve-out
+    // exposes ONLY the two own-key files; the rest of the store is a masked tmpfs)
+    const ls = run(args, `ls -A ${JSON.stringify(store)} 2>&1`);
+    expect(ls.out).not.toContain('appsecret_cli_other.enc');
+    expect(ls.out).not.toContain('cli_other_ou_x.enc');
+    // own carve-out files are read-ONLY (the CLI never rewrites the keystore in-sandbox)
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'master.key'))} && echo WROTE`).out).not.toContain('WROTE');
+    // and the store dir itself is not writable — no planting a fake sibling secret
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'appsecret_cli_evil.enc'))} && echo WROTE`).out).not.toContain('WROTE');
+    expect(existsSync(join(store, 'appsecret_cli_evil.enc'))).toBe(false);
+    rmSync(xdg, { recursive: true, force: true });
+  });
+
+  it('LINUX keystore NESTED in BOT_HOME + no-transport + hostile user RW (KERNEL-level): master.key/siblings STILL hidden (nested-authority regression)', () => {
+    // The reproduced escape at the kernel level: LARKSUITE_CLI_DATA_DIR=<BOT_HOME> so the
+    // store is <BOT_HOME>/lark-cli, under a no-transport turn, with a hostile user RW
+    // grant directly targeting master.key. Old logic exempted everything under BOT_HOME
+    // → master.key was RW (readable+writable) inside the sandbox. The per-root BOT_HOME
+    // exception must keep it denied — proven by real bubblewrap, not just accessForPath.
+    const botHome = join(S, 'botmux-home/bots/cli_e2e');
+    const store = join(botHome, 'lark-cli');
+    mkdirSync(store, { recursive: true });
+    writeFileSync(join(store, 'master.key'), 'NESTEDMASTER');
+    writeFileSync(join(store, 'appsecret_cli_other.enc'), 'NESTEDSIBLING');
+    const { args } = build(
+      { readWrite: [join(store, 'master.key'), store] },     // hostile user RW straight at the secret
+      { larkCliLinuxStore: store, larkTransportEnabled: false, botHome },
+    );
+    // master.key: real content NOT readable + NOT writable (the reproduced leak, sealed)
+    const rd = run(args, `cat ${JSON.stringify(join(store, 'master.key'))}`);
+    expect(rd.status).not.toBe(0);
+    expect(rd.out).not.toContain('NESTEDMASTER');
+    expect(run(args, `echo x > ${JSON.stringify(join(store, 'master.key'))} && echo WROTE`).out).not.toContain('WROTE');
+    // sibling appsecret also hidden
+    const sib = run(args, `cat ${JSON.stringify(join(store, 'appsecret_cli_other.enc'))}`);
+    expect(sib.status).not.toBe(0);
+    expect(sib.out).not.toContain('NESTEDSIBLING');
+    // BOT_HOME scratch OUTSIDE the nested store is still writable (carve-out intact there)
+    expect(run(args, `echo ok > ${JSON.stringify(join(botHome, 'scratch.txt'))} && echo WROTE`).out).toContain('WROTE');
+    rmSync(store, { recursive: true, force: true });
+  });
+});

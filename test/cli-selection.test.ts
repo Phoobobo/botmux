@@ -1,0 +1,1086 @@
+import { describe, expect, it } from 'vitest';
+import { delimiter } from 'node:path';
+
+import {
+  CLI_SELECT_OPTIONS,
+  CLI_SELECT_TREE,
+  CLI_SELECTION_ALIASES,
+  resolveCliSelection,
+  lookupCliSelection,
+  lookupCliSelectionForBotShape,
+  selectionKeyForBot,
+  stripSettingsArgs,
+  stripWrapperUnsafeArgs,
+  rewriteAidenCodexArgs,
+  buildWrappedLaunch,
+  parseWrapperCli,
+  decorateResumeForWrapper,
+  isTtadkWrapper,
+  ttadkAcceptsModel,
+  ttadkConfigModelChoices,
+  TTADK_DEFAULT_MODEL,
+  TTADK_MODEL_SUGGESTIONS,
+} from '../src/setup/cli-selection.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+
+describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
+  it('includes the two aiden gateway options right after native aiden', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('aiden');
+    expect(keys).toContain('aiden-x-claude');
+    expect(keys).toContain('aiden-x-codex');
+    const i = keys.indexOf('aiden');
+    expect(keys[i + 1]).toBe('aiden-x-claude');
+    expect(keys[i + 2]).toBe('aiden-x-codex');
+  });
+
+  it('appends the two cjadk gateway options after the native CLIs', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('cjadk-x-claude');
+    expect(keys).toContain('cjadk-x-codex');
+    const i = keys.indexOf('cjadk-x-claude');
+    expect(keys[i + 1]).toBe('cjadk-x-codex');
+  });
+
+  it('keeps every plain CliId selectable by its own key', () => {
+    expect(lookupCliSelection('claude-code')?.cliId).toBe('claude-code');
+    expect(lookupCliSelection('codex')?.cliId).toBe('codex');
+    expect(lookupCliSelection('codex')?.wrapperCli).toBeUndefined();
+  });
+
+  it('cascades Aiden into a submenu of three variants', () => {
+    const aiden = CLI_SELECT_TREE.find((g) => g.key === 'aiden');
+    expect(aiden?.children?.map((c) => c.key)).toEqual(['aiden', 'aiden-x-claude', 'aiden-x-codex']);
+    // an ungrouped top entry is a directly-selectable leaf
+    const gemini = CLI_SELECT_TREE.find((g) => g.key === 'gemini');
+    expect(gemini?.option?.cliId).toBe('gemini');
+    expect(gemini?.children).toBeUndefined();
+  });
+
+  it('cascades Codex into one submenu of Codex + Codex App (no top-level codex-app)', () => {
+    const codex = CLI_SELECT_TREE.find((g) => g.key === 'codex');
+    expect(codex?.children?.map((c) => c.key)).toEqual(['codex', 'codex-app']);
+    expect(codex?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'codex-app')).toBeUndefined();
+    expect(resolveCliSelection('codex')).toEqual({ cliId: 'codex' });
+    expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
+  });
+
+  it('cascades TRAE CLI into a current-first submenu without changing adapter ids', () => {
+    const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
+    expect(trae?.label).toBe('TRAE CLI');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['traex', 'coco']);
+    expect(trae?.children?.map((c) => c.label)).toEqual([
+      'TRAE CLI 2.0（推荐；traex / traecli）',
+      'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+    ]);
+    expect(trae?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
+    expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
+    expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(flatKeys.indexOf('traex')).toBe(flatKeys.indexOf('coco') - 1);
+    expect(flatKeys.indexOf('forge-x-traex')).toBe(flatKeys.indexOf('coco') + 1);
+  });
+
+  it('exposes Forge x TraeX as a first-class top-level launch shape', () => {
+    const forge = CLI_SELECT_TREE.find((g) => g.key === 'forge-x-traex');
+    expect(forge?.label).toBe('Forge x TraeX');
+    expect(forge?.option).toEqual({
+      key: 'forge-x-traex',
+      label: 'Forge x TraeX',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+    expect(forge?.children).toBeUndefined();
+    expect(resolveCliSelection('forge-x-traex')).toEqual({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
+  });
+
+  it('keeps traecli as an input-only alias of the TRAE CLI 2.0 adapter', () => {
+    expect(CLI_SELECTION_ALIASES).toMatchObject({ traecli: 'traex' });
+    expect(CLI_SELECT_OPTIONS.map((o) => o.key)).not.toContain('traecli');
+    expect(lookupCliSelection('traecli')).toBe(lookupCliSelection('traex'));
+    expect(resolveCliSelection('traecli')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps numeric setup choices as selection aliases', () => {
+    expect(resolveCliSelection('14')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
+    const treeKeys = CLI_SELECT_TREE.map((g) => g.key);
+    const i = treeKeys.indexOf('pi');
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(treeKeys[i + 1]).toBe('oh-my-pi');
+    // both remain directly-selectable leaves (not a submenu)
+    expect(CLI_SELECT_TREE[i].option?.cliId).toBe('pi');
+    expect(CLI_SELECT_TREE[i + 1].option?.cliId).toBe('oh-my-pi');
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    const fi = flatKeys.indexOf('pi');
+    expect(flatKeys[fi + 1]).toBe('oh-my-pi');
+  });
+
+  it('cascades OpenCode into one submenu of OpenCode + OpenCode 2 (no top-level opencode2)', () => {
+    const opencode = CLI_SELECT_TREE.find((g) => g.key === 'opencode');
+    expect(opencode?.label).toBe('OpenCode');
+    expect(opencode?.children?.map((c) => c.key)).toEqual(['opencode', 'opencode2']);
+    expect(opencode?.option).toBeUndefined();
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'opencode2')).toBeUndefined();
+    expect(resolveCliSelection('opencode')).toEqual({ cliId: 'opencode' });
+    expect(resolveCliSelection('opencode2')).toEqual({ cliId: 'opencode2' });
+    // flat list: both resolvable, opencode2 folded right under opencode
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('opencode');
+    expect(keys).toContain('opencode2');
+    expect(keys.indexOf('opencode2')).toBe(keys.indexOf('opencode') + 1);
+  });
+
+  it('cascades Mira into one submenu of Mira App + Mir CLI (no top-level mir)', () => {    const mira = CLI_SELECT_TREE.find((g) => g.key === 'mira');
+    expect(mira?.children?.map((c) => c.key)).toEqual(['mira', 'mir']);
+    expect(mira?.option).toBeUndefined();
+    // mir is no longer a separate top-level entry — it lives under the Mira group.
+    expect(CLI_SELECT_TREE.find((g) => g.key === 'mir')).toBeUndefined();
+    // flat list: both resolvable, mir folded under mira (no duplicate top entry)
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('mira');
+    expect(keys).toContain('mir');
+  });
+
+  it('resolves both Mira variants to their native cliIds (no wrapperCli)', () => {
+    expect(resolveCliSelection('mira')).toEqual({ cliId: 'mira' });
+    expect(resolveCliSelection('mir')).toEqual({ cliId: 'mir' });
+  });
+
+  it('cascades CJADK into a submenu of its two × variants', () => {
+    const cjadk = CLI_SELECT_TREE.find((g) => g.key === 'cjadk');
+    expect(cjadk?.children?.map((c) => c.key)).toEqual(['cjadk-x-claude', 'cjadk-x-codex']);
+    expect(cjadk?.option).toBeUndefined();
+  });
+
+  it('appends the six ttadk gateway options after cjadk', () => {
+    const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(keys).toContain('ttadk-x-claude');
+    const i = keys.indexOf('ttadk-x-claude');
+    expect(keys.slice(i, i + 6)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    ]);
+    // ttadk comes after the cjadk block
+    expect(keys.indexOf('ttadk-x-claude')).toBeGreaterThan(keys.indexOf('cjadk-x-codex'));
+  });
+
+  it('cascades TTADK into a submenu of its six × variants', () => {
+    const ttadk = CLI_SELECT_TREE.find((g) => g.key === 'ttadk');
+    expect(ttadk?.children?.map((c) => c.key)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    ]);
+    expect(ttadk?.option).toBeUndefined();
+  });
+});
+
+describe('resolveCliSelection', () => {
+  it('maps a plain cli key to just its cliId', () => {
+    expect(resolveCliSelection('claude-code')).toEqual({ cliId: 'claude-code' });
+    expect(resolveCliSelection('gemini')).toEqual({ cliId: 'gemini' });
+  });
+
+  it('maps aiden×claude to claude-code + wrapperCli "aiden x claude"', () => {
+    expect(resolveCliSelection('aiden-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'aiden x claude' });
+  });
+
+  it('maps aiden×codex to codex + wrapperCli "aiden x codex"', () => {
+    expect(resolveCliSelection('aiden-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'aiden x codex' });
+  });
+
+  it('maps native aiden to plain aiden (no wrapper)', () => {
+    expect(resolveCliSelection('aiden')).toEqual({ cliId: 'aiden' });
+  });
+
+  it('maps cjadk×claude to claude-code + wrapperCli "cjadk claude"', () => {
+    expect(resolveCliSelection('cjadk-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'cjadk claude' });
+  });
+
+  it('maps cjadk×codex to codex + wrapperCli "cjadk codex"', () => {
+    expect(resolveCliSelection('cjadk-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'cjadk codex' });
+  });
+
+  it('maps ttadk variants to their underlying cliId + "ttadk <sub>" wrapperCli', () => {
+    expect(resolveCliSelection('ttadk-x-claude')).toEqual({ cliId: 'claude-code', wrapperCli: 'ttadk claude' });
+    expect(resolveCliSelection('ttadk-x-codex')).toEqual({ cliId: 'codex', wrapperCli: 'ttadk codex' });
+    expect(resolveCliSelection('ttadk-x-opencode')).toEqual({ cliId: 'opencode', wrapperCli: 'ttadk opencode' });
+    expect(resolveCliSelection('ttadk-x-coco')).toEqual({ cliId: 'coco', wrapperCli: 'ttadk coco' });
+    // Cursor uses ttadk's `cursor-cli` subcommand but the botmux adapter is still `cursor`.
+    expect(resolveCliSelection('ttadk-x-cursor')).toEqual({ cliId: 'cursor', wrapperCli: 'ttadk cursor-cli' });
+    expect(resolveCliSelection('ttadk-x-gemini')).toEqual({ cliId: 'gemini', wrapperCli: 'ttadk gemini' });
+  });
+
+  it('throws on an unknown key', () => {
+    expect(() => resolveCliSelection('nope')).toThrow(/未知 CLI 选择项/);
+  });
+});
+
+describe('selectionKeyForBot', () => {
+  it('round-trips Forge x TraeX bots back to their first-class selection key', () => {
+    expect(selectionKeyForBot('traex', undefined, 'forge-traex')).toBe('forge-x-traex');
+    expect(selectionKeyForBot('traex', 'ignored wrapper', 'forge-traex')).toBe('forge-x-traex');
+  });
+
+  it('round-trips aiden gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'aiden x claude')).toBe('aiden-x-claude');
+    expect(selectionKeyForBot('codex', 'aiden x codex')).toBe('aiden-x-codex');
+  });
+
+  it('round-trips cjadk gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'cjadk claude')).toBe('cjadk-x-claude');
+    expect(selectionKeyForBot('codex', 'cjadk codex')).toBe('cjadk-x-codex');
+  });
+
+  it('round-trips ttadk gateway bots back to their selection key', () => {
+    expect(selectionKeyForBot('claude-code', 'ttadk claude')).toBe('ttadk-x-claude');
+    expect(selectionKeyForBot('coco', 'ttadk coco')).toBe('ttadk-x-coco');
+    expect(selectionKeyForBot('cursor', 'ttadk cursor-cli')).toBe('ttadk-x-cursor');
+  });
+
+  it('falls back to cliId for plain bots or unrecognised prefixes', () => {
+    expect(selectionKeyForBot('codex')).toBe('codex');
+    expect(selectionKeyForBot('claude-code', '')).toBe('claude-code');
+    expect(selectionKeyForBot('claude-code', 'ccr')).toBe('claude-code');
+  });
+});
+
+describe('lookupCliSelectionForBotShape', () => {
+  it('round-trips every registered native, wrapper and launch-mode tuple exactly', () => {
+    for (const option of CLI_SELECT_OPTIONS) {
+      expect(lookupCliSelectionForBotShape(
+        option.cliId,
+        option.wrapperCli,
+        option.cliLaunchMode,
+      )?.key).toBe(option.key);
+    }
+  });
+
+  it('does not treat missing fields as wildcards or unknown wrappers as native', () => {
+    expect(lookupCliSelectionForBotShape('codex', 'ccr claude')).toBeUndefined();
+    expect(lookupCliSelectionForBotShape('codex', 'aiden x codex', undefined)?.key)
+      .toBe('aiden-x-codex');
+    expect(lookupCliSelectionForBotShape('codex', undefined, undefined)?.key).toBe('codex');
+    expect(lookupCliSelectionForBotShape('traex', undefined, 'forge-traex')?.key)
+      .toBe('forge-x-traex');
+    expect(lookupCliSelectionForBotShape('traex', undefined, undefined)?.key).toBe('traex');
+  });
+});
+
+describe('stripSettingsArgs', () => {
+  it('drops --settings <value> (two tokens)', () => {
+    expect(stripSettingsArgs(['--session-id', 'x', '--settings', '{"a":1}', '--model', 'm']))
+      .toEqual(['--session-id', 'x', '--model', 'm']);
+  });
+
+  it('drops --settings=<value> (single token)', () => {
+    expect(stripSettingsArgs(['--settings={"a":1}', '--plugin-dir', '/p']))
+      .toEqual(['--plugin-dir', '/p']);
+  });
+
+  it('leaves args untouched when there is no --settings', () => {
+    expect(stripSettingsArgs(['--resume', 'id', '--model', 'm'])).toEqual(['--resume', 'id', '--model', 'm']);
+  });
+});
+
+describe('stripWrapperUnsafeArgs', () => {
+  it('strips --settings (both forms) like stripSettingsArgs', () => {
+    expect(stripWrapperUnsafeArgs(['--settings', '{}', '--plugin-dir', '/p'])).toEqual(['--plugin-dir', '/p']);
+    expect(stripWrapperUnsafeArgs(['--settings={}', '--model', 'm'])).toEqual(['--model', 'm']);
+  });
+
+  it('strips the botmux-injected codex -c override (flag + value)', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+      '-C',
+      '/repo',
+    ])).toEqual(['--no-alt-screen', '-C', '/repo']);
+  });
+
+  it('strips a botmux override for any BOTMUX_* key, not just SESSION_ID', () => {
+    expect(stripWrapperUnsafeArgs(['-c', 'shell_environment_policy.set.BOTMUX_TURN_ID="t"', '--model', 'm']))
+      .toEqual(['--model', 'm']);
+  });
+
+  it('leaves a user-supplied -c (non-botmux config override) untouched', () => {
+    expect(stripWrapperUnsafeArgs(['-c', 'model_reasoning_effort="high"', '--model', 'm']))
+      .toEqual(['-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  });
+
+  it('handles both --settings and the codex -c override in one pass', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--session-id', 'x',
+      '--settings', '{}',
+      '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+      '--model', 'm',
+    ])).toEqual(['--session-id', 'x', '--model', 'm']);
+  });
+
+  // Regression: aiden's own launcher injects codex's --dangerously-bypass-hook-trust,
+  // so botmux passing it too made codex's clap see it twice → "cannot be used multiple
+  // times" and spawn aborted. Strip botmux's redundant copy for aiden wrappers.
+  it('strips the codex --dangerously-bypass-hook-trust flag (aiden injects its own)', () => {
+    expect(stripWrapperUnsafeArgs([
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '--model', 'm',
+    ])).toEqual(['--dangerously-bypass-approvals-and-sandbox', '--no-alt-screen', '--model', 'm']);
+  });
+
+  it('leaves args untouched when nothing is unsafe', () => {
+    expect(stripWrapperUnsafeArgs(['resume', 'cid', '--model', 'm'])).toEqual(['resume', 'cid', '--model', 'm']);
+  });
+});
+
+describe('rewriteAidenCodexArgs', () => {
+  it('rewrites Botmux reasoning config to Aiden native syntax', () => {
+    expect(rewriteAidenCodexArgs([
+      '--model', 'deepseek-v4-pro',
+      '-c', 'model_reasoning_effort="high"',
+    ])).toEqual({
+      reasoningEffort: 'high',
+      shellConfigs: [],
+      forwardedArgs: ['--model', 'deepseek-v4-pro'],
+    });
+  });
+
+  it.each(['max', 'ultra'] as const)('preserves the %s reasoning level for the shim', (effort) => {
+    expect(rewriteAidenCodexArgs(['-c', `model_reasoning_effort="${effort}"`, '--model', 'm']))
+      .toEqual({ reasoningEffort: effort, shellConfigs: [], forwardedArgs: ['--model', 'm'] });
+  });
+
+  it('extracts the shell_environment_policy overrides for the PATH shim', () => {
+    expect(rewriteAidenCodexArgs([
+      '--no-alt-screen',
+      '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="sess"',
+      '-c', 'shell_environment_policy.set.BOTMUX_CHAT_ID="chat"',
+      '-c', 'shell_environment_policy.set.BOTMUX_LARK_APP_ID="cli_x"',
+      '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+      '-c', 'shell_environment_policy.set.ZDOTDIR="/data/x/ident/shell"',
+      '-c', 'shell_environment_policy.set.BASH_ENV="/data/x/ident/shell/bash_env.sh"',
+      '-c', 'shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/data/x/ident"',
+      '-c', 'shell_environment_policy.set.GIT_ASKPASS="/data/x/askpass"',
+      '-c', 'shell_environment_policy.set.BOTMUX_LARK_TOOL_BINDING="/data/x/lark-tool"',
+      '-c', 'shell_environment_policy.set.BOTMUX_DAEMON_IPC_PORT="4242"',
+      '-c', 'shell_environment_policy.inherit="all"',
+      '-c', 'shell_environment_policy.ignore_default_excludes=true',
+      'resume', 'cid',
+    ])).toEqual({
+      reasoningEffort: undefined,
+      shellConfigs: [
+        'shell_environment_policy.set.BOTMUX_SESSION_ID="sess"',
+        'shell_environment_policy.set.BOTMUX_CHAT_ID="chat"',
+        'shell_environment_policy.set.BOTMUX_LARK_APP_ID="cli_x"',
+        'shell_environment_policy.set.SESSION_DATA_DIR="/data dir/x"',
+        'shell_environment_policy.set.ZDOTDIR="/data/x/ident/shell"',
+        'shell_environment_policy.set.BASH_ENV="/data/x/ident/shell/bash_env.sh"',
+        'shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/data/x/ident"',
+        'shell_environment_policy.set.GIT_ASKPASS="/data/x/askpass"',
+        'shell_environment_policy.set.BOTMUX_LARK_TOOL_BINDING="/data/x/lark-tool"',
+        'shell_environment_policy.set.BOTMUX_DAEMON_IPC_PORT="4242"',
+        'shell_environment_policy.inherit="all"',
+        'shell_environment_policy.ignore_default_excludes=true',
+      ],
+      forwardedArgs: ['--no-alt-screen', 'resume', 'cid'],
+    });
+  });
+
+  it('does not extract an unrelated shell_environment_policy key (allowlist is exact-prefix)', () => {
+    // Only the keys the worker enumerates may take this channel; a user or a
+    // future adapter emitting any other shell_environment_policy key keeps the
+    // old behavior (forwarded verbatim, where Aiden rejects it).
+    expect(rewriteAidenCodexArgs([
+      '-c', 'shell_environment_policy.set.SOMETHING_ELSE="1"',
+    ]).forwardedArgs).toEqual(['-c', 'shell_environment_policy.set.SOMETHING_ELSE="1"']);
+  });
+
+  it('extracts the service_tier / tui.auto_recap root overrides for the shim', () => {
+    // Both are botmux-injected root configs that Aiden rejects from argv but
+    // that must still reach the real codex (chosen tier / recap suppression).
+    // 'default' is included because sessionServiceTier only hides
+    // undefined/inherit — an explicit default is injected and forwarded too.
+    for (const value of [
+      'service_tier="default"',
+      'service_tier="priority"',
+      'service_tier="ultrafast"',
+      'tui.auto_recap=false',
+      'tui.auto_recap=true',
+    ]) {
+      expect(rewriteAidenCodexArgs(['-c', value, 'resume', 'cid']), value).toEqual({
+        reasoningEffort: undefined,
+        shellConfigs: [value],
+        forwardedArgs: ['resume', 'cid'],
+      });
+    }
+  });
+
+  it.each([
+    'service_tier="bogus"',      // not a botmux-emitted tier
+    'service_tier=priority',      // wrong shape (unquoted)
+    'tui.auto_recap=maybe',       // not true/false
+    'tui.auto_recap',             // bare key
+    'tuiXauto_recap=false',       // regex must not treat '.' as any-char
+    'my_service_tier="priority"',     // prefix must not match mid-string
+    'service_tier="priority" ',       // trailing junk must not match (anchored $)
+    'x=tui.auto_recap=false',          // suffix must not match mid-string
+  ])('leaves a user-owned near-miss %s on the forwarded argv', (value) => {
+    // The predicates are anchored and exact so a user's own -c is never hijacked
+    // into the shim file channel (where it would be silently relocated).
+    expect(rewriteAidenCodexArgs(['-c', value, 'resume']).forwardedArgs)
+      .toEqual(['-c', value, 'resume']);
+  });
+
+  it('still drops update/nudge suppressions, hook-trust and settings on the aiden codex path', () => {
+    expect(rewriteAidenCodexArgs([
+      '--dangerously-bypass-hook-trust',
+      '--settings', '{}',
+      '-c', 'check_for_update_on_startup=false',
+      '-c', 'notice.hide_rate_limit_model_nudge=true',
+      '-c', 'model_reasoning_effort="high"',
+      '--model', 'm',
+    ])).toEqual({
+      reasoningEffort: 'high',
+      shellConfigs: [],
+      forwardedArgs: ['--model', 'm'],
+    });
+  });
+
+  it('removes the Aiden-incompatible config even when no shim is available', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c', 'model_reasoning_effort="ultra"', '--model', 'm',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.env).toBeUndefined();
+  });
+
+  it('does not rewrite arbitrary user config values', () => {
+    expect(rewriteAidenCodexArgs(['-c', 'model_provider="custom"']))
+      .toEqual({
+        reasoningEffort: undefined,
+        shellConfigs: [],
+        forwardedArgs: ['-c', 'model_provider="custom"'],
+      });
+  });
+});
+
+describe('parseWrapperCli', () => {
+  it('splits on whitespace and drops blanks', () => {
+    expect(parseWrapperCli('  aiden   x claude ')).toEqual(['aiden', 'x', 'claude']);
+    expect(parseWrapperCli('')).toEqual([]);
+  });
+});
+
+describe('buildWrappedLaunch', () => {
+  it('prepends the prefix and strips --settings for aiden x claude', () => {
+    const out = buildWrappedLaunch('aiden x claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'claude', '--session-id', 'sid', '--plugin-dir', '/p']);
+  });
+
+  it('keeps non-config args verbatim for aiden x codex', () => {
+    const out = buildWrappedLaunch('aiden x codex', ['resume', 'cid', '--model', 'm']);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex', 'resume', 'cid', '--model', 'm']);
+  });
+
+  // Regression: aiden 1.8.38+ rejects `aiden x codex … -c …`. The Codex adapter
+  // injects `-c shell_environment_policy.set.BOTMUX_SESSION_ID=…` (commit 10d3e61),
+  // which previously reached the launcher verbatim and broke spawn. It must now be
+  // stripped for aiden wrappers; everything else (bypass/-C/--model) is preserved.
+  it('strips the botmux-injected codex -c override for aiden x codex', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual([
+      'x',
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('strips the startup-update override that aiden refuses to accept', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
+  it('strips the luna-nudge override alongside the startup-update one (aiden x codex)', () => {
+    // aiden 1.8.38+ rejects passthrough -c outright; without whitelisting this
+    // botmux-injected value the launch would abort instead of merely losing it.
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
+  it('rewrites the Codex adapter reasoning config for aiden x codex', () => {
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--model', 'm'],
+      (bin) => `/resolved/${bin}`,
+      { childPath: '/child/bin', aidenCodexShimDir: '/botmux/scripts/aiden-codex-shim' },
+    );
+    expect(out.bin).toBe('/botmux/scripts/aiden-codex-shim/launch');
+    expect(out.args).toEqual(['/resolved/aiden', 'x', 'codex', '--model', 'm']);
+    expect(out.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
+    expect(out.env).not.toHaveProperty('BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE');
+  });
+
+  it('routes shell-env overrides through the shim via a persisted config file (no effort)', () => {
+    const written: string[][] = [];
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      [
+        '--no-alt-screen',
+        '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/d/x"',
+        '-c', 'shell_environment_policy.set.ZDOTDIR="/d/x/shell"',
+        '-c', 'shell_environment_policy.set.BASH_ENV="/d/x/bash_env.sh"',
+        'resume', 'cid',
+      ],
+      (bin) => `/resolved/${bin}`,
+      {
+        aidenCodexRealBin: '/resolved/codex',
+        aidenCodexShimDir: '/botmux/shim',
+        writeAidenShellConfigs: (configs) => {
+          written.push([...configs]);
+          return '/botmux/shim/shell-configs';
+        },
+      },
+    );
+    expect(written).toEqual([[
+      'shell_environment_policy.set.SESSION_DATA_DIR="/d/x"',
+      'shell_environment_policy.set.ZDOTDIR="/d/x/shell"',
+      'shell_environment_policy.set.BASH_ENV="/d/x/bash_env.sh"',
+    ]]);
+    expect(out.bin).toBe('/botmux/shim/launch');
+    expect(out.args).toEqual(['/resolved/aiden', 'x', 'codex', '--no-alt-screen', 'resume', 'cid']);
+    expect(out.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE: '/botmux/shim/shell-configs',
+    });
+    // No reasoning level was present, so the shim must not be handed one.
+    expect(out.env).not.toHaveProperty('BOTMUX_AIDEN_CODEX_REASONING_EFFORT');
+  });
+
+  it('combines shell-env overrides and reasoning effort in one shim launch', () => {
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      [
+        '-c', 'model_reasoning_effort="max"',
+        '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/d/x"',
+        '--model', 'm',
+      ],
+      (bin) => `/resolved/${bin}`,
+      {
+        aidenCodexShimDir: '/botmux/shim',
+        writeAidenShellConfigs: () => '/cfg',
+      },
+    );
+    expect(out.bin).toBe('/botmux/shim/launch');
+    expect(out.args).toEqual(['/resolved/aiden', 'x', 'codex', '--model', 'm']);
+    expect(out.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'max',
+      BOTMUX_AIDEN_CODEX_SHELL_CONFIG_FILE: '/cfg',
+    });
+  });
+
+  it('strips shell-env overrides without a shim dir (degraded, no crash)', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c', 'shell_environment_policy.set.SESSION_DATA_DIR="/d/x"',
+      '--no-alt-screen',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+    expect(out.env).toBeUndefined();
+  });
+
+  it('strips shell-env overrides when the persistence hook is missing (never fabricate a path)', () => {
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      ['-c', 'shell_environment_policy.set.ZDOTDIR="/d/x"'],
+      (b) => b,
+      { aidenCodexShimDir: '/botmux/shim' },
+    );
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex']);
+    expect(out.env).toBeUndefined();
+  });
+
+  // Fail-closed (maintainer decision): when the launch carries session identity
+  // (trigger-user auth / Lark tool binding) the shim is the ONLY channel for the
+  // non-prefixed identity keys. Degrading here would silently run tool shells as
+  // the machine owner, so it must throw instead of stripping the overrides.
+  describe('requireAidenCodexShim (identity-bearing launches fail closed)', () => {
+    it('throws when the shim dir is unavailable', () => {
+      expect(() => buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'shell_environment_policy.set.ZDOTDIR="/d/x"', 'resume', 'cid'],
+        (b) => b,
+        { requireAidenCodexShim: true },
+      )).toThrow(/launch refused: session identity/);
+    });
+
+    it('throws when the persistence hook is missing', () => {
+      expect(() => buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'shell_environment_policy.set.ZDOTDIR="/d/x"'],
+        (b) => b,
+        { aidenCodexShimDir: '/botmux/shim', requireAidenCodexShim: true },
+      )).toThrow(/persistence hook/);
+    });
+
+    it('does NOT throw for a reasoning-only launch with a shim (no identity present)', () => {
+      // requireAidenCodexShim is only ever set alongside identity keys; a
+      // reasoning-only launch still takes the shim normally.
+      const out = buildWrappedLaunch(
+        'aiden x codex',
+        ['-c', 'model_reasoning_effort="high"'],
+        (b) => b,
+        { aidenCodexShimDir: '/botmux/shim', requireAidenCodexShim: true },
+      );
+      expect(out.bin).toBe('/botmux/shim/launch');
+      expect(out.env).toMatchObject({ BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high' });
+    });
+
+    it('does NOT throw for a launch with nothing to transport (no shim needed)', () => {
+      // Nothing is injected, so no shim is attempted and no fail-closed applies.
+      const out = buildWrappedLaunch('aiden x codex', ['--no-alt-screen', 'resume', 'cid'],
+        (b) => b, { requireAidenCodexShim: true });
+      expect(out.bin).toBe('aiden');
+      expect(out.args).toEqual(['x', 'codex', '--no-alt-screen', 'resume', 'cid']);
+    });
+  });
+
+  // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,
+  // so botmux's copy (codex.ts buildArgs, gated by bypassCodexHookTrust) reaching the
+  // launcher made codex see the flag twice → `error: the argument
+  // '--dangerously-bypass-hook-trust' cannot be used multiple times` and spawn aborted.
+  // The approval/sandbox bypass is a distinct flag aiden does NOT inject → kept.
+  it('strips the codex --dangerously-bypass-hook-trust for aiden x codex (aiden injects its own)', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual([
+      'x',
+      'codex',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-C',
+      '/repo',
+    ]);
+    expect(out.args).not.toContain('--dangerously-bypass-hook-trust');
+  });
+
+  // Regression (only reproduces on cjadk codex): cjadk's `code` subcommand defines
+  // `-c, --command <cmd>` (commander), so botmux's injected
+  // `-c shell_environment_policy.set.BOTMUX_SESSION_ID=…` was captured as cjadk's
+  // --command and NOT forwarded to codex → cjadk tried to run the value as a custom
+  // command and errored `… is not installed. Please install it first.`. Rewrite to
+  // codex's long form `--config` (which cjadk does NOT define → allowUnknownOption
+  // passes it through to real codex), preserving the BOTMUX_SESSION_ID shell-env channel.
+  it('rewrites the botmux codex -c override to --config for cjadk codex', () => {
+    const out = buildWrappedLaunch('cjadk codex', [
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+    ]);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', 'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"']);
+    // cjadk's `-c`/`--command` collision is gone — no bare -c reaches the launcher.
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('does not rewrite a user-supplied -c that is not a botmux override (cjadk codex)', () => {
+    const out = buildWrappedLaunch('cjadk codex', ['-c', 'model_reasoning_effort="high"', '--no-alt-screen']);
+    // User-owned -c is left untouched (its semantics are the user's to own, not ours).
+    expect(out.args).toEqual(['codex', '-c', 'model_reasoning_effort="high"', '--no-alt-screen']);
+  });
+
+  // Regression (same family as the aiden shell-env gap): the trigger-user
+  // identity overrides do NOT carry a BOTMUX_ prefix, so the old whitelist
+  // missed them on the cjadk path too — cjadk claimed them as its --command
+  // and the identity never reached codex's shells. They must rewrite to
+  // --config exactly like the BOTMUX_* ones.
+  it.each([
+    ['SESSION_DATA_DIR', 'shell_environment_policy.set.SESSION_DATA_DIR="/d/x"'],
+    ['ZDOTDIR', 'shell_environment_policy.set.ZDOTDIR="/d/x/shell"'],
+    ['BASH_ENV', 'shell_environment_policy.set.BASH_ENV="/d/x/bash_env.sh"'],
+    ['GIT_ASKPASS', 'shell_environment_policy.set.GIT_ASKPASS="/d/x/askpass"'],
+    ['inherit', 'shell_environment_policy.inherit="all"'],
+  ] as const)('rewrites the non-prefixed %s identity override to --config (cjadk codex)', (_label, value) => {
+    const out = buildWrappedLaunch('cjadk codex', ['--no-alt-screen', '-c', value]);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', value]);
+    expect(out.args).not.toContain('-c');
+  });
+
+  // Same -c → --config requirement for the two root overrides the codex adapter
+  // injects: without the shared predicate cjadk would claim them as --command and
+  // never forward the chosen tier / recap suppression to the real codex.
+  it.each([
+    'service_tier="default"',
+    'service_tier="priority"',
+    'service_tier="ultrafast"',
+    'tui.auto_recap=false',
+    'tui.auto_recap=true',
+  ] as const)('rewrites the %s root override to --config (cjadk codex)', (value) => {
+    const out = buildWrappedLaunch('cjadk codex', ['--no-alt-screen', '-c', value]);
+    expect(out.args).toEqual(['codex', '--no-alt-screen', '--config', value]);
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('rewrites the startup-update override for cjadk codex', () => {
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
+  });
+
+  it('rewrites the luna-nudge override to --config for cjadk codex', () => {
+    // Same -c → --config passthrough requirement as the startup-update override;
+    // cjadk's code subcommand claims -c as --command otherwise.
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'notice.hide_rate_limit_model_nudge=true']);
+  });
+
+  it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
+    const out = buildWrappedLaunch('ttadk codex', [
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
+    ]);
+    expect(out.args).toContain('-c');
+    expect(out.args).toContain('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+  });
+
+  it('keeps the startup-update override for the bare-passthrough ttadk gateway', () => {
+    const out = buildWrappedLaunch('ttadk codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+    ]);
+    expect(out.args).toContain('check_for_update_on_startup=false');
+  });
+
+  it('keeps --settings for cjadk claude (forwarded verbatim to real claude)', () => {
+    const out = buildWrappedLaunch('cjadk claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['claude', '--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p']);
+  });
+
+  it('prepends the prefix for cjadk codex', () => {
+    const out = buildWrappedLaunch('cjadk codex', ['resume', 'cid']);
+    expect(out.bin).toBe('cjadk');
+    expect(out.args).toEqual(['codex', 'resume', 'cid']);
+  });
+
+  it('works for a generic single-token prefix (ccr) without stripping --settings', () => {
+    const out = buildWrappedLaunch('ccr', ['--settings', '{}', '--resume', 'x']);
+    expect(out.bin).toBe('ccr');
+    expect(out.args).toEqual(['--settings', '{}', '--resume', 'x']);
+  });
+
+  it('resolves the bin via the provided resolver', () => {
+    const out = buildWrappedLaunch('aiden x claude', ['--resume', 'x'], (b) => `/abs/${b}`);
+    expect(out.bin).toBe('/abs/aiden');
+  });
+
+  it('returns empty bin for a blank prefix so callers can skip', () => {
+    expect(buildWrappedLaunch('   ', ['--resume', 'x'])).toEqual({ bin: '', args: ['--resume', 'x'] });
+  });
+
+  describe('ttadk gateway', () => {
+    it('injects `-m <model> --skip-check` and forwards CLI args verbatim (keeps --settings)', () => {
+      const out = buildWrappedLaunch('ttadk claude', ['--session-id', 'sid', '--settings', '{}'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.bin).toBe('ttadk');
+      expect(out.args).toEqual(['claude', '-m', 'glm-5.1', '--skip-check', '--session-id', 'sid', '--settings', '{}']);
+    });
+
+    it('falls back to the default model when none is provided', () => {
+      const out = buildWrappedLaunch('ttadk codex', ['--resume', 'cid']);
+      expect(out.args).toEqual(['codex', '-m', TTADK_DEFAULT_MODEL, '--skip-check', '--resume', 'cid']);
+    });
+
+    it('treats blank/whitespace model as unset and uses the default', () => {
+      const out = buildWrappedLaunch('ttadk claude', ['--x'], (b) => b, { ttadkModel: '   ' });
+      expect(out.args).toEqual(['claude', '-m', TTADK_DEFAULT_MODEL, '--skip-check', '--x']);
+    });
+
+    it('does NOT inject -m for CoCo (requiresManagedModel=false), only --skip-check', () => {
+      const out = buildWrappedLaunch('ttadk coco', ['--session-id', 'sid'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.args).toEqual(['coco', '--skip-check', '--session-id', 'sid']);
+      expect(out.args).not.toContain('-m');
+    });
+
+    it('uses the cursor-cli subcommand for ttadk × cursor', () => {
+      const out = buildWrappedLaunch('ttadk cursor-cli', ['--resume', 'x'], (b) => b, { ttadkModel: 'glm-5.1' });
+      expect(out.args).toEqual(['cursor-cli', '-m', 'glm-5.1', '--skip-check', '--resume', 'x']);
+    });
+
+    it('resolves the ttadk bin via the provided resolver', () => {
+      const out = buildWrappedLaunch('ttadk claude', [], (b) => `/abs/${b}`, { ttadkModel: 'glm-5' });
+      expect(out.bin).toBe('/abs/ttadk');
+    });
+  });
+});
+
+// End-to-end regression: wire the REAL Codex adapter's buildArgs into the
+// launcher exactly as the worker does. This is the actual failure the user hit
+// (aiden 1.8.38 rejecting `aiden x codex … -c …`). Guards against the adapter
+// and the wrapper layer drifting apart in the future.
+describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () => {
+  const codex = createCodexAdapter('/usr/bin/codex');
+
+  const BOTMUX_OVERRIDE_RE = /^shell_environment_policy\.set\.BOTMUX_/;
+  const forwardsBotmuxC = (args: ReadonlyArray<string>): boolean =>
+    args.some((a, i) => a === '-c' && BOTMUX_OVERRIDE_RE.test(args[i + 1] ?? ''));
+
+  it('native codex still injects the botmux session-env -c (feature preserved)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(forwardsBotmuxC(args)).toBe(true);
+  });
+
+  it('aiden x codex never forwards the botmux -c (fresh launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(forwardsBotmuxC(out.args)).toBe(false);
+    expect(out.args).not.toContain('-c');
+  });
+
+  it('aiden x codex never forwards the botmux -c (resume launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-uuid' });
+    expect(args).toContain('resume');               // sanity: we exercised the resume branch
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(forwardsBotmuxC(out.args)).toBe(false);
+    // resume target + benign flags survive the strip.
+    expect(out.args).toContain('codex-uuid');
+    expect(out.args).toContain('--no-alt-screen');
+  });
+
+  it('aiden x codex strips the cwd trust preseed -c (aiden rejects passthrough config)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    expect(args.join(' ')).toContain('projects={"/repo"={trust_level="trusted"}}');
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(out.args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
+  // Cross-CLI guard: any aiden `aiden x <cli>` wrapper must drop a botmux-injected
+  // `-c shell_environment_policy.set.BOTMUX_*` override, so a future adapter that
+  // mirrors Codex's injection cannot re-break aiden launches. ttadk keeps it
+  // (bare-passthrough); cjadk rewrites it to --config (see the cjadk regression below).
+  it('no aiden built-in wrapper forwards a botmux -c override', () => {
+    const codexArgs = [
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="s"',
+    ];
+    const aidenWrappers = CLI_SELECT_OPTIONS
+      .map((o) => o.wrapperCli)
+      .filter((w): w is string => !!w && parseWrapperCli(w)[0] === 'aiden');
+    expect(aidenWrappers).toContain('aiden x codex');
+    for (const w of aidenWrappers) {
+      const out = buildWrappedLaunch(w, codexArgs);
+      expect(forwardsBotmuxC(out.args), `${w} must not forward botmux -c`).toBe(false);
+    }
+  });
+});
+
+// End-to-end regression (only reproduces on cjadk codex): cjadk's `code` subcommand
+// owns `-c/--command`, so botmux's injected `-c shell_environment_policy.set.BOTMUX_*`
+// was eaten as cjadk's custom-command and never reached codex (cjadk errored
+// `… is not installed`). The wrapper layer must rewrite it to codex's long-form
+// `--config` (cjadk passes unknown options through), keeping the session-env channel.
+describe('codex adapter × cjadk wrapper (cjadk -c/--command collision)', () => {
+  const codex = createCodexAdapter('/usr/bin/codex');
+
+  const BOTMUX_OVERRIDE_RE = /^shell_environment_policy\.set\.BOTMUX_/;
+  const findConfigOverride = (args: ReadonlyArray<string>, flag: string): string | undefined => {
+    const i = args.findIndex((a, j) => a === flag && BOTMUX_OVERRIDE_RE.test(args[j + 1] ?? ''));
+    return i === -1 ? undefined : args[i + 1];
+  };
+
+  it('cjadk codex rewrites the botmux -c override to --config (fresh launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(out.bin).toBe('cjadk');
+    // No bare `-c` survives (would collide with cjadk's --command); the override now rides --config.
+    expect(findConfigOverride(out.args, '-c')).toBeUndefined();
+    expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+  });
+
+  it('cjadk codex rewrites the botmux -c override to --config (resume launch)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-uuid' });
+    expect(args).toContain('resume');               // sanity: exercised the resume branch
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(findConfigOverride(out.args, '-c')).toBeUndefined();
+    expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
+    expect(out.args).toContain('codex-uuid');        // resume target survives
+  });
+
+  it('cjadk codex forwards the cwd trust preseed through --config on a fresh launch', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(out.args).toContain('--config');
+    expect(out.args).toContain('projects={"/repo"={trust_level="trusted"}}');
+    // It must ride --config, never a bare -c (cjadk --command collision).
+    const idx = out.args.indexOf('projects={"/repo"={trust_level="trusted"}}');
+    expect(out.args[idx - 1]).toBe('--config');
+  });
+});
+
+describe('isTtadkWrapper / ttadkAcceptsModel', () => {
+  it('detects the ttadk prefix only', () => {
+    expect(isTtadkWrapper('ttadk claude')).toBe(true);
+    expect(isTtadkWrapper('ttadk coco')).toBe(true);
+    expect(isTtadkWrapper('cjadk claude')).toBe(false);
+    expect(isTtadkWrapper('aiden x claude')).toBe(false);
+    expect(isTtadkWrapper('')).toBe(false);
+    expect(isTtadkWrapper(undefined)).toBe(false);
+  });
+
+  it('reports which ttadk subcommands accept -m', () => {
+    expect(ttadkAcceptsModel('ttadk claude')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk cursor-cli')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk gemini')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk coco')).toBe(false);
+    expect(ttadkAcceptsModel('cjadk claude')).toBe(false);
+    expect(ttadkAcceptsModel(undefined)).toBe(false);
+  });
+});
+
+describe('ttadkConfigModelChoices', () => {
+  it('returns the ttadk model suggestions for a managed-model ttadk bot', () => {
+    expect(ttadkConfigModelChoices('ttadk claude')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+    expect(ttadkConfigModelChoices('ttadk cursor-cli')).toEqual([...TTADK_MODEL_SUGGESTIONS]);
+  });
+
+  it('returns an empty list for ttadk CoCo (no model dropdown)', () => {
+    expect(ttadkConfigModelChoices('ttadk coco')).toEqual([]);
+  });
+
+  it('returns null for non-ttadk bots so callers fall back to the adapter choices', () => {
+    expect(ttadkConfigModelChoices('cjadk claude')).toBeNull();
+    expect(ttadkConfigModelChoices('aiden x claude')).toBeNull();
+    expect(ttadkConfigModelChoices(undefined)).toBeNull();
+    expect(ttadkConfigModelChoices('')).toBeNull();
+  });
+});
+
+describe('decorateResumeForWrapper', () => {
+  it('rewrites the leading bin to the wrapper prefix', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', 'aiden x claude')).toBe('aiden x claude --resume ID');
+    expect(decorateResumeForWrapper('codex resume ID', 'aiden x codex')).toBe('aiden x codex resume ID');
+  });
+
+  it('returns the command unchanged when no wrapper is set', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', undefined)).toBe('claude --resume ID');
+    expect(decorateResumeForWrapper('claude --resume ID', '   ')).toBe('claude --resume ID');
+  });
+
+  it('keeps ttadk non-interactive flags (-m / --skip-check) in the resume command', () => {
+    expect(decorateResumeForWrapper('claude --resume ID', 'ttadk claude', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk claude -m glm-5.1 --skip-check --resume ID');
+  });
+
+  it('uses the default ttadk model in the resume command when none is set', () => {
+    expect(decorateResumeForWrapper('codex resume ID', 'ttadk codex'))
+      .toBe(`ttadk codex -m ${TTADK_DEFAULT_MODEL} --skip-check resume ID`);
+  });
+
+  it('omits -m for ttadk CoCo resume (still adds --skip-check)', () => {
+    expect(decorateResumeForWrapper('coco --resume ID', 'ttadk coco', { ttadkModel: 'glm-5.1' }))
+      .toBe('ttadk coco --skip-check --resume ID');
+  });
+});
+
+describe('Codex model-nudge override through wrappers', () => {
+  const override = 'notice.hide_rate_limit_model_nudge=true';
+  it.each([
+    { wrapper: 'aiden x codex', flag: null },
+    { wrapper: 'cjadk codex', flag: '--config' },
+    { wrapper: 'ttadk codex', flag: '-c' },
+  ])('$wrapper handles the enabled override without breaking launch', ({ wrapper, flag }) => {
+    for (const resume of [false, true]) {
+      const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+        sessionId: 'session', resume, resumeSessionId: 'existing-thread',
+        hideRateLimitModelNudge: true,
+      });
+      expect(args).toContain(override);
+      const out = buildWrappedLaunch(wrapper, args);
+      if (flag === null) {
+        expect(out.args).not.toContain(override);
+        expect(out.args).not.toContain('-c');
+        expect(out.args).not.toContain('--config');
+      } else {
+        expect(out.args).toContain(override);
+        expect(out.args[out.args.indexOf(override) - 1]).toBe(flag);
+        if (flag === '--config') expect(out.args).not.toContain('-c');
+      }
+      expect(out.args).toContain('--no-alt-screen');
+      if (resume) expect(out.args).toContain('existing-thread');
+    }
+  });
+
+  it.each(['aiden x codex', 'cjadk codex', 'ttadk codex'])(
+    '%s leaves user-provided notice overrides untouched', (wrapper) => {
+      const userArgs = ['-c', 'notice.hide_rate_limit_model_nudge=false'];
+      expect(buildWrappedLaunch(wrapper, userArgs).args.slice(-2)).toEqual(userArgs);
+    },
+  );
+
+  it('ttadk coco preserves the model-nudge long config option across fresh and resume launches', () => {
+    for (const resume of [false, true]) {
+      for (const enabled of [false, true]) {
+        const args = createCocoAdapter('/usr/bin/coco').buildArgs({
+          sessionId: 'coco-session', resume, model: 'coco-model', hideRateLimitModelNudge: enabled,
+        });
+        const out = buildWrappedLaunch('ttadk coco', args);
+        expect(out.args).toEqual(['coco', '--skip-check', ...args]);
+        expect(out.args.includes('notice.hide_rate_limit_model_nudge=true')).toBe(enabled);
+        if (enabled) {
+          expect(out.args[out.args.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('--config');
+        }
+        expect(out.args).toContain('model.name=coco-model');
+      }
+    }
+  });
+});

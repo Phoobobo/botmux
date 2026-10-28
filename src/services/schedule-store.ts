@@ -1,11 +1,51 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync, statSync, watch } from 'node:fs';
-import { join, dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from '../core/dashboard-events.js';
-import { computeInputHash } from '../workflows/events/idempotency.js';
-import type { ScheduledTask, ParsedSchedule } from '../types.js';
+import { computeInputHash } from '../utils/canonical-input-hash.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
+import { botHomePath } from '../adapters/cli/read-isolation.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduleUntilDone } from '../types.js';
+import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
+import {
+  absorbLegacyFailureStats,
+  normalizeScheduleNotify,
+  normalizeUntilDone,
+  recordRunOutcome,
+  SCHEDULE_FAILING_THRESHOLD,
+  settleUntilDoneRun,
+  settleUntilDoneSkip,
+} from './schedule-until-done.js';
+
+/** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
+ *  here because this module is the storage layer and must not depend on the CLI
+ *  adapter services. */
+export type ScheduleReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+
+const SCHEDULE_REASONING_EFFORTS: readonly ScheduleReasoningEffort[] = [
+  'low', 'medium', 'high', 'xhigh', 'max', 'ultra',
+];
+
+export function isScheduleReasoningEffort(value: unknown): value is ScheduleReasoningEffort {
+  return typeof value === 'string'
+    && SCHEDULE_REASONING_EFFORTS.includes(value as ScheduleReasoningEffort);
+}
 
 // ─── Idempotency types (events doc v0.1.2 §2.2) ─────────────────────────────
 
@@ -42,9 +82,8 @@ export class IdempotencyConflictError extends Error {
  *
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
- *   - `chatType` (advisory, derived)
  *   - `creator*` (audit metadata, not input)
- *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastRunId`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
@@ -57,20 +96,39 @@ export class IdempotencyConflictError extends Error {
  * canonical input freezes the resolved schedule shape (`parsed.kind` and
  * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
-function canonicalScheduleInput(t: {
+export function canonicalScheduleInput(t: {
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed?: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
+  chatType?: 'group' | 'p2p' | 'topic_group';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   larkAppId?: string;
   repeat?: { times: number | null; completed?: number };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
+  followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
+  /** Human creator whose scheduled turns authenticate workflow commands (see
+   *  scheduled-turn-provenance). Part of canonical input: the same workflow
+   *  attempt run as a different creator is a different schedule. */
+  ownerOpenId?: string;
+  untilDone?: Pick<ScheduleUntilDone, 'deadline' | 'retryMinutes'>;
+  notify?: readonly ScheduleNotifyEvent[];
 }): unknown {
+  const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
+    calendar: t.calendar,
+    calendarDayType: t.calendar && t.calendarDayType !== 'workday' ? t.calendarDayType : undefined,
     name: t.name,
     schedule: t.schedule,
     parsed: t.parsed
@@ -86,23 +144,151 @@ function canonicalScheduleInput(t: {
       : undefined,
     prompt: t.prompt,
     workingDir: t.workingDir,
-    chatId: t.chatId,
+    chatId: targets.chatId,
+    // Keep this absent for old and single-chat tasks. `computeInputHash`
+    // drops the undefined property, preserving their historical canonical
+    // JSON and hash byte-for-byte; multi-chat routing remains canonical input.
+    chatIds: targets.chatIds,
+    // This changes how the future worker session replies (especially P2P), so
+    // it is provider input rather than advisory display metadata.
+    chatType: t.chatType,
     rootMessageId: t.rootMessageId,
     scope: t.scope,
+    executionPosition: t.executionPosition,
+    topicTitle: t.topicTitle,
     larkAppId: t.larkAppId,
     // Strip `completed` — it mutates after the task starts running, but
     // `times` is the durable user intent.
     repeat: t.repeat ? { times: t.repeat.times } : undefined,
-    deliver: t.deliver ?? 'origin',
+    deliver: t.deliver === 'local' ? 'local' : 'origin',
+    // `silent: false`/absent normalizes to undefined (dropped by
+    // computeInputHash) so pre-existing tasks keep their canonical hash.
+    silent: t.silent === true ? true : undefined,
+    followActive: t.followActive === true ? true : undefined,
+    // Which model this task's runs ask for is caller input, not runtime state.
+    // Absent on every pre-existing task, so `computeInputHash` drops both slots
+    // and their canonical JSON stays byte-for-byte what it was.
+    model: t.model?.trim() || undefined,
+    reasoningEffort: t.reasoningEffort,
+    // Absent/blank on every pre-existing and ownerless task, so the undefined
+    // slot is dropped by computeInputHash and their canonical JSON is
+    // byte-for-byte unchanged.
+    ownerOpenId: t.ownerOpenId?.trim() || undefined,
+    // Until-done configuration is caller intent; its runtime state (status,
+    // attempts, closing-run bookkeeping) is not. Both are absent on every
+    // pre-existing task, so their canonical JSON stays byte-for-byte the same.
+    untilDone: t.untilDone
+      ? { deadline: t.untilDone.deadline, retryMinutes: t.untilDone.retryMinutes }
+      : undefined,
+    notify: t.notify?.length ? [...t.notify] : undefined,
   };
 }
 
-let tasks: Map<string, ScheduledTask> = new Map();
-let loaded = false;
-let cachedMtime = 0;
+export interface ScheduleChatTargets {
+  chatId: string;
+  chatIds?: string[];
+}
 
-function getFilePath(): string {
-  return join(config.session.dataDir, 'schedules.json');
+/** Normalize caller-controlled schedule targets without changing the legacy
+ * single-chat storage shape. When `chatIds` is supplied it is authoritative:
+ * values are trimmed and deduplicated in order, and its first entry becomes
+ * the compatibility `chatId`. `null` explicitly collapses an update to its
+ * supplied/fallback `chatId`. */
+export function normalizeScheduleChatTargets(input: {
+  chatId: string;
+  chatIds?: readonly string[] | null;
+}): ScheduleChatTargets {
+  if (input.chatIds === undefined || input.chatIds === null) {
+    if (typeof input.chatId !== 'string' || !input.chatId.trim()) {
+      throw new TypeError('chat_id_required');
+    }
+    return { chatId: input.chatId.trim() };
+  }
+
+  if (!Array.isArray(input.chatIds)) throw new TypeError('invalid_chat_ids');
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input.chatIds) {
+    if (typeof raw !== 'string' || !raw.trim()) throw new TypeError('invalid_chat_ids');
+    const chatId = raw.trim();
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    unique.push(chatId);
+  }
+  if (unique.length === 0) throw new TypeError('chat_id_required');
+  return unique.length === 1
+    ? { chatId: unique[0] }
+    : { chatId: unique[0], chatIds: unique };
+}
+
+/** Effective dispatch targets for both legacy/single-chat and multi-chat rows. */
+export function effectiveScheduleChatIds(
+  task: Pick<ScheduledTask, 'chatId' | 'chatIds'>,
+): string[] {
+  const targets = normalizeScheduleChatTargets({ chatId: task.chatId, chatIds: task.chatIds });
+  return targets.chatIds ? [...targets.chatIds] : [targets.chatId];
+}
+
+// ─── Per-bot store scope ─────────────────────────────────────────────────────
+//
+// Schedules are stored PER BOT inside each bot's BOT_HOME
+// (`<botmuxHome>/bots/<appId>/schedules.json`) instead of one shared
+// `data/schedules.json`. Why: the bot's own BOT_HOME is already readWrite
+// inside the file sandbox while sibling BOT_HOMEs are denied by construction —
+// so a sandboxed `botmux schedule add` can take the RMW sibling lock
+// (`schedules.json.lock`) on BOTH platforms without any policy special-case,
+// and one bot's task prompts/routing are no longer readable by every other
+// sandboxed bot (the leak the old shared-file grant had to accept).
+//
+// Callers bind the store to one bot before use: the daemon binds its own bot
+// at startup, the CLI binds the session's bot (or an explicit --lark-app-id).
+// Cross-bot reads/writes stay possible for UNsandboxed callers via the
+// explicit-appId variants below; inside a sandbox they fail closed (EPERM).
+
+interface FileState {
+  tasks: Map<string, ScheduledTask>;
+  loaded: boolean;
+  version: string;
+}
+
+const fileStates = new Map<string, FileState>();
+let scopeAppId: string | null = null;
+
+/** Bind the store's default file to one bot. Daemon: own bot at startup.
+ *  CLI: the session's bot / explicit --lark-app-id before any store call. */
+export function setScheduleScope(appId: string): void {
+  scopeAppId = appId;
+}
+
+export function getScheduleScope(): string | null {
+  return scopeAppId;
+}
+
+function requireScope(): string {
+  if (!scopeAppId) {
+    throw new Error(
+      '[schedule-store] no bot scope bound — call setScheduleScope(<larkAppId>) before using the schedule store',
+    );
+  }
+  return scopeAppId;
+}
+
+/** The per-bot schedules file: `<botmuxHome>/bots/<appId>/schedules.json`. */
+export function scheduleFilePathFor(appId: string): string {
+  return join(botHomePath(dirname(config.session.dataDir), appId), 'schedules.json');
+}
+
+function getFilePath(appId?: string): string {
+  return scheduleFilePathFor(appId ?? requireScope());
+}
+
+function stateFor(fp: string): FileState {
+  let s = fileStates.get(fp);
+  if (!s) {
+    s = { tasks: new Map(), loaded: false, version: 'missing' };
+    fileStates.set(fp, s);
+  }
+  return s;
 }
 
 function getOutputDir(): string {
@@ -115,6 +301,19 @@ export function getTaskOutputDir(taskId: string): string {
 
 function ensureDir(d: string): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
+}
+
+function fileVersion(fp: string): string {
+  try {
+    const stat = statSync(fp);
+    // Atomic rename can replace a file without advancing mtime on coarse
+    // filesystems. Include inode/size/ctime so a stale process notices the
+    // replacement before serving another read.
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') return 'missing';
+    throw err;
+  }
 }
 
 /**
@@ -138,80 +337,335 @@ function migrate(raw: any): ScheduledTask | null {
     }
   }
 
+  const executionPosition: ScheduleExecutionPosition | undefined =
+    raw.executionPosition === 'top-level' || raw.executionPosition === 'topic' || raw.executionPosition === 'new-topic' || raw.executionPosition === 'task'
+      ? raw.executionPosition
+      : raw.deliver === 'new-topic'
+        ? 'new-topic'
+        : undefined;
+  let targets: ScheduleChatTargets;
+  try {
+    targets = normalizeScheduleChatTargets({
+      chatId: raw.chatId,
+      chatIds: raw.chatIds,
+    });
+  } catch (error) {
+    // `chatIds` is additive metadata. A malformed manually-written value must
+    // not make one row empty the entire schedules file; retain the legacy
+    // primary target when that field is still usable.
+    targets = normalizeScheduleChatTargets({ chatId: raw.chatId });
+    logger.warn(
+      `[schedule-store] Ignoring invalid chatIds for task ${String(raw.id)}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
   return {
     id: raw.id,
+    // Preserve malformed bindings so runtime fails closed instead of dropping the gate.
+    calendar: raw.calendar,
+    calendarDayType: raw.calendarDayType,
+    lastCalendarCheck: raw.lastCalendarCheck,
+    manualRunRequested: raw.manualRunRequested === true ? true : undefined,
+    preconditionRef: typeof raw.preconditionRef === 'string' && raw.preconditionRef
+      ? raw.preconditionRef
+      : undefined,
     name: raw.name,
     schedule: raw.schedule,
     parsed,
     prompt: raw.prompt,
     workingDir: raw.workingDir,
-    chatId: raw.chatId,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
     rootMessageId: raw.rootMessageId,
+    scope: raw.scope === 'thread' || raw.scope === 'chat' ? raw.scope : undefined,
+    executionPosition,
+    topicTitle: typeof raw.topicTitle === 'string' && raw.topicTitle.trim()
+      ? Array.from(raw.topicTitle.trim()).slice(0, 200).join('')
+      : undefined,
     chatType: raw.chatType,
     larkAppId: raw.larkAppId,
     creatorChatId: raw.creatorChatId,
     creatorRootMessageId: raw.creatorRootMessageId,
     creatorLarkAppId: raw.creatorLarkAppId,
+    // Creator identity is rebuilt field-by-field like everything else here, so
+    // it has to be listed explicitly: without these two lines `createTask`
+    // persists them but every reload (daemon restart, external `schedule add`
+    // bumping the file version) drops them, and the task silently degrades to
+    // "no creator".
+    ownerOpenId: raw.ownerOpenId,
+    ownerUnionId: raw.ownerUnionId,
+    // Same trap as the creator pair above: a claim that is not rebuilt here is
+    // dropped on the next reload and the task falls back to having no identity.
+    runAsClaim: parseScheduleRunAsClaim(raw.runAsClaim),
     enabled: raw.enabled !== false,
+    disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
+      ? raw.disabledReason
+      : undefined,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
     lastStatus: raw.lastStatus,
+    lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
+    // #2334 shipped the admin-DM watermark top-level; it stays there (written
+    // at settlement, not gated on delivery). The old top-level counter is gone
+    // from the model — absorbLegacyFailureStats folds it into the ledger.
+    failureAlertSent: raw.failureAlertSent === true ? true : undefined,
     repeat: raw.repeat,
-    deliver: raw.deliver ?? 'origin',
+    deliver: raw.deliver === 'local' ? 'local' : 'origin',
+    silent: raw.silent === true ? true : undefined,
+    followActive: raw.followActive === true ? true : undefined,
+    // Rebuilt explicitly like every other field here: omitting them would let
+    // `createTask` persist a per-task model and then have the next reload drop
+    // it, so the task silently degrades back to the bot's model (the exact way
+    // `ownerOpenId` broke once). A hand-edited junk value is dropped rather
+    // than carried to fire time, where it could only produce a CLI error.
+    model: typeof raw.model === 'string' && raw.model.trim() ? raw.model.trim() : undefined,
+    reasoningEffort: isScheduleReasoningEffort(raw.reasoningEffort) ? raw.reasoningEffort : undefined,
+    // Rebuilt explicitly for the same reason as the fields above: a reload must
+    // not silently drop the ledger or turn an until-done task into a plain one.
+    // absorbLegacyFailureStats also folds #2334's persisted top-level
+    // `consecutiveFailures` into the ledger so an upgrade never resets a streak.
+    runStats: absorbLegacyFailureStats(raw.runStats, raw.consecutiveFailures),
+    untilDone: normalizeUntilDone(raw.untilDone),
+    notify: normalizeScheduleNotify(raw.notify),
   };
 }
 
-function load(): void {
-  ensureDir(dirname(getFilePath()));
-  const fp = getFilePath();
-  let currentMtime = 0;
-  if (existsSync(fp)) {
-    try { currentMtime = statSync(fp).mtimeMs; } catch { /* ignore */ }
-  }
-
-  // Reload if file has been modified externally (e.g. by `botmux schedule add`)
-  // or on first load.
-  if (loaded && currentMtime === cachedMtime) return;
-
-  tasks = new Map();
-  if (existsSync(fp)) {
-    try {
-      const data = JSON.parse(readFileSync(fp, 'utf-8'));
-      let migratedCount = 0;
-      for (const [id, raw] of Object.entries(data)) {
-        const migrated = migrate(raw);
-        if (migrated) {
-          tasks.set(id, migrated);
-          if (!(raw as any).parsed) migratedCount++;
-        }
-      }
-      if (!loaded) {
-        logger.info(`Loaded ${tasks.size} scheduled tasks from ${fp}${migratedCount ? ` (migrated ${migratedCount} legacy)` : ''}`);
-      } else {
-        logger.info(`[schedule-store] Reloaded ${tasks.size} tasks (file mtime changed)`);
-      }
-      if (migratedCount > 0) save(); // persist migration
-    } catch (err) {
-      logger.error(`Failed to load schedules: ${err}`);
-      tasks = new Map();
-    }
-  }
-  cachedMtime = currentMtime;
-  loaded = true;
+interface DiskSnapshot {
+  map: Map<string, ScheduledTask>;
+  migratedCount: number;
 }
 
-function save(): void {
-  ensureDir(dirname(getFilePath()));
-  const fp = getFilePath();
-  const tmpFp = fp + '.tmp';
+function readDiskSnapshot(fp: string, strict: boolean): DiskSnapshot {
+  const map = new Map<string, ScheduledTask>();
+  if (!existsSync(fp)) return { map, migratedCount: 0 };
+
+  try {
+    const data = JSON.parse(readFileSync(fp, 'utf-8'));
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('schedules.json root must be an object');
+    }
+    let migratedCount = 0;
+    for (const [id, raw] of Object.entries(data)) {
+      const migrated = migrate(raw);
+      if (migrated) {
+        map.set(id, migrated);
+        if (!(raw as any).parsed) migratedCount++;
+      }
+    }
+    return { map, migratedCount };
+  } catch (err) {
+    if (strict) throw err;
+    logger.error(`Failed to load schedules: ${err}`);
+    return { map: new Map(), migratedCount: 0 };
+  }
+}
+
+function serializeTasks(map: ReadonlyMap<string, ScheduledTask>): string {
   const obj: Record<string, ScheduledTask> = {};
-  for (const [k, v] of tasks) obj[k] = v;
-  writeFileSync(tmpFp, JSON.stringify(obj, null, 2), 'utf-8');
-  renameSync(tmpFp, fp);
-  try { cachedMtime = statSync(fp).mtimeMs; } catch { /* ignore */ }
+  for (const [id, task] of map) obj[id] = task;
+  return JSON.stringify(obj, null, 2);
+}
+
+/** Rewrite the untrusted JSON projection from a host-authoritative task row.
+ * This intentionally bypasses create idempotency: the authority store owns the
+ * exact runtime state and the projection is merely repaired to match it. */
+export function projectAuthoritativeTask(task: ScheduledTask, appId?: string): void {
+  mutateTasks(working => {
+    working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId ?? task.larkAppId);
+}
+
+/** Remove only the JSON projection. A protected tombstone remains in the
+ * authority database, preventing task-id reuse or legacy downgrade. */
+export function removeAuthoritativeTaskProjection(id: string, appId?: string): void {
+  mutateTasks(working => {
+    const changed = working.delete(id);
+    return { result: undefined, changed };
+  }, appId);
+}
+
+export function replaceAuthoritativeProjection(tasks: readonly ScheduledTask[], appId?: string): void {
+  mutateTasks(working => {
+    working.clear();
+    for (const task of tasks) working.set(task.id, structuredClone(task));
+    return { result: undefined, changed: true };
+  }, appId);
+}
+
+// Deliberately inert outside Vitest. This lets the durability regression test
+// inject a failure after the temp file is fsynced but before the atomic rename,
+// without weakening or monkey-patching Node's filesystem API in production.
+let beforeRenameTestHook: (() => void) | undefined;
+export function __setScheduleStoreBeforeRenameTestHook(hook?: () => void): void {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error('schedule-store persistence hook is test-only');
+  }
+  beforeRenameTestHook = hook;
+}
+
+/**
+ * Crash-durable replace. The random O_EXCL temp prevents two writers from
+ * sharing a staging file; the caller's schedules.json lock serializes the
+ * reload/mutate/commit transaction. The old file remains authoritative until
+ * rename, and the parent fsync makes the rename durable before callers see the
+ * new in-memory snapshot.
+ */
+function persistDiskSnapshot(fp: string, map: ReadonlyMap<string, ScheduledTask>): void {
+  const parent = dirname(fp);
+  ensureDir(parent);
+  const tmpFp = join(
+    parent,
+    `.${basename(fp)}.tmp.${process.pid}.${randomBytes(8).toString('hex')}`,
+  );
+  let fd: number | undefined;
+  let renamed = false;
+  try {
+    fd = openSync(
+      tmpFp,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    writeFileSync(fd, serializeTasks(map), 'utf-8');
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    beforeRenameTestHook?.();
+    renameSync(tmpFp, fp);
+    renamed = true;
+    fsyncDirectorySyncPortable(parent);
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+    if (!renamed) {
+      try { unlinkSync(tmpFp); } catch { /* absent or already cleaned */ }
+    }
+  }
+}
+
+function installSnapshot(map: Map<string, ScheduledTask>, fp: string): void {
+  const s = stateFor(fp);
+  s.tasks = map;
+  s.version = fileVersion(fp);
+  s.loaded = true;
+}
+
+interface MutationResult<T> {
+  result: T;
+  changed: boolean;
+}
+
+/**
+ * Every schedules.json mutation goes through one cross-process transaction:
+ * lock -> force reload -> mutate an isolated map -> durable replace -> publish
+ * to memory. A failed write therefore cannot create an in-memory ghost, and a
+ * stale daemon/CLI process cannot overwrite another process's newer update.
+ */
+function mutateTasks<T>(
+  mutate: (working: Map<string, ScheduledTask>) => MutationResult<T>,
+  appId?: string,
+): T {
+  const fp = getFilePath(appId);
+  ensureDir(dirname(fp));
+  return withFileLockSync(fp, () => {
+    const working = readDiskSnapshot(fp, true).map;
+    const outcome = mutate(working);
+    if (outcome.changed) persistDiskSnapshot(fp, working);
+    // Install only after the commit succeeds. No-op/idempotent mutations still
+    // refresh a stale process from the authoritative disk snapshot.
+    installSnapshot(working, fp);
+    return outcome.result;
+  });
+}
+
+function load(appId?: string): void {
+  const fp = getFilePath(appId);
+  ensureDir(dirname(fp));
+  const state = stateFor(fp);
+  const currentVersion = fileVersion(fp);
+
+  // Reload if the file has been atomically replaced externally (e.g. by
+  // `botmux schedule add`) or on first load.
+  if (state.loaded && currentVersion === state.version) return;
+
+  const snapshot = readDiskSnapshot(fp, false);
+  let nextMap = snapshot.map;
+
+  // Persist legacy normalization under the same mutation lock. Re-read inside
+  // the lock so migration cannot overwrite a concurrent modern writer.
+  if (snapshot.migratedCount > 0) {
+    try {
+      nextMap = withFileLockSync(fp, () => {
+        const current = readDiskSnapshot(fp, true);
+        if (current.migratedCount > 0) persistDiskSnapshot(fp, current.map);
+        return current.map;
+      });
+    } catch (err) {
+      // Reading remains backward compatible even if the optional normalization
+      // write fails. Future mutations still fail closed on malformed storage.
+      logger.error(`[schedule-store] Failed to persist legacy migration: ${err}`);
+      // A different process may have committed between our optimistic read and
+      // lock acquisition. Never pair that newer file version with the stale
+      // pre-lock map, or this process could serve stale data indefinitely.
+      nextMap = readDiskSnapshot(fp, false).map;
+    }
+  }
+
+  if (!state.loaded) {
+    logger.info(
+      `Loaded ${nextMap.size} scheduled tasks from ${fp}` +
+      `${snapshot.migratedCount ? ` (migrated ${snapshot.migratedCount} legacy)` : ''}`,
+    );
+  } else {
+    logger.info(`[schedule-store] Reloaded ${nextMap.size} tasks (file changed)`);
+  }
+  installSnapshot(nextMap, fp);
+}
+
+/** Allowed task id alphabet/width. Producers are the 8-hex legacy ids and the
+ *  workflow idempotency keys (`wf_`/`wf3_` + truncated sha256 hex, width 50);
+ *  task ids are used as schedules.json keys and per-task output-dir segments,
+ *  so anything outside [0-9a-z_] (path separators, dots, spaces) is rejected
+ *  up front. */
+const TASK_ID_RE = /^[0-9a-z_]{1,50}$/;
+
+/** 周期任务连续失败达到此次数后发出一次管理员告警（成功即清零）。
+ *  #2334 引入的名字，与 owner 通知（--notify failing）的判定阈值统一为
+ *  同一个常量：两套通知共用一段失败串，不允许多两套阈值漂移。保留导出名
+ *  作为兼容别名。 */
+export const SCHEDULE_FAILURE_ALERT_THRESHOLD = SCHEDULE_FAILING_THRESHOLD;
+
+/**
+ * 连续失败计数 / 告警判定的唯一推进规则，schedule-store（JSON legacy 路径）
+ * 与 scheduler（authority store 生产路径）共用，避免两份实现漂移。
+ * 计数即执行账本 runStats.consecutiveFailures（唯一事实源：成功清零、失败
+ * +1，owner 侧 failingNotifiedAt 水印由 recordRunOutcome 一并维护）：
+ *  - crossedFailureThreshold 由结算前后的账本推导（after≥阈值 且 before<阈值），
+ *    每段失败串恰好越过一次，由调用方据此投递一次管理员告警；
+ *  - 管理员侧的顶层 failureAlertSent 水印（落盘即记账）与 owner 侧的
+ *    failingNotifiedAt（投递成功才记账）语义不同，由各结算点自行维护，不合并。
+ */
+export function nextFailureTracking(
+  current: ScheduleRunStats | undefined,
+  success: boolean,
+): { runStats: ScheduleRunStats; consecutiveFailures: number; crossedFailureThreshold: boolean } {
+  const runStats = recordRunOutcome(current, success ? 'dispatched' : 'failed');
+  const consecutiveFailures = runStats.consecutiveFailures;
+  const crossedFailureThreshold = !success
+    && consecutiveFailures >= SCHEDULE_FAILURE_ALERT_THRESHOLD
+    && (current?.consecutiveFailures ?? 0) < SCHEDULE_FAILURE_ALERT_THRESHOLD;
+  return { runStats, consecutiveFailures, crossedFailureThreshold };
+}
+
+function assertValidTaskId(id: string): void {
+  if (!TASK_ID_RE.test(id)) {
+    throw new TypeError(`invalid schedule task id: ${JSON.stringify(id)}`);
+  }
 }
 
 /**
@@ -232,142 +686,381 @@ function save(): void {
  */
 export function createTask(params: {
   id?: string;
+  preconditionRef?: string;
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  topicTitle?: string;
   chatType?: 'group' | 'p2p' | 'topic_group';
   larkAppId?: string;
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
+  ownerOpenId?: string;
+  ownerUnionId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
-  deliver?: 'origin' | 'local';
-}): ScheduledTask {
-  load();
-
-  if (params.id) {
-    const existing = tasks.get(params.id);
-    if (existing) {
-      const existingHash = computeInputHash(canonicalScheduleInput(existing));
-      const incomingHash = computeInputHash(canonicalScheduleInput(params));
-      if (existingHash === incomingHash) {
-        // create-or-return-identical: same id + same canonical input → no-op.
-        // Do NOT mutate `enabled`, `nextRunAt`, `lastRunAt` etc — those are
-        // runtime state that the caller has no business overwriting via the
-        // create path.  Use `updateTask` / `enableTask` for those.
-        logger.debug(
-          `[schedule-store] createTask: returning existing task ${params.id} (canonical input identical)`,
-        );
-        return existing;
+  deliver?: 'origin' | 'local' | 'new-topic';
+  silent?: boolean;
+  followActive?: boolean;
+  model?: string;
+  reasoningEffort?: ScheduleReasoningEffort;
+  /** Initial until-done state, already validated by scheduler.addTask. */
+  untilDone?: ScheduleUntilDone;
+  notify?: ScheduleNotifyEvent[];
+}, authoritativeCreate?: (task: ScheduledTask) => ScheduledTask): ScheduledTask {
+  const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
+  if (params.id) assertValidTaskId(params.id);
+  if (authoritativeCreate) {
+    // Authority owns idempotency and runtime state. Do not read or write the
+    // projection before it accepts this candidate.
+    const task: ScheduledTask = {
+      ...params,
+      chatId: targets.chatId,
+      chatIds: targets.chatIds,
+      id: params.id ?? randomUUID().substring(0, 8),
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
+      silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+    };
+    return authoritativeCreate(task);
+  }
+  // Route to the OWNING bot's file: a task explicitly created for another bot
+  // (`--lark-app-id` / dashboard admin flows) must land in that bot's store so
+  // its daemon (the only one that executes it) can see it. Sandboxed callers
+  // can only reach their own BOT_HOME — a cross-bot write fails closed (EPERM).
+  return mutateTasks(working => {
+    if (params.id) {
+      const existing = working.get(params.id);
+      if (existing) {
+        const existingHash = computeInputHash(canonicalScheduleInput(existing));
+        const incomingHash = computeInputHash(canonicalScheduleInput(params));
+        if (existingHash === incomingHash) {
+          // create-or-return-identical: same id + same canonical input → no-op.
+          // Do NOT mutate `enabled`, `nextRunAt`, `lastRunAt` etc — those are
+          // runtime state that the caller has no business overwriting via the
+          // create path.  Use `updateTask` / `enableTask` for those.
+          logger.debug(
+            `[schedule-store] createTask: returning existing task ${params.id} (canonical input identical)`,
+          );
+          return { result: existing, changed: false };
+        }
+        throw new IdempotencyConflictError({
+          taskId: params.id,
+          existingInputHash: existingHash,
+          incomingInputHash: incomingHash,
+        });
       }
-      throw new IdempotencyConflictError({
-        taskId: params.id,
-        existingInputHash: existingHash,
-        incomingInputHash: incomingHash,
-      });
+      // id given but new task — fall through to create with that id.
     }
-    // id given but new task — fall through to create with that id.
-  }
 
-  const task: ScheduledTask = {
-    id: params.id ?? randomUUID().substring(0, 8),
-    name: params.name,
-    schedule: params.schedule,
-    parsed: params.parsed,
-    prompt: params.prompt,
-    workingDir: params.workingDir,
-    chatId: params.chatId,
-    rootMessageId: params.rootMessageId,
-    scope: params.scope,
-    chatType: params.chatType,
-    larkAppId: params.larkAppId,
-    creatorChatId: params.creatorChatId,
-    creatorRootMessageId: params.creatorRootMessageId,
-    creatorLarkAppId: params.creatorLarkAppId,
-    enabled: true,
-    createdAt: new Date().toISOString(),
-    nextRunAt: params.nextRunAt,
-    repeat: params.repeat,
-    deliver: params.deliver ?? 'origin',
-  };
-  tasks.set(task.id, task);
-  save();
-  return task;
+    let id = params.id ?? randomUUID().substring(0, 8);
+    while (!params.id && working.has(id)) id = randomUUID().substring(0, 8);
+    assertValidTaskId(id);
+    const task: ScheduledTask = {
+      id,
+      preconditionRef: params.preconditionRef,
+      calendar: params.calendar,
+      calendarDayType: params.calendarDayType,
+      name: params.name,
+      schedule: params.schedule,
+      parsed: params.parsed,
+      prompt: params.prompt,
+      workingDir: params.workingDir,
+      chatId: targets.chatId,
+      chatIds: targets.chatIds,
+      rootMessageId: params.rootMessageId,
+      scope: params.scope,
+      executionPosition: params.executionPosition,
+      topicTitle: params.topicTitle,
+      chatType: params.chatType,
+      larkAppId: params.larkAppId,
+      creatorChatId: params.creatorChatId,
+      creatorRootMessageId: params.creatorRootMessageId,
+      creatorLarkAppId: params.creatorLarkAppId,
+      ownerOpenId: params.ownerOpenId,
+      ownerUnionId: params.ownerUnionId,
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      nextRunAt: params.nextRunAt,
+      repeat: params.repeat,
+      // Legacy `deliver:new-topic` is converted by scheduler.addTask into the
+      // explicit executionPosition field before reaching the store.
+      deliver: params.deliver === 'local' ? 'local' : 'origin',
+      silent: params.silent === true ? true : undefined,
+      followActive: params.followActive === true ? true : undefined,
+      model: params.model?.trim() || undefined,
+      reasoningEffort: params.reasoningEffort,
+      untilDone: params.untilDone,
+      notify: params.notify,
+    };
+    working.set(task.id, task);
+    return { result: task, changed: true };
+  }, params.larkAppId);
 }
 
-export function getTask(id: string): ScheduledTask | undefined {
-  load();
-  return tasks.get(id);
+export function getTask(id: string, appId?: string): ScheduledTask | undefined {
+  load(appId);
+  return stateFor(getFilePath(appId)).tasks.get(id);
 }
 
-export function removeTask(id: string): boolean {
-  load();
-  const existed = tasks.delete(id);
-  if (existed) {
-    save();
-    logger.info(`[schedule-store] Removed task ${id}`);
-  }
+export function removeTask(id: string, appId?: string): boolean {
+  const existed = mutateTasks(working => {
+    const removed = working.delete(id);
+    return { result: removed, changed: removed };
+  }, appId);
+  if (existed) logger.info(`[schedule-store] Removed task ${id}`);
   return existed;
 }
 
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'chatType'
-  >>,
-): void {
-  load();
-  const task = tasks.get(id);
-  if (task) {
-    Object.assign(task, updates);
-    save();
-  }
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    | 'runStats' | 'untilDone' | 'notify'
+  >> & { chatIds?: readonly string[] | null },
+  appId?: string,
+): boolean {
+  return mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: false, changed: false };
+    const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+    const targets = targetUpdate
+      ? normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          // Supplying only chatId preserves the old single-target update
+          // meaning and therefore collapses any previous multi-chat list.
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : undefined;
+    const { chatIds: _chatIds, ...ordinaryUpdates } = updates;
+    Object.assign(
+      task,
+      updates.deliver === 'new-topic'
+        ? { ...ordinaryUpdates, deliver: 'origin' as const }
+        : ordinaryUpdates,
+    );
+    // Generic enable/disable writes are operator actions. Automatic one-shot
+    // completion is written directly by markRun below so the two states remain
+    // distinguishable for exact in-flight scheduled-turn authorization.
+    if (updates.enabled === true) delete task.disabledReason;
+    else if (updates.enabled === false && updates.disabledReason === undefined) {
+      task.disabledReason = 'manual';
+    }
+    if (targets) {
+      task.chatId = targets.chatId;
+      if (targets.chatIds) task.chatIds = targets.chatIds;
+      else delete task.chatIds;
+    }
+    return { result: true, changed: true };
+  }, appId);
+}
+
+export type ScheduleRunClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' };
+
+/** Atomically claim a task for dispatch. The file lock makes this the single
+ * admission point shared by natural ticks and Dashboard run-now requests. */
+export function claimRun(
+  id: string,
+  claim: Pick<ScheduledTask, 'lastRunAt' | 'nextRunAt' | 'lastRunId'> & Partial<Pick<ScheduledTask, 'untilDone'>>,
+  appId?: string,
+): ScheduleRunClaimResult {
+  return mutateTasks<ScheduleRunClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    const manualRunRequested = task.manualRunRequested;
+    delete task.manualRunRequested;
+    Object.assign(task, claim, {
+      lastStatus: 'running' as const,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task: { ...task, manualRunRequested } } as const, changed: true };
+  }, appId);
+}
+
+/** Atomically make a task due without re-arming one that is already running. */
+export function requestRunNow(
+  id: string,
+  nextRunAt = new Date().toISOString(),
+  appId?: string,
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' }>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    if (task.enabled === false) {
+      return { result: { ok: false, error: 'disabled' } as const, changed: false };
+    }
+    task.nextRunAt = nextRunAt;
+    task.manualRunRequested = true;
+    return { result: { ok: true } as const, changed: true };
+  }, appId);
+}
+
+/** Record a skipped check without consuming a run or disabling a one-shot. */
+export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
+
+    task.lastRunAt = new Date().toISOString();
+    task.lastStatus = 'skipped';
+    task.lastError = undefined;
+    task.lastDeliveryError = undefined;
+    task.runStats = recordRunOutcome(task.runStats, 'skipped');
+    if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
+    working.set(id, settleUntilDoneSkip(task, runId, Date.now()));
+    return { result: undefined, changed: true };
+  });
 }
 
 /**
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
-  load();
-  const task = tasks.get(id);
-  if (!task) return;
-
-  const now = new Date().toISOString();
-  task.lastRunAt = now;
-  task.lastStatus = success ? 'ok' : 'error';
-  task.lastError = success ? undefined : error;
-  task.lastDeliveryError = deliveryError;
-
-  // Advance repeat counter
-  if (task.repeat) {
-    task.repeat.completed = (task.repeat.completed ?? 0) + 1;
-    const times = task.repeat.times;
-    if (times !== null && times !== undefined && times > 0 && task.repeat.completed >= times) {
-      tasks.delete(id);
-      save();
-      logger.info(`[schedule-store] Task ${id} removed after completing ${times} runs`);
-      return;
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): { removedAfterTimes?: number; crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  let crossedFailureThreshold = false;
+  let consecutiveFailures = 0;
+  const completedRepeat = mutateTasks(working => {
+    const task = working.get(id);
+    if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
     }
-  }
 
-  // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
-  if (task.parsed.kind === 'once') {
-    task.enabled = false;
-    task.nextRunAt = undefined;
+    const now = new Date().toISOString();
+    task.lastRunAt = now;
+    task.lastStatus = success ? 'ok' : 'error';
+    task.lastError = success ? undefined : error;
+    task.lastDeliveryError = deliveryError;
+
+    // Shared failure counter lives in the ledger (before any early return, so
+    // until-done settlements advance it too). Admin watermark: recorded when
+    // the row is written, unlike the owner's delivery-confirmed marker.
+    const tracking = nextFailureTracking(task.runStats, success);
+    task.runStats = tracking.runStats;
+    task.failureAlertSent = success
+      ? undefined
+      : (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined;
+    crossedFailureThreshold = tracking.crossedFailureThreshold;
+    consecutiveFailures = tracking.consecutiveFailures;
+
+    // Until-done tasks are not consumed by a run: they stay until marked done
+    // or their deadline's closing run (see schedule-until-done.ts).
+    if (task.untilDone) {
+      working.set(id, settleUntilDoneRun(task, { success, runId, nowMs: Date.parse(now) }));
+      return { result: undefined, changed: true };
+    }
+
+    // Advance repeat counter
+    if (task.repeat) {
+      task.repeat.completed = (task.repeat.completed ?? 0) + 1;
+      const times = task.repeat.times;
+      if (times !== null && times !== undefined && times > 0 && task.repeat.completed >= times) {
+        working.delete(id);
+        return { result: times, changed: true };
+      }
+    }
+
+    // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
+    if (task.parsed.kind === 'once') {
+      task.enabled = false;
+      task.disabledReason = 'once_completed';
+      task.nextRunAt = undefined;
+    }
+    return { result: undefined, changed: true };
+  });
+  if (completedRepeat !== undefined) {
+    logger.info(`[schedule-store] Task ${id} removed after completing ${completedRepeat} runs`);
   }
-  save();
+  return completedRepeat !== undefined
+    ? { removedAfterTimes: completedRepeat, crossedFailureThreshold, consecutiveFailures }
+    : { crossedFailureThreshold, consecutiveFailures };
 }
 
-export function listTasks(): ScheduledTask[] {
-  load();
-  return [...tasks.values()];
+export function listTasks(appId?: string): ScheduledTask[] {
+  load(appId);
+  return [...stateFor(getFilePath(appId)).tasks.values()];
+}
+
+/** Aggregate view across several bots' stores (unsandboxed admin CLI). Bots
+ *  whose store cannot be read (sandbox deny / missing BOT_HOME) are skipped —
+ *  callers inside a sandbox naturally collapse to their own bot. */
+export function listTasksForBots(appIds: readonly string[]): Array<ScheduledTask & { _storeAppId: string }> {
+  const out: Array<ScheduledTask & { _storeAppId: string }> = [];
+  for (const appId of appIds) {
+    try {
+      for (const t of listTasks(appId)) out.push({ ...t, _storeAppId: appId });
+    } catch { /* unreadable (sandboxed sibling / bad appId) → skip */ }
+  }
+  return out;
+}
+
+/** Bulk-insert raw task entries into one bot's store (startup split
+ *  migration). Runs the same in-file legacy normalization as a disk read;
+ *  an id already present in the destination wins (the per-bot store is newer
+ *  by definition) and the collision is logged. */
+export function importTasks(appId: string, entries: ReadonlyArray<[string, unknown]>): void {
+  if (entries.length === 0) return;
+  mutateTasks(working => {
+    let changed = false;
+    for (const [id, raw] of entries) {
+      const task = migrate(raw);
+      if (!task) continue;
+      if (working.has(id)) {
+        logger.warn(`[schedule-store] import: id ${id} already exists in ${appId}'s store — keeping existing entry`);
+        continue;
+      }
+      working.set(id, task);
+      changed = true;
+    }
+    return { result: undefined, changed };
+  }, appId);
+}
+
+/** Locate a task id across several bots' stores. First hit wins (ids are
+ *  UUID-derived; a cross-store collision is negligible and would only make an
+ *  id-addressed command pick the first store). */
+export function findTaskAcrossBots(
+  id: string,
+  appIds: readonly string[],
+): { task: ScheduledTask; appId: string } | undefined {
+  for (const appId of appIds) {
+    try {
+      const task = getTask(id, appId);
+      if (task) return { task, appId };
+    } catch { /* unreadable → skip */ }
+  }
+  return undefined;
 }
 
 /** Ensure per-task output dir exists and return path to today's run log. */
@@ -381,55 +1074,72 @@ export function appendOutputLog(taskId: string, content: string): string {
 }
 
 /**
- * Watch schedules.json for changes from external processes (e.g. `botmux
- * schedule add` running outside the daemon) and emit dashboard events for
- * the diff. Idempotent — calling twice is a no-op.
+ * Reconcile committed schedules.json changes into dashboard events, including
+ * writes made by this daemon. Idempotent — calling twice is a no-op.
  *
- * The existing `load()` already reloads when the on-disk mtime differs from
- * `cachedMtime`, so this watcher just snapshots the in-memory map, calls
- * `load()` to refresh, then diffs and publishes. fs.watch can fire multiple
- * events for one logical write — the mtime guard inside `load()` makes
- * redundant fires no-ops, and an unchanged diff produces no events anyway.
+ * Keep the publication baseline separate from the business cache: mutations
+ * and ordinary reads can refresh that cache before fs.watch runs. Comparing
+ * against it would consume changes without notifying dashboard subscribers.
+ * Reconcile on the watcher turn so synchronous compound writes/rollbacks have
+ * finished; repeated filesystem notifications produce no additional diff.
  */
 let watcherStarted = false;
 export function startExternalWriteWatcher(): void {
   if (watcherStarted) return;
   watcherStarted = true;
 
-  // Make sure the data dir + file exist before we try to watch — fs.watch on
-  // a non-existent path throws ENOENT.
-  ensureDir(dirname(getFilePath()));
+  // Watch this daemon's OWN bot store (the only one it executes/serves). Make
+  // sure the BOT_HOME + file exist before we try to watch — fs.watch on a
+  // non-existent path throws ENOENT.
   const fp = getFilePath();
+  ensureDir(dirname(fp));
   if (!existsSync(fp)) {
-    try { writeFileSync(fp, '{}', 'utf-8'); } catch { /* best effort */ }
+    try {
+      mutateTasks(working => ({ result: undefined, changed: !existsSync(fp) && working.size === 0 }));
+    } catch { /* best effort */ }
   }
-  // Prime cachedMtime so the first watcher fire is comparable.
   load();
+  // Serialized public rows are immutable even if a caller retains a task
+  // object, and never retain protected precondition references in events.
+  const snapshot = (): Map<string, string> => new Map(
+    [...stateFor(fp).tasks].map(([id, { preconditionRef, ...task }]) => [
+      id, JSON.stringify({ ...task, hasPrecondition: !!preconditionRef }),
+    ]),
+  );
+  let published = snapshot();
+  const announced = new Set(published.keys());
 
   try {
-    watch(fp, { persistent: false }, () => {
+    // Watch the directory, not the file inode: every commit atomically replaces
+    // schedules.json, so a file-level watcher would remain attached to the old
+    // inode after the first external write.
+    watch(dirname(fp), { persistent: false }, (_eventType, filename) => {
       try {
+        if (filename && filename.toString() !== basename(fp)) return;
         if (!existsSync(fp)) return;
-        const stat = statSync(fp);
-        if (stat.mtimeMs <= cachedMtime) return; // no real change since last reload
-
-        // Snapshot in-memory state, then let load() refresh from disk.
-        // load() compares mtime internally and updates cachedMtime.
-        const before = new Map<string, ScheduledTask>();
-        for (const [k, v] of tasks) before.set(k, v);
         load();
+        const current = snapshot();
+        const before = published;
+        published = current;
 
-        // Diff and publish.
-        for (const [id, t] of tasks) {
-          const prev = before.get(id);
-          if (!prev) {
-            dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: t } });
-          } else if (JSON.stringify(prev) !== JSON.stringify(t)) {
-            dashboardEventBus.publish({ type: 'schedule.updated', body: { id, patch: t } });
+        for (const [id, serialized] of current) {
+          const previous = before.get(id);
+          if (previous === serialized) continue;
+          const row = JSON.parse(serialized) as Record<string, unknown>;
+          if (!announced.has(id)) {
+            dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: row } });
+          } else {
+            // JSON omits undefined. Explicit nulls clear fields such as an old
+            // error or thread bookmark in the dashboard's merge-based cache.
+            const patch = { ...row };
+            for (const key of Object.keys(JSON.parse(previous ?? '{}'))) {
+              if (!(key in row)) patch[key] = null;
+            }
+            dashboardEventBus.publish({ type: 'schedule.updated', body: { id, patch } });
           }
         }
         for (const id of before.keys()) {
-          if (!tasks.has(id)) {
+          if (!current.has(id)) {
             dashboardEventBus.publish({ type: 'schedule.deleted', body: { id } });
           }
         }
@@ -437,8 +1147,51 @@ export function startExternalWriteWatcher(): void {
         logger.debug(`[schedule-store] watch handler error: ${err}`);
       }
     });
+    // Dashboard mutations can announce a richer row before fs.watch runs.
+    // Reconcile it with an update, not another create that would replace its
+    // presentation metadata. Track lifecycle only: a partial eager update
+    // must not consume other committed fields still awaiting publication.
+    dashboardEventBus.subscribe(event => {
+      if (event.type === 'schedule.created' && stateFor(fp).tasks.has(event.body.schedule.id)) {
+        announced.add(event.body.schedule.id);
+      } else if (event.type === 'schedule.deleted') {
+        announced.delete(event.body.id);
+      }
+    });
     logger.info(`[schedule-store] Watching ${fp} for external writes`);
   } catch (err: any) {
     logger.warn(`[schedule-store] Failed to start file watcher: ${err.message}`);
   }
+}
+
+/** Settle a calendar block without counting a model run. Matching claims only.
+ *  A calendar `error` counts as a failed ledger run and crosses the same shared
+ *  failure counter — it can trigger the admin alert too, same rule as a
+ *  dispatch failure. */
+export function markCalendarBlocked(
+  id: string,
+  check: NonNullable<ScheduledTask['lastCalendarCheck']>,
+  runId: string,
+): { crossedFailureThreshold?: boolean; consecutiveFailures?: number } {
+  let crossedFailureThreshold = false;
+  let consecutiveFailures = 0;
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task || task.lastRunId !== runId) return { result: undefined, changed: false };
+    task.lastStatus = check.status === 'error' ? 'error' : 'skipped';
+    task.lastCalendarCheck = check;
+    task.lastError = check.status === 'error' ? check.reason : undefined;
+    task.lastDeliveryError = undefined;
+    if (check.status === 'error') {
+      const tracking = nextFailureTracking(task.runStats, false);
+      task.runStats = tracking.runStats;
+      task.failureAlertSent = (task.failureAlertSent === true || tracking.crossedFailureThreshold) ? true : undefined;
+      crossedFailureThreshold = tracking.crossedFailureThreshold;
+      consecutiveFailures = tracking.consecutiveFailures;
+    } else {
+      task.runStats = recordRunOutcome(task.runStats, 'skipped');
+    }
+    return { result: undefined, changed: true };
+  });
+  return { crossedFailureThreshold, consecutiveFailures };
 }

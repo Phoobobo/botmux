@@ -1,0 +1,1939 @@
+/**
+ * scheduler-silent-execute.test.ts
+ *
+ * Behavioral tests for executeScheduledTask's silent mode (ScheduledTask.silent):
+ *  - silent thread fire: no "🕐 task started" banner / creator notice, anchor
+ *    reuses task.rootMessageId, spawned session carries a turn-exact silent id and
+ *    the CLI prompt is wrapped with the silent-schedule hint
+ *  - loud fire keeps posting the banner (control)
+ *  - explicit fresh-topic fires post their configured title and own a new anchor
+ *  - silent fresh-topic fires start at a durable virtual anchor and defer the
+ *    visible Lark root until the first botmux send
+ *  - chat-scope fires honor the bot/chat regular-group mode for flat, shared,
+ *    and independent-topic routing
+ *  - live-session injection: silent id follows the queued turn even when busy
+ *  - converted-topic regression: chat-scope task in a topic-converted group
+ *    anchors at rootMessageId (previously clobbered by the trailing
+ *    `anchor = task.chatId`) and the runtime session is promoted to thread scope
+ *
+ * forkWorker / lark client are stubbed (same pattern as
+ * dashboard-create-session.test.ts) so the routing logic runs in isolation.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { Session, ScheduledTask } from '../src/types.js';
+import type { DaemonSession } from '../src/core/types.js';
+
+// ── in-memory session store ──────────────────────────────────────────────
+const store = new Map<string, Session>();
+let sessionSeq = 0;
+const findActiveThreadSessionsByChatMock = vi.fn((_chatId: string): Session[] => []);
+const scheduleStoreUpdateTaskMock = vi.fn();
+const scheduleStoreGetTaskMock = vi.fn();
+const scheduleTasks = new Map<string, ScheduledTask>();
+vi.mock('../src/services/schedule-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/schedule-store.js')>()),
+  updateTask: (...a: any[]) => scheduleStoreUpdateTaskMock(...a),
+  getTask: (...a: any[]) => scheduleStoreGetTaskMock(...a),
+}));
+vi.mock('../src/services/session-store.js', () => ({
+  findActiveThreadSessionsByChat: (chatId: string) => findActiveThreadSessionsByChatMock(chatId),
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+  createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p'): Session => {
+    const s: Session = {
+      sessionId: `sess-${++sessionSeq}`,
+      chatId, rootMessageId, title, chatType,
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    };
+    store.set(s.sessionId, s);
+    return s;
+  }),
+  updateSession: vi.fn((s: Session) => { store.set(s.sessionId, s); }),
+  getSession: vi.fn((id: string) => store.get(id)),
+  listSessions: vi.fn(() => [...store.values()]),
+  closeSession: (...a: any[]) => sessionStoreCloseMock(...a),
+  updateSessionPid: vi.fn(),
+}));
+
+vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
+
+const sendMessageMock = vi.fn(async () => 'om_banner_123');
+const replyMessageMock = vi.fn(async () => 'om_reply_456');
+const getChatModeMock = vi.fn(async () => 'group');
+const getMessageThreadIdMock = vi.fn(async () => 'omt_target_thread');
+vi.mock('../src/im/lark/client.js', () => ({
+  sendMessage: (...a: any[]) => sendMessageMock(...a),
+  replyMessage: (...a: any[]) => replyMessageMock(...a),
+  getChatMode: (...a: any[]) => getChatModeMock(...a),
+  getMessageThreadId: (...a: any[]) => getMessageThreadIdMock(...a),
+  downloadMessageResource: vi.fn(),
+  listChatBotMembers: vi.fn(async () => []),
+  listCurrentChatBotMembers: vi.fn(async () => []),
+  resolveCurrentChatBotOpenIdsByLarkAppIds: vi.fn(async () => ({ ok: true, openIds: [] })),
+  addChatGrant: vi.fn(async () => ({ ok: true })),
+  removeChatGrant: vi.fn(async () => ({ ok: true })),
+  UserTokenMissingError: class extends Error {},
+  getMessageChatId: vi.fn(),
+}));
+
+const forkWorkerMock = vi.fn();
+const sendWorkerInputMock = vi.fn(() => true);
+const closeSessionMock = vi.fn();
+const sessionStoreCloseMock = vi.fn();
+vi.mock('../src/core/worker-pool.js', () => ({
+  forkWorker: (...a: any[]) => {
+    // Faithfully model the production queued-session transition. A loose
+    // no-op mock would hide the exact regression this suite guards: forking a
+    // parked session permanently consumes its dashboard task.
+    const ds = a[0] as DaemonSession;
+    if (ds.session.queued) {
+      ds.session.queued = false;
+      ds.session.queuedPrompt = undefined;
+      ds.session.queuedCodexAppText = undefined;
+      ds.session.queuedCodexAppMessageContext = undefined;
+      store.set(ds.session.sessionId, ds.session);
+    }
+    return forkWorkerMock(...a);
+  },
+  sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
+  forkAdoptWorker: vi.fn(),
+  adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
+  killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
+  getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
+  restoreUsageLimitRuntimeState: vi.fn(),
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
+    if (map.has(k) && map.get(k) !== ds) return false;
+    map.set(k, ds);
+    return true;
+  }),
+  setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
+  getActiveSessionsRegistry: vi.fn(() => null),
+  // Daemon.ts module-load wires a couple of registry lookups at top level.
+  findActiveBySessionId: vi.fn(() => undefined),
+  retiringWorkersForSession: vi.fn(() => []),
+  // Faithful per-key promise-chain lock (mirror of worker-pool.ts): the naive
+  // pass-through used before cannot serialize the task-position promotion race,
+  // where a contender waits behind a held key lock.
+  withActiveSessionKeyLock: vi.fn((() => {
+    const chainsByMap = new WeakMap<Map<string, any>, Map<string, Promise<unknown>>>();
+    return async (
+      map: Map<string, any>,
+      key: string,
+      action: () => any,
+    ) => {
+      let chains = chainsByMap.get(map);
+      if (!chains) {
+        chains = new Map();
+        chainsByMap.set(map, chains);
+      }
+      const previous = chains.get(key) ?? Promise.resolve();
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      const tail = previous.catch(() => { /* predecessor errors do not poison the chain */ }).then(() => hold);
+      chains.set(key, tail);
+      await previous.catch(() => { /* predecessor already reported its own error */ });
+      try {
+        return await action();
+      } finally {
+        release();
+        if (chains.get(key) === tail) chains.delete(key);
+      }
+    };
+  })()),
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  isRelayableRealSession: vi.fn((ds: DaemonSession) =>
+    (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
+  isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
+    !ds.worker
+    && !ds.pendingRepo
+    && ds.pendingPrompt === undefined
+    && ds.pendingRawInput === undefined
+    && !ds.adoptedFrom
+    && !ds.session.adoptedFrom
+    && !ds.session.queued
+    && !ds.session.cliId
+    && !ds.session.lastCliInput),
+  closeSession: (...a: any[]) => closeSessionMock(...a),
+  suspendWorker: vi.fn(),
+}));
+
+const BOT = {
+  config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp', topicUnavailablePolicy: 'legacy' as 'legacy' | 'stop' },
+  botName: 'TestBot',
+  botOpenId: 'ou_bot',
+};
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => BOT),
+  getAllBots: vi.fn(() => [BOT]),
+  getOwnerOpenId: vi.fn(() => 'ou_owner'),
+  getBotOpenId: vi.fn(() => undefined),
+  findOncallChat: vi.fn(() => undefined),
+  findOncallChatForAnyBot: vi.fn(() => undefined),
+  effectiveDefaultWorkingDir: vi.fn((cfg: any) => cfg?.defaultWorkingDir),
+}));
+
+vi.mock('../src/core/dashboard-events.js', () => ({ dashboardEventBus: { publish: vi.fn() } }));
+vi.mock('../src/core/dashboard-rows.js', () => ({
+  composeRowFromActive: vi.fn((ds: DaemonSession) => ({ sessionId: ds.session.sessionId })),
+}));
+vi.mock('../src/core/role-resolver.js', () => ({
+  resolveRole: vi.fn(() => ({ content: null, source: undefined })),
+  resolveRoleInjection: vi.fn(() => ({ content: null, source: undefined, injectMode: 'none' })),
+}));
+vi.mock('../src/services/whiteboard-store.js', () => ({
+  whiteboardEnabled: vi.fn(() => false),
+  getWhiteboard: vi.fn(),
+  ensureDefaultWhiteboard: vi.fn(),
+}));
+
+// 让 hook 模式的 preflight 通过：否则 riff 守卫的接线测试会因为 preflight false 而
+// 恒为 inline，锁不住 executeScheduledTask → buildFollowUpCliInput 的 sessionBackendType 传参。
+vi.mock('../src/adapters/hook-installer.js', () => ({
+  hasInstalledPromptHookCached: vi.fn(() => true),
+}));
+
+import { executeScheduledTask, rememberLastCliInput, restoreActiveSessions } from '../src/core/session-manager.js';
+import { recordDispatchInputCommit, foldableChatSessionAppIds } from '../src/core/dispatch.js';
+import { sessionKey } from '../src/core/types.js';
+import { writeDeferredTopicBinding, removeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
+import { config } from '../src/config.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
+import {
+  __testOnly_activeSessions as daemonActiveSessions,
+  __testOnly_promoteMaterializedTaskPositionSession as promoteTaskPositionSession,
+} from '../src/daemon.js';
+
+const APP = 'cli_app_test';
+const CHAT = 'oc_chat';
+const ROOT = 'om_root_thread';
+const refreshCliVersion = vi.fn(() => true);
+
+function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
+  const task: ScheduledTask = {
+    id: 'task0001',
+    name: '服务巡检',
+    schedule: 'every 30m',
+    parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+    prompt: '检查服务状态，挂了才报警',
+    workingDir: '/tmp',
+    chatId: CHAT,
+    larkAppId: APP,
+    enabled: true,
+    createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    ...overrides,
+  };
+  scheduleTasks.set(task.id, task);
+  return task;
+}
+
+function forkedCliInput(): string {
+  const arg = forkWorkerMock.mock.calls[0][1];
+  return typeof arg === 'string' ? arg : arg.content;
+}
+
+function forkedTurnId(): string {
+  return forkWorkerMock.mock.calls[0][2];
+}
+
+function forkedPayload(): any {
+  return forkWorkerMock.mock.calls[0][1];
+}
+
+beforeEach(() => {
+  BOT.config.topicUnavailablePolicy = 'legacy';
+  store.clear();
+  sessionSeq = 0;
+  forkWorkerMock.mockClear();
+  closeSessionMock.mockClear();
+  sessionStoreCloseMock.mockReset();
+  sessionStoreCloseMock.mockImplementation((id: string) => {
+    const session = store.get(id);
+    if (session) session.status = 'closed';
+  });
+  sendWorkerInputMock.mockClear();
+  sendWorkerInputMock.mockReturnValue(true);
+  sendMessageMock.mockClear();
+  replyMessageMock.mockClear();
+  findActiveThreadSessionsByChatMock.mockReset();
+  findActiveThreadSessionsByChatMock.mockImplementation(() => []);
+  scheduleStoreUpdateTaskMock.mockClear();
+  scheduleStoreGetTaskMock.mockReset();
+  scheduleTasks.clear();
+  scheduleStoreUpdateTaskMock.mockImplementation((id: string, patch: Partial<ScheduledTask>) => {
+    const current = scheduleTasks.get(id);
+    if (current) scheduleTasks.set(id, { ...current, ...patch });
+  });
+  scheduleStoreGetTaskMock.mockImplementation((id: string) => scheduleTasks.get(id));
+  getChatModeMock.mockClear();
+  getChatModeMock.mockResolvedValue('group');
+  getMessageThreadIdMock.mockClear();
+  getMessageThreadIdMock.mockResolvedValue('omt_target_thread');
+  delete (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode;
+});
+
+describe('retained-topic scheduled send policy', () => {
+  it.each(['TOPIC_SEND_BLOCKED', 'TOPIC_SEND_CHECK_FAILED', 'network'] as const)(
+    'does not escape into a new topic or start a worker after %s under stop', async kind => {
+      BOT.config.topicUnavailablePolicy = 'stop';
+      const failure = kind === 'network' ? new Error('provider unavailable') : new TopicSendError(kind, 'original topic unavailable');
+      replyMessageMock.mockRejectedValueOnce(failure);
+      const active = new Map<string, DaemonSession>();
+      await expect(executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion))
+        .rejects.toBe(failure);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled(); expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(0); expect(store.size).toBe(0);
+    },
+  );
+  it('preserves the legacy fallback after a failed retained-topic reply', async () => {
+    replyMessageMock.mockRejectedValueOnce(new Error('withdrawn'));
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+    expect(sendMessageMock).toHaveBeenCalledOnce(); expect(forkWorkerMock).toHaveBeenCalledOnce();
+  });
+});
+
+describe('executeScheduledTask — silent thread fire', () => {
+  it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
+    const active = new Map<string, DaemonSession>();
+    let prepared = false;
+    forkWorkerMock.mockImplementationOnce(() => { expect(prepared).toBe(true); });
+    const prepareTurnIdentity = vi.fn(async (session: DaemonSession, turnId: string) => {
+      expect(session.session.sessionId).toBe('sess-1');
+      expect(turnId).toMatch(/^schedule:task0001:/);
+      prepared = true;
+    });
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      undefined,
+      { prepareTurnIdentity },
+    );
+    expect(prepareTurnIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: 'sess-1' }) }),
+      expect.stringMatching(/^schedule:task0001:/),
+    );
+  });
+
+  it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds).toBeTruthy();
+    expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+    expect(ds.session.rootMessageId).toBe(ROOT);
+
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const input = forkedCliInput();
+    expect(input).toContain('<botmux_silent_schedule trusted="true">');
+    expect(input).toContain('检查服务状态，挂了才报警');
+    // dashboard-facing lastUserPrompt keeps the raw task prompt (no hint blob)
+    expect(ds.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('runs the turn as the task creator: identity + schedule_creator provenance on the payload', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toEqual({
+      requestUserOpenId: 'ou_creator',
+      requestUserUnionId: 'on_creator',
+      requestLarkAppId: APP,
+      senderType: 'user',
+      source: 'schedule_creator',
+      taskId: 'task0001',
+    });
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.session).toMatchObject({
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    });
+  });
+
+  it('carries no identity when the task has no creator union_id (fail closed, not "runs as the bot")', async () => {
+    const active = new Map<string, DaemonSession>();
+    // ownerOpenId alone is what legacy tasks and bot-created tasks have. It is
+    // app-scoped and deliberately not enough to act as that user.
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    expect(forkedPayload().trustedCaller).toBeUndefined();
+  });
+
+  it('loud fire (control): banner reply posted in-thread, no silent flag, no hint', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+
+    expect(replyMessageMock).toHaveBeenCalledTimes(1);
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.silentScheduledTurns).toBeUndefined();
+    expect(forkedTurnId()).toMatch(/^schedule:task0001:/);
+    expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    // Unit-level check: dispatch receipts require a live worker generation.
+    ds.session.workerGeneration = 1;
+    expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
+  });
+
+  it('loud fresh session appends per-fire context without mutating the scheduled task', async () => {
+    const active = new Map<string, DaemonSession>();
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread' });
+
+    await executeScheduledTask(task, active, refreshCliVersion, '本次仅检查支付集群');
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次仅检查支付集群';
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(forkedCliInput()).toContain(effectivePrompt);
+    expect(forkedCliInput()).not.toContain('<botmux_silent_schedule');
+    expect(ds.lastUserPrompt).toBe(task.prompt);
+    expect(ds.session.lastUserPrompt).toBe(task.prompt);
+    expect(ds.lastCliInput).toContain(effectivePrompt);
+    expect(task.prompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('silent fresh session appends per-fire context after the silent hint boundary', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      '本次仅汇总异常项',
+    );
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次仅汇总异常项';
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(forkedCliInput()).toContain('<botmux_silent_schedule trusted="true">');
+    expect(forkedCliInput()).toContain(effectivePrompt);
+    expect(ds.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(ds.session.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(ds.lastCliInput).toContain(effectivePrompt);
+  });
+});
+
+describe('executeScheduledTask — fresh-topic execution', () => {
+  it('posts the custom title and always starts an independent thread session', async () => {
+    const active = new Map<string, DaemonSession>();
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'shared';
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      topicTitle: '每日发布巡检',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, '每日发布巡检');
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(getChatModeMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+    expect(ds.hasHistory).toBe(false);
+  });
+
+  it('renders dynamic date and owner placeholders before creating the text root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      topicTitle: '{{date:-1d}} 工作总结（00:00-24:00） {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 工作总结（00:00-24:00） /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('uses the standard task-start notice when no custom title is configured', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0][2]).toContain('服务巡检');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('starts fresh-topic + silent at an isolated virtual anchor without a visible seed', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      silent: true,
+      topicTitle: '按需巡检告警',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [[key, ds]] = [...active.entries()];
+    expect(key).toMatch(/^schedule-run:task0001:[^:]+::cli_app_test$/);
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.rootMessageId).toBe(ds.session.deferredScheduleRun?.routingAnchor);
+    expect(ds.session.deferredScheduleRun).toMatchObject({
+      taskId: 'task0001',
+      turnId: forkedTurnId(),
+      topicTitle: '按需巡检告警',
+    });
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+
+  it('gives every silent fresh-topic fire a distinct session and virtual anchor', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', silent: true }), active, refreshCliVersion);
+    await executeScheduledTask(baseTask({ executionPosition: 'new-topic', silent: true }), active, refreshCliVersion);
+
+    expect(active.size).toBe(2);
+    expect(new Set([...active.values()].map(ds => ds.session.sessionId)).size).toBe(2);
+    expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
+  });
+
+  it('fails closed when a silent fresh-topic task uses a runtime title template', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'new-topic',
+      silent: true,
+      topicTitle: '{{date:-1d}} 日报 {{owner}}',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('does not render a hidden topic title after switching to top-level', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'top-level',
+      topicTitle: '{{owner}}',
+      ownerOpenId: undefined,
+    }), active, refreshCliVersion)).resolves.toBeUndefined();
+  });
+
+  it('thread task without a real root safely degrades to silent chat scope', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ scope: 'thread', silent: true }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+});
+
+describe('executeScheduledTask — task position (dedicated per-task topic)', () => {
+  const taskAnchor = `schedule-task:${'task0001'}`;
+
+  it('silent first fire owns a stable per-task virtual anchor and posts nothing', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      silent: true,
+      topicTitle: '服务日报专属话题',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(1);
+    expect(active.has(sessionKey(taskAnchor, APP))).toBe(true);
+    const ds = active.get(sessionKey(taskAnchor, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.rootMessageId).toBe(taskAnchor);
+    expect(ds.session.deferredScheduleRun).toMatchObject({
+      taskId: 'task0001',
+      turnId: forkedTurnId(),
+      routingAnchor: taskAnchor,
+      topicTitle: '服务日报专属话题',
+    });
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+
+  it('re-fires before materialization continue the SAME hidden session, with turn ownership handed over', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+    const firstTurn = forkWorkerMock.mock.calls[0][2] as string;
+    const firstSessionId = forkWorkerMock.mock.calls[0][0].session.sessionId as string;
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+
+    // No Lark root ever created, no second virtual session: both fires share one
+    // stable slot (contrast: new-topic mints a per-run anchor/session each time).
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(1);
+    expect(active.has(sessionKey(taskAnchor, APP))).toBe(true);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(2);
+    expect(forkWorkerMock.mock.calls[1][0].session.sessionId).toBe(firstSessionId);
+    const secondTurn = (forkWorkerMock.mock.calls[1][2] as { turnId: string }).turnId;
+    expect(secondTurn).not.toBe(firstTurn);
+    const ds = active.get(sessionKey(taskAnchor, APP))!;
+    // The deferred marker now belongs to the NEW turn — a first `botmux send`
+    // during turn 1 must not steal materialization ownership (turn equality).
+    expect(ds.session.deferredScheduleRun?.turnId).toBe(secondTurn);
+    expect(ds.session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
+  });
+
+  it('a hidden run keeps the scheduler run it executes, and a re-fire hands it over with the turn', async () => {
+    // A hidden run that later proves undelivered rewrites exactly this run's
+    // execution-log record (#1607).
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-first' });
+    const ds = active.get(sessionKey(taskAnchor, APP))!;
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-first');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion, undefined, { runId: 'run-second' });
+    expect(ds.session.deferredScheduleRun?.runId).toBe('run-second');
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+    expect(ds.session.deferredScheduleRun?.runId).toBeUndefined();
+  });
+
+  it('live re-fire on the hidden session injects and re-hands materialization ownership', async () => {
+    const active = new Map<string, DaemonSession>();
+    const session: Session = {
+      sessionId: 'sess-task-hidden', chatId: CHAT, rootMessageId: taskAnchor, title: 'hidden',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      scope: 'chat',
+      deferredScheduleRun: {
+        taskId: 'task0001',
+        turnId: 'schedule:task0001:oldturn',
+        routingAnchor: taskAnchor,
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+    };
+    active.set(sessionKey(taskAnchor, APP), existing);
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const turnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(session.deferredScheduleRun?.turnId).toBe(turnId);
+    expect(session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+  });
+
+  it('non-silent first fire seeds a real topic, writes the root back to the task, and forks a thread session', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      topicTitle: '每日数据库巡检',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, '每日数据库巡检');
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_banner_123' },
+      APP,
+    );
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+    expect(ds.session.deferredScheduleRun).toBeUndefined();
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders dynamic date and owner placeholders for the dedicated task root', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      topicTitle: '{{date:-1d}} 数据库巡检 {{owner}}',
+      ownerOpenId: 'ou_owner123',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    const title = sendMessageMock.mock.calls[0][2] as string;
+    expect(title).toMatch(/^\d{4}-\d{2}-\d{2} 数据库巡检 /);
+    expect(title).toContain('<at user_id="ou_owner123"></at>');
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_banner_123' },
+      APP,
+    );
+  });
+
+  it('fails closed before creating a hidden task session for a dynamic title', async () => {
+    const active = new Map<string, DaemonSession>();
+    await expect(executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      silent: true,
+      topicTitle: '{{date}} 数据库巡检',
+    }), active, refreshCliVersion)).rejects.toThrow('topic_title_template_silent_unsupported');
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.size).toBe(0);
+  });
+
+  it('non-silent first fire without a custom title seeds the standard task-start notice', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      chatType: 'group',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(sendMessageMock.mock.calls[0][2]).toContain('服务巡检');
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('non-silent first fire in a cross-chat task still notifies its creator thread', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
+        'text',
+        true,
+      );
+    });
+  });
+
+  it('concurrent rootless non-silent fires seed the topic ONCE and share its session', async () => {
+    // Two run-now clicks admitted from rootless snapshots. Without the
+    // stable per-task serialization each fire sends its own seed: the two om_
+    // anchors take different key locks, both win the registration CAS, and the
+    // task history splits across two sessions. The loser must instead re-read
+    // the winner's writeback and inject into the one session.
+    const active = new Map<string, DaemonSession>();
+    let writtenRoot: string | undefined;
+    scheduleStoreUpdateTaskMock.mockImplementation((
+      _id: string,
+      patch: { rootMessageId?: string },
+    ) => { writtenRoot = patch.rootMessageId; });
+    scheduleStoreGetTaskMock.mockImplementation((id: string, appId: string) => (
+      id === 'task0001' && appId === APP
+        ? { ...baseTask({ executionPosition: 'task' }), ...(writtenRoot ? { rootMessageId: writtenRoot } : {}) }
+        : undefined
+    ));
+
+    let seedSeq = 0;
+    let releaseSeed!: () => void;
+    const seedGate = new Promise<void>((resolve) => { releaseSeed = resolve; });
+    sendMessageMock.mockImplementation(async () => {
+      await seedGate;
+      return `om_seed_${++seedSeq}`;
+    });
+    // Model two human-paced run-now clicks: by the time B arrives, A's worker
+    // has finished its spawn handshake (production attaches ds.worker from the
+    // worker init callback, i.e. asynchronously after forkWorker returns).
+    forkWorkerMock.mockImplementation((ds: DaemonSession) => {
+      ds.worker = { killed: false, send: vi.fn() } as any;
+    });
+
+    const first = executeScheduledTask(
+      baseTask({ executionPosition: 'task', chatType: 'group' }),
+      active,
+      refreshCliVersion,
+    );
+    let second: Promise<unknown> | undefined;
+    try {
+      await flush(20);
+      // The delay bites INSIDE the race window: A holds the virtual key while
+      // parked at the seed gate.
+      expect(await settle(first)).toBe('pending');
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+
+      second = executeScheduledTask(
+        baseTask({ executionPosition: 'task', chatType: 'group' }),
+        active,
+        refreshCliVersion,
+      );
+      await flush(20);
+      // While the gate is held B is queued on the virtual key — it cannot have
+      // started a second seed of its own.
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+
+      releaseSeed();
+      await Promise.all([first, second]);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      const rootWrites = scheduleStoreUpdateTaskMock.mock.calls.filter(c => c[1]?.rootMessageId !== undefined);
+      expect(rootWrites).toEqual([['task0001', { rootMessageId: 'om_seed_1' }, APP]]);
+      expect(active.size).toBe(1);
+      const ds = active.get(sessionKey('om_seed_1', APP));
+      expect(ds).toBeTruthy();
+      expect(ds!.scope).toBe('thread');
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      // B continued A's session by live injection — no second fork/session.
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock.mock.calls[0][0]).toBe(ds);
+      expect(sendWorkerInputMock.mock.calls[0][2]).toMatch(/^schedule:task0001:/);
+    } finally {
+      releaseSeed();
+      // suite beforeEach only mockClear()s these mocks, so implementations set
+      // here must be restored for later tests.
+      sendMessageMock.mockImplementation(async () => 'om_banner_123');
+      forkWorkerMock.mockReset();
+      await Promise.allSettled([first, second].filter((p): p is Promise<unknown> => !!p));
+    }
+  });
+
+  it('a materialized task rides the ordinary thread branch: live injection at its real root, no re-seed/rewrite', async () => {
+    const active = new Map<string, DaemonSession>();
+    const session: Session = {
+      sessionId: 'sess-task-real', chatId: CHAT, rootMessageId: 'om_task_real', title: 'task topic',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      scope: 'thread',
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+    };
+    active.set(sessionKey('om_task_real', APP), existing);
+
+    await executeScheduledTask(baseTask({
+      executionPosition: 'task',
+      scope: 'thread',
+      rootMessageId: 'om_task_real',
+      silent: true,
+    }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][2]).toMatch(/^schedule:task0001:/);
+    // The root was written back when the topic materialized; fires must not rewrite it.
+    expect(scheduleStoreUpdateTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('a rootless fire snapshot that raced materialization reroutes to the promoted om_ slot instead of opening a second hidden session', async () => {
+    // Previous fire materialized and was promoted: the store now carries the
+    // real root, the live session sits at the om_ slot, and the virtual
+    // schedule-task slot was deleted. THIS fire still holds the pre-promotion
+    // task snapshot (no root). The authoritative in-lock re-check must reroute
+    // it — otherwise its later materialization would fork a second hidden
+    // session and overwrite task.rootMessageId, splitting the task's history.
+    scheduleStoreGetTaskMock.mockImplementation((id: string, appId: string) => (
+      id === 'task0001' && appId === APP
+        ? { ...baseTask({ executionPosition: 'task' }), rootMessageId: 'om_promoted_root' }
+        : undefined
+    ));
+    const promotedSession: Session = {
+      sessionId: 'sess-task-promoted', chatId: CHAT, rootMessageId: 'om_promoted_root', title: 'task topic',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      scope: 'thread',
+    };
+    store.set(promotedSession.sessionId, promotedSession);
+    const promotedDs: DaemonSession = {
+      session: promotedSession,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+    };
+    const active = new Map<string, DaemonSession>();
+    active.set(sessionKey('om_promoted_root', APP), promotedDs);
+
+    await executeScheduledTask(baseTask({ executionPosition: 'task', silent: true }), active, refreshCliVersion);
+
+    // The guard consulted the authoritative store inside the virtual-key lock.
+    expect(scheduleStoreGetTaskMock).toHaveBeenCalledWith('task0001', APP);
+    // No second hidden session at the stable virtual anchor; the map is unchanged.
+    expect(active.has(sessionKey(taskAnchor, APP))).toBe(false);
+    expect(active.size).toBe(1);
+    expect(active.get(sessionKey('om_promoted_root', APP))).toBe(promotedDs);
+    // Silent: no seed, no banner; the promoted root is never rewritten.
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(scheduleStoreUpdateTaskMock).not.toHaveBeenCalled();
+    // Continuation of the promoted live session by injection, not a new fork.
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][0]).toBe(promotedDs);
+    expect(sendWorkerInputMock.mock.calls[0][2]).toMatch(/^schedule:task0001:/);
+  });
+});
+
+describe('executeScheduledTask — silent chat-scope fire', () => {
+  it('posts no banner and anchors at chatId', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ scope: 'chat', silent: true }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+
+  it('suppresses the cross-chat creator notice too', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      scope: 'chat', silent: true,
+      creatorChatId: 'oc_other_chat', creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(CHAT, APP))).toBeTruthy();
+  });
+});
+
+describe('executeScheduledTask — chat-scope regular-group mode', () => {
+  it('cross-chat loud execution notifies the creator and still uses a target-chat trigger', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      scope: 'chat',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.any(String),
+        'text',
+        true,
+      );
+    });
+    expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String));
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    expect(active.get(sessionKey('om_banner_123', APP))?.scope).toBe('thread');
+  });
+
+  it('new-topic mode uses the top-level banner as a fresh thread/session anchor', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    expect(active.get(sessionKey(CHAT, APP))).toBeUndefined();
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+  });
+
+  it('shared mode reuses chat scope but pins this exact turn under the banner topic', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'shared';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    const turnId = forkedTurnId();
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBe('om_banner_123');
+    expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: 'om_banner_123', turnId });
+  });
+
+  it('a topic group uses the top-level banner as its thread anchor', async () => {
+    getChatModeMock.mockResolvedValue('topic');
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'topic_group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+  });
+
+  it('silent new-topic mode stays silent and chat-scoped because there is no visible trigger anchor', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group', silent: true }), active, refreshCliVersion);
+
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+  });
+});
+
+describe('executeScheduledTask — cross-target notice', () => {
+  it('links a cross-thread creator notice to the exact target topic', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      creatorChatId: CHAT,
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(getMessageThreadIdMock).toHaveBeenCalledWith(APP, ROOT);
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining(
+          'https://applink.feishu.cn/client/thread/open?open_chat_id=oc_chat&open_thread_id=omt_target_thread',
+        ),
+        'text',
+        true,
+      );
+    });
+    expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
+  });
+
+  it('links a cross-chat creator notice to the target chat', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'new-topic';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      scope: 'chat',
+      chatType: 'group',
+      creatorChatId: 'oc_creator_chat',
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
+        'text',
+        true,
+      );
+    });
+  });
+
+  it('falls back to the target chat link when topic resolution fails', async () => {
+    getMessageThreadIdMock.mockRejectedValueOnce(new Error('lookup failed'));
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      creatorChatId: CHAT,
+      creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(
+        APP,
+        'om_creator_root',
+        expect.stringContaining('https://applink.feishu.cn/client/chat/open?openChatId=oc_chat'),
+        'text',
+        true,
+      );
+    });
+  });
+});
+
+describe('executeScheduledTask — follow-active landing', () => {
+  const humanHeld = (rootMessageId: string): Session => ({
+    sessionId: `held-${rootMessageId}`, chatId: CHAT, rootMessageId, title: 'held', scope: 'thread',
+    status: 'active', createdAt: '2026-01-01T00:00:00.000Z', lastHumanMessageAt: '2026-01-01T09:00:00.000Z',
+  });
+
+  it('a moved landing point inside the creator chat is in-thread: banner there, no notice to the old topic', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: CHAT, creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+    await new Promise(r => setTimeout(r, 20));
+
+    expect(replyMessageMock).toHaveBeenCalledTimes(1);
+    expect(replyMessageMock.mock.calls[0][1]).toBe(ROOT);
+    expect(getMessageThreadIdMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))?.session.rootMessageId).toBe(ROOT);
+  });
+
+  it('control: the same shape without followActive is cross-thread — notice to the creator topic, no banner', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic',
+      creatorChatId: CHAT, creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
+    });
+    expect(replyMessageMock.mock.calls.map(c => c[1])).not.toContain(ROOT);
+  });
+
+  it('a follow-active task created from another chat still notifies its creator there', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [humanHeld(ROOT)]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: 'oc_creator_chat', creatorRootMessageId: 'om_creator_root',
+    }), active, refreshCliVersion);
+
+    await vi.waitFor(() => {
+      expect(replyMessageMock).toHaveBeenCalledWith(APP, 'om_creator_root', expect.any(String), 'text', true);
+    });
+    expect(active.get(sessionKey(ROOT, APP))).toBeTruthy();
+  });
+
+  it('a bot-only landing point yields to the topic where a human is: fires there and persists it', async () => {
+    findActiveThreadSessionsByChatMock.mockImplementation(() => [
+      { ...humanHeld(ROOT), lastHumanMessageAt: undefined },
+      humanHeld('om_human_topic'),
+    ]);
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT, scope: 'thread', executionPosition: 'topic', followActive: true,
+      creatorChatId: CHAT, creatorRootMessageId: ROOT,
+    }), active, refreshCliVersion);
+
+    expect(active.get(sessionKey('om_human_topic', APP))).toBeTruthy();
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+    expect(replyMessageMock.mock.calls.map(c => c[1])).toEqual(['om_human_topic']);
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith('task0001', { rootMessageId: 'om_human_topic' }, APP);
+  });
+});
+
+describe('executeScheduledTask — live-session injection', () => {
+  function liveSession(lastScreenStatus?: string): DaemonSession {
+    const session: Session = {
+      sessionId: 'sess-live', chatId: CHAT, rootMessageId: ROOT, title: 'live',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+    };
+    store.set(session.sessionId, session);
+    return {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp',
+      lastScreenStatus: lastScreenStatus as any,
+    };
+  }
+
+  it.each(['live', 'cold'] as const)('preserves retained routing and prompts when identity preparation rejects (%s)', async mode => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    const anchor = 'schedule-task:task0001';
+    existing.scope = 'chat';
+    existing.session.rootMessageId = anchor;
+    existing.session.cliId = 'claude-code';
+    existing.lastUserPrompt = 'previous prompt';
+    existing.session.lastCliInput = 'previous input';
+    existing.session.deferredScheduleRun = {
+      taskId: 'task0001', turnId: 'previous-turn', routingAnchor: anchor,
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    if (mode === 'cold') existing.worker = null;
+    active.set(sessionKey(anchor, APP), existing);
+    const before = structuredClone(existing.session);
+    const failure = new Error('schedule authority state is revoked; refusing identity');
+    await expect(executeScheduledTask(
+      baseTask({ executionPosition: 'task', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => { throw failure; },
+      },
+    )).rejects.toBe(failure);
+    expect(active.get(sessionKey(anchor, APP))).toBe(existing);
+    expect(existing.session).toEqual(before);
+    expect(store.get(existing.session.sessionId)).toEqual(before);
+    expect(existing.lastMessageAt).toBe(0);
+    expect(existing.lastUserPrompt).toBe('previous prompt');
+    expect(sessionStoreCloseMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('idle session: injects with the exact scheduled turn armed, no banner', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    const turnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(turnId).toMatch(/^schedule:task0001:/);
+    expect(existing.silentScheduledTurns?.has(turnId)).toBe(true);
+    const injected = sendWorkerInputMock.mock.calls[0][1];
+    const content = typeof injected === 'string' ? injected : injected.content;
+    expect(content).toContain('<botmux_silent_schedule');
+  });
+
+  it('live injection carries the creator identity in OPTS (sendWorkerInput never reads the payload)', async () => {
+    // sendWorkerInput reads trustedCaller from its 4th argument only; forkWorker
+    // reads payload ?? opts. Putting the identity on the payload type-checks and
+    // is then silently dropped — and this is the path every recurring fire after
+    // the first one takes, so the bug would read as "worked once, then quietly
+    // ran without identity".
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+      ownerUnionId: 'on_creator',
+    }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({
+      trustedCaller: {
+        requestUserOpenId: 'ou_creator',
+        requestUserUnionId: 'on_creator',
+        requestLarkAppId: APP,
+        senderType: 'user',
+        source: 'schedule_creator',
+        taskId: 'task0001',
+      },
+    });
+  });
+
+  it('live injection passes no identity when the task has no creator union_id', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({
+      rootMessageId: ROOT,
+      scope: 'thread',
+      ownerOpenId: 'ou_creator',
+    }), active, refreshCliVersion);
+
+    // Byte-for-byte the pre-change behaviour for legacy/bot-created tasks.
+    expect(sendWorkerInputMock.mock.calls[0][3]).toEqual({});
+  });
+
+  it('loud continuation appends per-fire context to the injected and remembered prompt', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread' });
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(task, active, refreshCliVersion, '本次重点检查数据库连接池');
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次重点检查数据库连接池';
+    const injected = sendWorkerInputMock.mock.calls[0][1];
+    const content = typeof injected === 'string' ? injected : injected.content;
+    expect(content).toContain(effectivePrompt);
+    expect(content).not.toContain('<botmux_silent_schedule');
+    expect(existing.lastUserPrompt).toBe(task.prompt);
+    expect(existing.session.lastUserPrompt).toBe(task.prompt);
+    expect(existing.lastCliInput).toContain(effectivePrompt);
+    expect(task.prompt).toBe('检查服务状态，挂了才报警');
+  });
+
+  it('silent continuation appends per-fire context while retaining the silent hint', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      '本次无异常时保持静默',
+    );
+
+    const effectivePrompt = '检查服务状态，挂了才报警\n\n本次无异常时保持静默';
+    const injected = sendWorkerInputMock.mock.calls[0][1];
+    const content = typeof injected === 'string' ? injected : injected.content;
+    expect(content).toContain('<botmux_silent_schedule');
+    expect(content).toContain(effectivePrompt);
+    expect(existing.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(existing.session.lastUserPrompt).toBe('检查服务状态，挂了才报警');
+    expect(existing.lastCliInput).toContain(effectivePrompt);
+  });
+
+  it('riff-backed claude-code session: scheduled fire stays inline（锁 sessionBackendType 传参）', async () => {
+    // review 要求：executeScheduledTask → buildFollowUpCliInput 必须传 sessionBackendType。
+    // 删掉该实参，旧代码（&& 短路）会让 riff 会话误进 hook 模式（reminder 不在 PTY 文本里，
+    // 远端又读不到 sidecar → reminder 丢失）。preflight 已 mock 为 true，唯一拦它的就是 riff 白名单。
+    const prev = (BOT.config as Record<string, unknown>).envelopeInjection;
+    (BOT.config as Record<string, unknown>).envelopeInjection = 'auto';
+    try {
+      const active = new Map<string, DaemonSession>();
+      const existing = liveSession('idle');
+      existing.session.cliId = 'claude-code';
+      existing.session.backendType = 'riff' as never;
+      active.set(sessionKey(ROOT, APP), existing);
+
+      await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      const injected = sendWorkerInputMock.mock.calls[0][1];
+      const content = typeof injected === 'string' ? injected : injected.content;
+      // riff 后端没有本地 hook 进程 → 必须 inline（reminder 在 PTY 文本里）
+      expect(content).toContain('<botmux_reminder>');
+    } finally {
+      (BOT.config as Record<string, unknown>).envelopeInjection = prev;
+    }
+  });
+
+  it('local-backend claude-code session + auto: scheduled fire 走 hook 模式（锁 sessionBackendType 传参）', async () => {
+    // 与上一条互补：本地后端（pty）+ auto 应走 hook 模式（reminder 不在 PTY 文本里）。
+    // 若有人删掉 executeScheduledTask 里的 sessionBackendType 实参，B3 fail-closed 会把
+    // undefined 判为非本地 → 强制 inline → reminder 出现在 PTY 文本里 → 本测试失败。
+    const prev = (BOT.config as Record<string, unknown>).envelopeInjection;
+    (BOT.config as Record<string, unknown>).envelopeInjection = 'auto';
+    try {
+      const active = new Map<string, DaemonSession>();
+      const existing = liveSession('idle');
+      existing.session.cliId = 'claude-code';
+      existing.session.backendType = 'pty' as never;
+      active.set(sessionKey(ROOT, APP), existing);
+
+      await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+      expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+      const injected = sendWorkerInputMock.mock.calls[0][1];
+      const content = typeof injected === 'string' ? injected : injected.content;
+      // 本地后端 + auto → hook 模式：reminder 进 sidecar，PTY 文本里没有
+      expect(content).not.toContain('<botmux_reminder>');
+      // #794 后续：hook 模式连 <user_message> 外壳也剥掉，PTY 文本只剩正文
+      expect(content).not.toContain('<user_message>');
+    } finally {
+      (BOT.config as Record<string, unknown>).envelopeInjection = prev;
+    }
+  });
+
+  it('busy session: arms only the queued scheduled turn without hushing the user turn', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('working');
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const turnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(existing.silentScheduledTurns?.has(turnId)).toBe(true);
+    expect(existing.silentScheduledTurns?.has('normal-user-turn')).toBe(false);
+  });
+
+  it('cold-resumes the registered worker-less session instead of losing the scheduled turn to CAS', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.session.suspendedColdResume = true;
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(store.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [, input, options] = forkWorkerMock.mock.calls[0];
+    expect(typeof input === 'string' ? input : input.content).toContain('检查服务状态，挂了才报警');
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
+    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+  });
+
+  it('falls back from a rejected live injection by re-forking the same registered session', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    active.set(sessionKey(ROOT, APP), existing);
+    sendWorkerInputMock.mockReturnValueOnce(false);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    );
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(store.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const [, , options] = forkWorkerMock.mock.calls[0];
+    expect(options.resume).toBe(true);
+    expect(options.turnId).toMatch(/^schedule:task0001:/);
+    expect(existing.silentScheduledTurns?.has(options.turnId)).toBe(true);
+  });
+
+  it('fails visibly instead of consuming a parked dashboard task', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.hasHistory = false;
+    existing.session.queued = true;
+    existing.session.queuedPrompt = '用户排进待办池的任务';
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/queued|parked|待办池/i);
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(existing.session.queued).toBe(true);
+    expect(existing.session.queuedPrompt).toBe('用户排进待办池的任务');
+    expect(store.size).toBe(1);
+  });
+
+  it('fails visibly instead of forking a pending repo/worktree setup', async () => {
+    const active = new Map<string, DaemonSession>();
+    const existing = liveSession('idle');
+    existing.worker = null;
+    existing.workerPort = null;
+    existing.workerToken = null;
+    existing.hasHistory = false;
+    existing.pendingRepo = true;
+    existing.worktreeCreating = true;
+    existing.pendingPrompt = '等待 worktree 后执行的首轮';
+    active.set(sessionKey(ROOT, APP), existing);
+
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/pending|setup|repo|worktree/i);
+
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(active.get(sessionKey(ROOT, APP))).toBe(existing);
+    expect(existing.pendingRepo).toBe(true);
+    expect(existing.worktreeCreating).toBe(true);
+    expect(existing.pendingPrompt).toBe('等待 worktree 后执行的首轮');
+  });
+});
+
+describe('executeScheduledTask — registration rejection', () => {
+  it.each([false, true])('closes an unregistered candidate when identity preparation rejects (silent=%s)', async silent => {
+    const active = new Map<string, DaemonSession>();
+    const failure = new Error('schedule authority state is paused; refusing identity');
+    const task = baseTask({ rootMessageId: ROOT, scope: 'thread', silent });
+    await expect(executeScheduledTask(task, active, refreshCliVersion, undefined, {
+      prepareTurnIdentity: async ds => {
+        expect([...active.values()]).not.toContain(ds);
+        throw failure;
+      },
+    })).rejects.toBe(failure);
+
+    expect(active.size).toBe(0);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(store.get('sess-1')?.status).toBe('closed');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+
+    // A later authorized fire must not be blocked by initialStartPending on
+    // the rejected candidate's old active registration.
+    await executeScheduledTask(task, active, refreshCliVersion);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    expect([...active.values()][0].session.sessionId).toBe('sess-2');
+  });
+
+  it('preserves a concurrent registration winner when candidate identity preparation rejects', async () => {
+    const active = new Map<string, DaemonSession>();
+    const winner = { session: { sessionId: 'sess-winner', status: 'active' } } as DaemonSession;
+    await expect(executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, {
+        prepareTurnIdentity: async () => {
+          active.set(sessionKey(ROOT, APP), winner);
+          throw new Error('revoked');
+        },
+      },
+    )).rejects.toThrow('revoked');
+    expect(active.get(sessionKey(ROOT, APP))).toBe(winner);
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-1');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('throws after closing the rejected candidate instead of reporting a false success', async () => {
+    const active = new Map<string, DaemonSession>();
+    const winner: DaemonSession = {
+      session: {
+        sessionId: 'sess-registration-winner',
+        chatId: CHAT,
+        rootMessageId: 'om_banner_123',
+        title: 'winner',
+        status: 'active',
+        createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      },
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: APP,
+      chatId: CHAT,
+      chatType: 'group',
+      scope: 'thread',
+      spawnedAt: 0,
+      cliVersion: 'test-cli-v1',
+      lastMessageAt: 0,
+      hasHistory: false,
+      workingDir: '/tmp',
+    };
+    active.set(sessionKey('om_banner_123', APP), winner);
+
+    await expect(executeScheduledTask(
+      baseTask({ executionPosition: 'new-topic', silent: false }),
+      active,
+      refreshCliVersion,
+    )).rejects.toThrow(/registration|active session|注册/i);
+
+    expect(active.get(sessionKey('om_banner_123', APP))).toBe(winner);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('silent scheduled turn lifecycle', () => {
+  it('a queued real CLI input does not clear the exact silent turn marker', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    const turnId = forkedTurnId();
+    expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
+
+    rememberLastCliInput(ds, '真实用户消息', '真实用户消息');
+    expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
+  });
+});
+
+describe('executeScheduledTask — explicit position wins over a retained root', () => {
+  it('loud chat-scope task posts at top level even when it retains an old topic root', async () => {
+    getChatModeMock.mockResolvedValue('topic');
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ scope: 'chat', rootMessageId: ROOT }), active, refreshCliVersion);
+
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).toHaveBeenCalledTimes(1);
+    const ds = active.get(sessionKey('om_banner_123', APP))!;
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread'); // topic-group top-level message is its own topic root
+    expect(ds.session.rootMessageId).toBe('om_banner_123');
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+  });
+
+  it('silent chat-scope task ignores the retained root and remains truly top-level/chat-scoped', async () => {
+    getChatModeMock.mockResolvedValue('topic');
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ scope: 'chat', rootMessageId: ROOT, silent: true }), active, refreshCliVersion);
+
+    expect(replyMessageMock).not.toHaveBeenCalled();
+    expect(sendMessageMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.scope).toBe('chat');
+    expect(ds.silentScheduledTurns?.has(forkedTurnId())).toBe(true);
+    expect(active.get(sessionKey(ROOT, APP))).toBeUndefined();
+  });
+});
+
+describe('executeScheduledTask — per-task model / reasoning effort', () => {
+  // ScheduledTask.model is fresh-spawn only: it can only be applied by a fire
+  // that starts a CLI process, because that is when the flag is passed.
+  const cliOf = (id: string) => { (BOT.config as { cliId: string }).cliId = id; };
+
+  beforeEach(() => { cliOf('codex'); });
+  afterEach(() => { cliOf('claude-code'); });
+
+  it('a fresh session carries the task model as an in-memory spawn override', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBe('gpt-5.6-sol');
+    // Never persisted: a stored model would outrank the bot's configured one on
+    // every later resume of this session (resolveSessionLaunchModel rule 1).
+    expect(ds.session.model).toBeUndefined();
+    // Effort is not re-resolved per spawn, so it does ride on the record.
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(store.get(ds.session.sessionId)?.reasoningEffort).toBe('ultra');
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('control: a task without an override leaves the bot configuration alone', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+  });
+
+  it('drops an effort the pinned model does not offer, still spawns with the model', async () => {
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.5', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBe('gpt-5.5');
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    // Degraded, never skipped.
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops both when the bot now runs a CLI without the override contract', async () => {
+    cliOf('gemini');
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'high' }),
+      active, refreshCliVersion,
+    );
+
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a fire that reuses this task’s session still injects, without touching its model', async () => {
+    const session: Session = {
+      sessionId: 'sess-live-model', chatId: CHAT, rootMessageId: ROOT, title: 'live',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      model: 'gpt-5.2',
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+    };
+    const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }),
+      active, refreshCliVersion,
+    );
+
+    // The turn is delivered, not refused — the running process just keeps the
+    // model it started with.
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(existing.spawnModelOverride).toBeUndefined();
+    expect(existing.session.model).toBe('gpt-5.2');
+    expect(existing.session.reasoningEffort).toBeUndefined();
+  });
+});
+
+describe('foldable dispatch excludes task-position sessions', () => {
+  function row(overrides: Partial<Session>): Session {
+    return {
+      sessionId: `sess-fold-${Math.random().toString(36).slice(2)}`,
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      title: 'row',
+      status: 'active',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      scope: 'chat',
+      larkAppId: APP,
+      ...overrides,
+    } as Session;
+  }
+
+  const deps = {
+    targetChatId: CHAT,
+    outboundMode: { mode: 'chat' } as any,
+    resolveMode: vi.fn(() => 'shared' as const),
+    resolveChatMode: vi.fn(async () => 'group' as const),
+  };
+
+  it('excludes the hidden task-anchor chat session and the promoted thread session, keeps a normal chat peer foldable', async () => {
+    const hidden = row({
+      rootMessageId: 'schedule-task:task0001',
+      deferredScheduleRun: {
+        taskId: 'task0001',
+        turnId: 'schedule:task0001:t1',
+        routingAnchor: 'schedule-task:task0001',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    const promoted = row({
+      scope: 'thread',
+      rootMessageId: 'om_task_real',
+    });
+    const ordinary = row({ sessionId: 'sess-ordinary', rootMessageId: CHAT });
+    const otherApp = row({ sessionId: 'sess-other-app', larkAppId: 'cli_other_app' });
+
+    const foldable = await foldableChatSessionAppIds({ sessions: [hidden, promoted, ordinary, otherApp], ...deps });
+    expect([...foldable].sort()).toEqual([APP, 'cli_other_app']);
+  });
+});
+
+// ── task-position promotion: daemon settlement races + restart recovery ──────
+import { withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+
+function hiddenTaskDs(overrides: Partial<Session> = {}): DaemonSession {
+  const session: Session = {
+    sessionId: 'sess-task-hidden',
+    chatId: CHAT,
+    rootMessageId: 'schedule-task:task0001',
+    title: 'hidden task topic',
+    status: 'active',
+    createdAt: '2026-01-01T00:00:00.000Z',
+    scope: 'chat',
+    larkAppId: APP,
+    deferredScheduleRun: {
+      taskId: 'task0001',
+      turnId: 'schedule:task0001:turn1',
+      routingAnchor: 'schedule-task:task0001',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    },
+    ...overrides,
+  };
+  store.set(session.sessionId, session);
+  return {
+    session,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: APP,
+    chatId: CHAT,
+    chatType: 'group',
+    scope: 'chat',
+    spawnedAt: 0,
+    cliVersion: 'test-cli-v1',
+    lastMessageAt: 0,
+    hasHistory: true,
+    workingDir: '/tmp',
+  };
+}
+
+const flush = (ticks = 5) => Array.from({ length: ticks }, () => Promise.resolve()).reduce((p, fn) => p.then(fn), Promise.resolve());
+const settle = (p: Promise<unknown>) => Promise.race([p.then(() => 'settled' as const), Promise.resolve().then(() => 'pending' as const)]);
+
+describe('task-position promotion on materialization (daemon)', () => {
+  beforeEach(() => {
+    daemonActiveSessions.clear();
+  });
+
+  it('promotes the virtual slot to the real om_ key and writes the root back to the task', async () => {
+    baseTask({ executionPosition: 'task' });
+    const ds = hiddenTaskDs();
+    daemonActiveSessions.set(sessionKey('schedule-task:task0001', APP), ds);
+    // Production precondition: settleDeferredScheduleRun's reconcile already
+    // wrote the real root + aliases onto the session before promotion.
+    ds.session.rootMessageId = 'om_task_real';
+
+    const result = await promoteTaskPositionSession(daemonActiveSessions, ds, 'om_task_real');
+
+    expect(result).toBe('promoted');
+    expect(daemonActiveSessions.has(sessionKey('schedule-task:task0001', APP))).toBe(false);
+    expect(daemonActiveSessions.get(sessionKey('om_task_real', APP))).toBe(ds);
+    expect(ds.session.deferredScheduleRun).toBeUndefined();
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.rootMessageId).toBe('om_task_real');
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_task_real' },
+      APP,
+    );
+  });
+
+  it('is a no-op for a new-topic (schedule-run) deferred session', async () => {
+    const ds = hiddenTaskDs();
+    ds.session.deferredScheduleRun = {
+      taskId: 'task0001',
+      turnId: 'schedule:task0001:turn1',
+      routingAnchor: 'schedule-run:task0001:turn1',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    ds.session.rootMessageId = 'schedule-run:task0001:turn1';
+
+    const result = await promoteTaskPositionSession(daemonActiveSessions, ds, 'om_banner_123');
+
+    expect(result).toBe('not_task_position');
+    expect(scheduleStoreUpdateTaskMock).not.toHaveBeenCalled();
+  });
+
+  it('race: a contender that registered the real om_ key first keeps it; promotion aborts the map move', async () => {
+    const ds = hiddenTaskDs();
+    daemonActiveSessions.set(sessionKey('schedule-task:task0001', APP), ds);
+    const occupant = hiddenTaskDs({ sessionId: 'sess-occupant' });
+    const virtualKey = sessionKey('schedule-task:task0001', APP);
+    const realKey = sessionKey('om_task_real', APP);
+
+    let releaseReal!: () => void;
+    const realGate = new Promise<void>((resolve) => { releaseReal = resolve; });
+    // Hold the real-key lock and register the occupant INSIDE that critical
+    // section — the exact window production's occupant guard covers.
+    const contenderDone = withActiveSessionKeyLock(daemonActiveSessions, realKey, async () => {
+      daemonActiveSessions.set(realKey, occupant);
+      await realGate;
+    });
+
+    const promoted = promoteTaskPositionSession(daemonActiveSessions, ds, 'om_task_real');
+    await flush();
+    // The delay must bite INSIDE the real race window: promotion is queued behind
+    // the contender at the real-key lock, not already rejected/finished.
+    expect(await settle(promoted)).toBe('pending');
+
+    releaseReal();
+    await contenderDone;
+    const result = await promoted;
+
+    expect(result).toBe('real_key_occupied');
+    expect(daemonActiveSessions.get(realKey)).toBe(occupant);
+    expect(daemonActiveSessions.get(virtualKey)).toBe(ds);
+    // Aborted promotion must be all-or-nothing: the task row, deferred marker
+    // and chat scope are untouched.
+    expect(scheduleStoreUpdateTaskMock).not.toHaveBeenCalled();
+    expect(ds.session.deferredScheduleRun?.routingAnchor).toBe('schedule-task:task0001');
+    expect(ds.session.scope).toBe('chat');
+    expect(ds.scope).toBe('chat');
+  });
+
+  it('race: losing the virtual slot before commit aborts promotion without touching the real key', async () => {
+    const ds = hiddenTaskDs();
+    const successor = hiddenTaskDs({ sessionId: 'sess-successor' });
+    daemonActiveSessions.set(sessionKey('schedule-task:task0001', APP), ds);
+    const virtualKey = sessionKey('schedule-task:task0001', APP);
+    const realKey = sessionKey('om_task_real', APP);
+
+    let releaseVirtual!: () => void;
+    const virtualGate = new Promise<void>((resolve) => { releaseVirtual = resolve; });
+    // Hold the VIRTUAL-key lock and evict ds while holding it — the exact
+    // re-registration window the identity CAS guards.
+    const contenderDone = withActiveSessionKeyLock(daemonActiveSessions, virtualKey, async () => {
+      daemonActiveSessions.set(virtualKey, successor);
+      await virtualGate;
+    });
+
+    const promoted = promoteTaskPositionSession(daemonActiveSessions, ds, 'om_task_real');
+    await flush();
+    expect(await settle(promoted)).toBe('pending');
+
+    releaseVirtual();
+    await contenderDone;
+    const result = await promoted;
+
+    expect(result).toBe('virtual_lost');
+    expect(daemonActiveSessions.get(virtualKey)).toBe(successor);
+    expect(daemonActiveSessions.get(realKey)).toBeUndefined();
+    // All-or-nothing: losing the virtual slot must not write the root back,
+    // clear the marker, or flip this session to thread scope.
+    expect(scheduleStoreUpdateTaskMock).not.toHaveBeenCalled();
+    expect(ds.session.deferredScheduleRun?.routingAnchor).toBe('schedule-task:task0001');
+    expect(ds.session.scope).toBe('chat');
+    expect(ds.scope).toBe('chat');
+  });
+});
+
+describe('task-position restart recovery', () => {
+  beforeEach(() => {
+    daemonActiveSessions.clear();
+  });
+
+  afterEach(() => {
+    removeDeferredTopicBinding(config.session.dataDir, 'sess-restore-materialized');
+    removeDeferredTopicBinding(config.session.dataDir, 'sess-restore-unmaterialized');
+  });
+
+  function persistedRow(sessionId: string, overrides: Partial<Session> = {}): Session {
+    const session: Session = {
+      sessionId,
+      chatId: CHAT,
+      rootMessageId: 'schedule-task:task0001',
+      title: 'hidden task topic',
+      status: 'active',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      scope: 'chat',
+      larkAppId: APP,
+      deferredScheduleRun: {
+        taskId: 'task0001',
+        turnId: 'schedule:task0001:turn1',
+        routingAnchor: 'schedule-task:task0001',
+        createdAt: '2026-01-01T00:00:00.000Z',
+      },
+      ...overrides,
+    };
+    store.set(sessionId, session);
+    return session;
+  }
+
+  it('a materialized binding promotes on restore: real-key registration, root writeback, marker cleared', async () => {
+    baseTask({ executionPosition: 'task' });
+    const row = persistedRow('sess-restore-materialized');
+    writeDeferredTopicBinding(config.session.dataDir, {
+      sessionId: row.sessionId,
+      turnId: 'schedule:task0001:turn1',
+      chatId: CHAT,
+      larkAppId: APP,
+      routingAnchor: 'schedule-task:task0001',
+      rootMessageId: 'om_real_restore',
+      createdAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    await restoreActiveSessions(daemonActiveSessions);
+
+    expect(scheduleStoreUpdateTaskMock).toHaveBeenCalledWith(
+      'task0001',
+      { rootMessageId: 'om_real_restore' },
+      APP,
+    );
+    const ds = daemonActiveSessions.get(sessionKey('om_real_restore', APP));
+    expect(ds).toBeTruthy();
+    expect(ds.scope).toBe('thread');
+    expect(ds.session.scope).toBe('thread');
+    expect(ds.session.deferredScheduleRun).toBeUndefined();
+    expect(ds.session.rootMessageId).toBe('om_real_restore');
+    expect(daemonActiveSessions.has(sessionKey('schedule-task:task0001', APP))).toBe(false);
+  });
+
+  it('an unmaterialized hidden task run is closed on restart, never resurrected at the virtual anchor', async () => {
+    persistedRow('sess-restore-unmaterialized');
+    // Deliberately NO binding file: restart cannot prove a visible conversation.
+
+    await restoreActiveSessions(daemonActiveSessions);
+
+    expect(sessionStoreCloseMock).toHaveBeenCalledWith('sess-restore-unmaterialized');
+    expect(daemonActiveSessions.size).toBe(0);
+  });
+});

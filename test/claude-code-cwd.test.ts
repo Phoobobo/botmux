@@ -12,10 +12,22 @@
  * Run:  pnpm vitest run test/claude-code-cwd.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, symlinkSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { claudeJsonlPathForSession } from '../src/adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, syncClaudeResumeTargetToCwd } from '../src/adapters/cli/claude-code.js';
 
 const SID = '01234567-89ab-cdef-0123-456789abcdef';
 
@@ -24,7 +36,10 @@ let realDir: string;
 let symDir: string;
 
 beforeEach(() => {
-  tmpRoot = mkdtempSync(join(tmpdir(), 'bmx-cwd-'));
+  // realpathSync: on macOS os.tmpdir() is a symlink (/var → /private/var). The
+  // helper realpath-resolves cwd, so the "already a real path" case must start
+  // from an already-resolved root or the expected hash would lack /private.
+  tmpRoot = realpathSync(mkdtempSync(join(tmpdir(), 'bmx-cwd-')));
   realDir = join(tmpRoot, 'real-target');
   symDir = join(tmpRoot, 'sym-link');
   mkdirSync(realDir);
@@ -64,5 +79,157 @@ describe('claudeJsonlPathForSession: symlink-aware cwd resolution', () => {
     const ghost = join(tmpRoot, 'never-existed');
     const got = claudeJsonlPathForSession(SID, ghost);
     expect(got).toBe(expectedProjectFor(ghost));
+  });
+});
+
+describe('syncClaudeResumeTargetToCwd', () => {
+  it('copies a cwd-scoped transcript into the new cwd before resume', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    const content = `${'{"turn":"old-context"}\n'.repeat(8_000)}`;
+    writeFileSync(source, content);
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result).toEqual({
+      targetPath: claudeJsonlPathForSession(SID, newCwd, dataDir),
+      sourcePath: source,
+      copied: true,
+    });
+    expect(readFileSync(result.targetPath, 'utf8')).toBe(content);
+  });
+
+  it('refreshes a stale target from the newest cwd copy', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(source, 'newest-context');
+    writeFileSync(target, 'stale-context');
+    const now = Date.now() / 1000;
+    utimesSync(target, now - 20, now - 20);
+    utimesSync(source, now, now);
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result.copied).toBe(true);
+    expect(result.sourcePath).toBe(source);
+    expect(readFileSync(target, 'utf8')).toBe('newest-context');
+    expect(lstatSync(target).isFile()).toBe(true);
+    expect(readdirSync(join(target, '..')).filter(name => name.endsWith('.tmp'))).toEqual([]);
+  });
+
+  it('keeps the target untouched when it is already the newest copy', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(source, 'stale-context');
+    writeFileSync(target, 'current-context');
+    const now = Date.now() / 1000;
+    utimesSync(source, now - 20, now - 20);
+    utimesSync(target, now, now);
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result).toEqual({ targetPath: target, sourcePath: target, copied: false });
+    expect(readFileSync(target, 'utf8')).toBe('current-context');
+  });
+
+  it('拒绝跟随 sibling 桶里的 source 软链读取 dataDir 外文件', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(newCwd);
+    const outside = join(tmpRoot, 'outside-secret.jsonl');
+    writeFileSync(outside, 'host-secret\n');
+    const hostileBucket = join(dataDir, 'projects', 'hostile-bucket');
+    mkdirSync(hostileBucket, { recursive: true });
+    symlinkSync(outside, join(hostileBucket, `${SID}.jsonl`));
+
+    const result = syncClaudeResumeTargetToCwd(SID, newCwd, dataDir);
+
+    expect(result).toEqual({
+      targetPath: claudeJsonlPathForSession(SID, newCwd, dataDir),
+      copied: false,
+    });
+    expect(existsSync(result.targetPath)).toBe(false);
+    expect(readFileSync(outside, 'utf8')).toBe('host-secret\n');
+  });
+
+  it('拒绝 target 软链，避免把 transcript 写穿到 dataDir 外文件', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    const outside = join(tmpRoot, 'outside-config.json');
+    writeFileSync(outside, 'must-not-change\n');
+    writeFileSync(source, 'transcript\n');
+    const now = Date.now() / 1000;
+    utimesSync(outside, now - 60, now - 60);
+    utimesSync(source, now, now);
+    symlinkSync(outside, target);
+
+    expect(() => syncClaudeResumeTargetToCwd(SID, newCwd, dataDir))
+      .toThrow(/unsafe Claude resume target/);
+    expect(lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, 'utf8')).toBe('must-not-change\n');
+  });
+
+  it('拒绝 dangling target 软链，不在 dataDir 外创建目标文件', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const oldCwd = join(tmpRoot, 'old-project');
+    const newCwd = join(tmpRoot, 'new-project');
+    mkdirSync(oldCwd);
+    mkdirSync(newCwd);
+    const source = claudeJsonlPathForSession(SID, oldCwd, dataDir);
+    const target = claudeJsonlPathForSession(SID, newCwd, dataDir);
+    mkdirSync(join(source, '..'), { recursive: true });
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(source, 'transcript\n');
+    const outside = join(tmpRoot, 'outside-created-by-write-through.jsonl');
+    symlinkSync(outside, target);
+
+    expect(() => syncClaudeResumeTargetToCwd(SID, newCwd, dataDir))
+      .toThrow(/unsafe Claude resume target/);
+    expect(existsSync(outside)).toBe(false);
+  });
+
+  it('拒绝整个 projects 根目录被替换为指向 dataDir 外的软链', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    const outsideProjects = join(tmpRoot, 'outside-projects');
+    mkdirSync(dataDir);
+    mkdirSync(outsideProjects);
+    symlinkSync(outsideProjects, join(dataDir, 'projects'));
+
+    expect(() => syncClaudeResumeTargetToCwd(SID, realDir, dataDir))
+      .toThrow(/unsafe Claude projects root/);
+  });
+
+  it('拒绝非 UUID session id，避免把路径片段插入跨桶扫描', () => {
+    const dataDir = join(tmpRoot, 'claude-data');
+    mkdirSync(join(dataDir, 'projects'), { recursive: true });
+
+    expect(() => syncClaudeResumeTargetToCwd('../../outside', realDir, dataDir))
+      .toThrow(/invalid Claude resume session id/);
   });
 });

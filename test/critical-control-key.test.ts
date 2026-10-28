@@ -1,0 +1,114 @@
+import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import {
+  TERMINAL_CANCEL_COOLDOWN_MS,
+  isCriticalInterruptKey,
+  sendCriticalControlKey,
+} from '../src/adapters/backend/critical-control-key.js';
+
+const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+
+describe('critical terminal control delivery', () => {
+  it('classifies only interrupt keys as critical', () => {
+    expect(TERMINAL_CANCEL_COOLDOWN_MS).toBeGreaterThan(500);
+    expect(isCriticalInterruptKey('ctrlc')).toBe(true);
+    expect(isCriticalInterruptKey('esc')).toBe(true);
+    for (const key of ['enter', 'tab', 'up', 'down', 'left', 'right']) {
+      expect(isCriticalInterruptKey(key)).toBe(false);
+    }
+  });
+
+  it('waits past OMP double-Ctrl+C shutdown before retrying Ctrl+C', async () => {
+    const sendOnce = vi.fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const wait = vi.fn(async () => {});
+
+    await expect(sendCriticalControlKey('ctrlc', sendOnce, wait)).resolves.toBe(true);
+    expect(sendOnce).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledWith(TERMINAL_CANCEL_COOLDOWN_MS);
+  });
+
+  it('keeps Escape retry latency short', async () => {
+    const sendOnce = vi.fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const wait = vi.fn(async () => {});
+
+    await expect(sendCriticalControlKey('esc', sendOnce, wait)).resolves.toBe(true);
+    expect(sendOnce).toHaveBeenCalledTimes(2);
+    expect(wait).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledWith(100);
+  });
+
+  it('fails after exactly two rejected or throwing attempts', async () => {
+    const rejected = vi.fn(() => false);
+    await expect(sendCriticalControlKey('ctrlc', rejected, async () => {})).resolves.toBe(false);
+    expect(rejected).toHaveBeenCalledTimes(2);
+
+    const throwing = vi.fn(() => { throw new Error('transport down'); });
+    await expect(sendCriticalControlKey('esc', throwing, async () => {})).resolves.toBe(false);
+    expect(throwing).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not delay or retry an accepted interrupt', async () => {
+    const sendOnce = vi.fn(() => undefined);
+    const wait = vi.fn(async () => {});
+
+    await expect(sendCriticalControlKey('ctrlc', sendOnce, wait)).resolves.toBe(true);
+    expect(sendOnce).toHaveBeenCalledOnce();
+    expect(wait).not.toHaveBeenCalled();
+  });
+});
+
+// 源码结构护栏(K3)：这些断言守的是 handleTermAction / handleExactTurnInterrupt 内部的
+// 顺序不变量（先过 viewer/RPC 拒绝分支，再写控制键；先在锁内投递成功，再清 TUI 状态）。
+// 逻辑埋在 worker.ts 的闭包里，无法从外部调用，而顺序错了就是线上事故（Ctrl+C 打到
+// 错误进程 / 不可用模式下仍写 PTY），所以只能钉源码文本。
+describe('worker interrupt action integration', () => {
+  it('awaits reliable delivery, notifies on failure, and exits before clearing TUI state', () => {
+    const start = workerSource.indexOf('async function handleTermAction');
+    const end = workerSource.indexOf('/** Key name → ANSI escape sequence', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const region = workerSource.slice(start, end);
+
+    const lock = region.indexOf('await runAfterAmbiguousSubmissionWrites');
+    const retry = region.indexOf('sendCriticalControlKey(key,', lock);
+    expect(region).toContain('sendCriticalControlKey(key,');
+    const notify = region.indexOf("type: 'user_notify'");
+    const failedReturn = region.indexOf('scheduleOneShotAfterAction();\n    return;', notify);
+    const clearBlocking = region.indexOf('tuiPromptBlocking = false');
+    expect(lock).toBeGreaterThanOrEqual(0);
+    expect(retry).toBeGreaterThan(lock);
+    expect(notify).toBeGreaterThan(retry);
+    expect(failedReturn).toBeGreaterThan(notify);
+    expect(clearBlocking).toBeGreaterThan(failedReturn);
+  });
+
+  it('awaits the async action in the worker IPC switch', () => {
+    const start = workerSource.indexOf("case 'term_action':");
+    expect(workerSource.slice(start, start + 160)).toContain('await handleTermAction(msg.key)');
+  });
+
+  it('rejects viewer/RPC Codex modes before any PTY control key is sent', () => {
+    const start = workerSource.indexOf('async function handleExactTurnInterrupt');
+    const end = workerSource.indexOf('/** Key name → ANSI escape sequence', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = workerSource.slice(start, end);
+    const unsupported = region.indexOf("reason: 'unsupported'");
+    // The key is adapter-selected (`interruptKey`, defaulting to ctrlc) so a CLI
+    // whose Ctrl+C is an exit gesture can opt into Escape; the ordering
+    // invariant — unsupported modes are rejected before any key is written — is
+    // unchanged.
+    const controlWrite = region.indexOf('sendCriticalControlKey(interruptKey');
+    // Upstream routes the Codex App question through the single literal
+    // predicate; the ordering invariant under test is unaffected.
+    expect(region).toContain('isCodexAppCliId(lastInitConfig?.cliId)');
+    expect(region).toContain('lastInitConfig?.codexRpcInput === true');
+    expect(region).toContain('cliAdapter?.interruptKey');
+    expect(unsupported).toBeGreaterThanOrEqual(0);
+    expect(controlWrite).toBeGreaterThan(unsupported);
+  });
+});

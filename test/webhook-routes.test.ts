@@ -1,10 +1,16 @@
 import { createHmac } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { verifyWebhookSignature } from '../src/dashboard/webhook-routes.js';
+import {
+  connectorTriggerPresentation,
+  resolveConnectorMentionIdentities,
+  resolveConnectorTriggerPresentation,
+  verifyWebhookSignature,
+  verifyWebhookToken,
+} from '../src/dashboard/webhook-routes.js';
 import type { ConnectorDefinition } from '../src/services/connector-store.js';
 
 let server: Server | null = null;
@@ -14,8 +20,8 @@ let prevDataDir: string | undefined;
 
 async function startWebhookServer(opts: {
   createLifecycleGroup?: any;
-  closeLifecycleGroup?: any;
   proxyToDaemon?: any;
+  resolveMentionIdentities?: any;
 } = {}): Promise<void> {
   vi.resetModules();
   const { handleWebhookRoute } = await import('../src/dashboard/webhook-routes.js');
@@ -28,7 +34,7 @@ async function startWebhookServer(opts: {
     if (await handleWebhookRoute(req, res, url, {
       proxyToDaemon,
       createLifecycleGroup: opts.createLifecycleGroup,
-      closeLifecycleGroup: opts.closeLifecycleGroup,
+      resolveMentionIdentities: opts.resolveMentionIdentities,
     })) return;
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found' }));
@@ -43,10 +49,15 @@ function sign(secret: string, ts: string, raw: string): string {
   return createHmac('sha256', secret).update(ts).update('.').update(raw).digest('base64url');
 }
 
-async function postWebhook(connectorId: string, nonce: string, body: unknown): Promise<any> {
+async function postWebhook(
+  connectorId: string,
+  nonce: string,
+  body: unknown,
+  query = '',
+): Promise<any> {
   const raw = JSON.stringify(body);
   const ts = String(Math.floor(Date.now() / 1000));
-  const res = await fetch(`${baseUrl}/webhook/${encodeURIComponent(connectorId)}`, {
+  const res = await fetch(`${baseUrl}/webhook/${encodeURIComponent(connectorId)}${query}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -57,6 +68,45 @@ async function postWebhook(connectorId: string, nonce: string, body: unknown): P
     body: raw,
   });
   return { status: res.status, body: await res.json() };
+}
+
+async function seedWorkflowConnector(input: {
+  mode: 'fixed' | 'dynamic' | 'new-group';
+  dedup?: boolean;
+}): Promise<ConnectorDefinition> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('secret');
+  return upsertConnector({
+    id: `conn_workflow_${input.mode.replace('-', '_')}_${input.dedup ? 'dedup' : 'plain'}`,
+    name: 'Legacy workflow connector',
+    enabled: true,
+    verify: {
+      type: 'hmac-sha256',
+      secretRef: secret.ref,
+      signatureHeader: 'x-botmux-signature',
+      timestampHeader: 'x-botmux-timestamp',
+      nonceHeader: 'x-botmux-nonce',
+      toleranceSeconds: 300,
+    },
+    target: {
+      mode: input.mode,
+      kind: 'workflow',
+      botId: 'app1',
+      ...(input.mode === 'fixed' ? { chatId: 'oc_legacy' } : {}),
+      workflowId: 'weekly-report',
+    },
+    promptEnvelope: {
+      sourceName: 'legacy-workflow',
+      headerAllowlist: [],
+      includeRawText: false,
+      maxBodyBytes: 1024,
+    },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: input.dedup ? { dedupKey: '$.alert.id' } : null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+  });
 }
 
 async function seedNewGroupConnector(): Promise<ConnectorDefinition> {
@@ -78,9 +128,52 @@ async function seedNewGroupConnector(): Promise<ConnectorDefinition> {
     target: { mode: 'new-group', kind: 'turn', botId: 'app1', botIds: ['app1', 'app2'] },
     promptEnvelope: { sourceName: 'alerts', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
     loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
-    lifecycleExtractors: { dedupKey: '$.alert.id', status: '$.alert.status', statusMap: { recovered: 'resolved' } },
+    lifecycleExtractors: { dedupKey: '$.alert.id' },
     createdAt: '2026-05-24T00:00:00.000Z',
     updatedAt: '2026-05-24T00:00:00.000Z',
+  });
+}
+
+async function seedNoDedupConnector(): Promise<ConnectorDefinition> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('tok_plain_value');
+  return upsertConnector({
+    id: 'conn_nodedup',
+    name: 'Per-event rooms',
+    enabled: true,
+    verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+    target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+    promptEnvelope: { sourceName: 'events', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: null,
+    createdAt: '2026-06-06T00:00:00.000Z',
+    updatedAt: '2026-06-06T00:00:00.000Z',
+  });
+}
+
+async function seedTokenConnector(): Promise<ConnectorDefinition> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('tok_plain_value');
+  return upsertConnector({
+    id: 'conn_token',
+    name: 'Simple',
+    enabled: true,
+    verify: {
+      type: 'token',
+      secretRef: secret.ref,
+      signatureHeader: 'x-botmux-signature',
+      timestampHeader: 'x-botmux-timestamp',
+      nonceHeader: 'x-botmux-nonce',
+      toleranceSeconds: 300,
+    },
+    target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
+    promptEnvelope: { sourceName: 'simple', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: null,
+    createdAt: '2026-06-05T00:00:00.000Z',
+    updatedAt: '2026-06-05T00:00:00.000Z',
   });
 }
 
@@ -99,6 +192,28 @@ afterEach(async () => {
 });
 
 describe('webhook route verification helpers', () => {
+  it('strictly verifies direct open_ids with the target bot before mentioning them', async () => {
+    const resolveRaw = vi.fn(async (_botId: string, identities: string[]) => ({
+      map: new Map(identities.map(identity => [identity, 'ou_resolved_email'])),
+    }));
+    const getProfile = vi.fn(async (_botId: string, openId: string) => (
+      openId === 'ou_same_app' ? { status: 'ok' as const, profile: { name: 'Same app' } } : { status: 'cross_app' as const }
+    ));
+
+    const result = await resolveConnectorMentionIdentities(
+      'app1',
+      ['ou_same_app', 'ou_foreign', 'owner@corp.com'],
+      { resolveRaw, getProfile },
+    );
+
+    expect(result).toEqual(new Map([
+      ['owner@corp.com', 'ou_resolved_email'],
+      ['ou_same_app', 'ou_same_app'],
+    ]));
+    expect(resolveRaw).toHaveBeenCalledWith('app1', ['owner@corp.com']);
+    expect(getProfile).toHaveBeenCalledTimes(2);
+  });
+
   it('verifies HMAC over timestamp dot raw-body', () => {
     const ts = '1770000000';
     const raw = Buffer.from('{"ok":true}');
@@ -107,9 +222,503 @@ describe('webhook route verification helpers', () => {
     expect(verifyWebhookSignature('secret', ts, raw, mac.toString('base64url'))).toBe(true);
     expect(verifyWebhookSignature('wrong', ts, raw, mac.toString('base64url'))).toBe(false);
   });
+
+  it('verifies a bearer token with constant-time comparison', () => {
+    expect(verifyWebhookToken('s3cret', 's3cret')).toBe(true);
+    expect(verifyWebhookToken('s3cret', 'wrong')).toBe(false);
+    expect(verifyWebhookToken('s3cret', '')).toBe(false);
+    expect(verifyWebhookToken('s3cret', 's3cret-longer')).toBe(false);
+  });
+
+  it('resolves connector-owned custom and disabled topic presentation', () => {
+    const connector = {
+      name: 'Deploy alerts',
+      promptEnvelope: { sourceName: 'production' },
+    } as ConnectorDefinition;
+    expect(connectorTriggerPresentation(connector)).toBeUndefined();
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'custom', text: '发布异常：{source}' },
+    })).toEqual({ topicMessage: '发布异常：production' });
+    expect(connectorTriggerPresentation({
+      ...connector,
+      topicMessage: { mode: 'none' },
+    })).toEqual({ topicMessage: null });
+  });
+
+  it('keeps trusted mentions and role labels intact when a payload title exceeds the topic limit', async () => {
+    const connector = {
+      name: 'Meego development',
+      target: { botId: 'app1' },
+      promptEnvelope: { sourceName: 'Meego' },
+      topicMessage: {
+        mode: 'template',
+        text: 'Meego启动开发：{{title}} {{mention owner}}负责人 {{mention trigger}}触发人',
+        extractors: {
+          title: { path: '$.issue.title', kind: 'text' },
+          owner: { path: '$.owner', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+          trigger: { path: '$.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        },
+      },
+    } as ConnectorDefinition;
+
+    const presentation = await resolveConnectorTriggerPresentation(
+      connector,
+      {
+        issue: { title: '需求'.repeat(180) },
+        owner: { name: 'Owner', email: 'owner@corp.com' },
+        trigger: { name: 'Trigger', email: 'trigger@corp.com' },
+      },
+      async () => new Map([
+        ['owner@corp.com', 'ou_owner'],
+        ['trigger@corp.com', 'ou_trigger'],
+      ]),
+    );
+
+    const message = presentation?.topicMessage ?? '';
+    expect(Array.from(message).length).toBeLessThanOrEqual(200);
+    expect(message).toContain('<at user_id="ou_owner">Owner</at>负责人');
+    expect(message).toContain('<at user_id="ou_trigger">Trigger</at>触发人');
+    expect((message.match(/<at /g) ?? [])).toHaveLength(2);
+    expect((message.match(/<\/at>/g) ?? [])).toHaveLength(2);
+  });
+});
+
+describe('webhook token mode', () => {
+  it('records one auditable, credential-redacted entry for successful and rejected calls', async () => {
+    await startWebhookServer();
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      loggingPolicy: { storePayload: true, storeHeaders: true, retentionDays: 14 },
+    });
+
+    const ok = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value?token=query-secret&chatId=oc_query`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: 'Bearer header-secret',
+        'x-api-key': 'api-secret',
+      },
+      body: JSON.stringify({ alert: 'disk-full', password: 'body-secret', nested: { accessToken: 'nested-secret' } }),
+    });
+    expect(ok.status).toBe(200);
+    const rejected = await fetch(`${baseUrl}/webhook/conn_token/wrong-token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ alert: 'still-recorded' }),
+    });
+    expect(rejected.status).toBe(401);
+
+    const { listTriggerLogs } = await import('../src/services/trigger-log-store.js');
+    const logs = listTriggerLogs({ limit: 10 }, dataDir);
+    expect(logs).toHaveLength(2);
+    expect(logs[0]).toMatchObject({
+      connectorId: 'conn_token',
+      status: 'error',
+      errorCode: 'invalid_signature',
+      request: {
+        method: 'POST',
+        path: '/webhook/conn_token/[REDACTED]',
+        payload: { alert: 'still-recorded' },
+      },
+      response: { httpStatus: 401 },
+    });
+    expect(logs[1]).toMatchObject({
+      connectorId: 'conn_token',
+      status: 'ok',
+      request: {
+        path: '/webhook/conn_token/[REDACTED]',
+        query: { token: '[REDACTED]', chatId: 'oc_query' },
+        headers: { authorization: '[REDACTED]', 'x-api-key': '[REDACTED]' },
+        payload: { alert: 'disk-full', password: '[REDACTED]', nested: { accessToken: '[REDACTED]' } },
+        payloadStored: true,
+      },
+      target: { kind: 'turn', mode: 'fixed', botId: 'app1', chatId: 'oc_fixed' },
+      response: { httpStatus: 200 },
+    });
+    expect(JSON.stringify(logs)).not.toContain('tok_plain_value');
+    expect(JSON.stringify(logs)).not.toContain('query-secret');
+    expect(JSON.stringify(logs)).not.toContain('body-secret');
+  });
+
+  it('accepts the token embedded in the path and dispatches', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hello: 'world' }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+  });
+
+  it('forwards topic presentation from connector config, never from request data', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered' }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, topicMessage: { mode: 'custom', text: 'Alert from {source}' } });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ presentation: { topicMessage: 'untrusted override' } }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(captured[0].presentation).toEqual({ topicMessage: 'Alert from simple' });
+    expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
+  });
+
+  it('renders a connector-owned trusted template with safe payload fields and resolved mentions', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered' }) };
+    }) as any;
+    const resolveMentionIdentities = vi.fn(async (_botId: string, identities: string[]) => new Map([
+      ['owner@corp.com', 'ou_owner'],
+      ['trigger@corp.com', 'ou_trigger'],
+    ].filter(([identity]) => identities.includes(identity))));
+    await startWebhookServer({ proxyToDaemon, resolveMentionIdentities });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      topicMessage: {
+        mode: 'template',
+        text: 'Meego启动开发：{{title}} {{mention owners}}负责人 {{mention trigger}}触发人',
+        extractors: {
+          title: { path: '$.issue.title', kind: 'text' },
+          owners: { path: '$.meego.owners', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+          trigger: { path: '$.meego.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        },
+      },
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        issue: { title: 'Batch <at user_id="ou_evil">伪造</at>' },
+        meego: {
+          owners: [{ name: 'Owner </at>', email: 'owner@corp.com' }],
+          trigger: { name: 'Trigger', email: 'trigger@corp.com' },
+        },
+        presentation: { topicMessage: 'untrusted override' },
+      }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(resolveMentionIdentities).toHaveBeenCalledWith('app1', ['owner@corp.com', 'trigger@corp.com']);
+    expect(captured[0].presentation).toEqual({
+      topicMessage: 'Meego启动开发：Batch ＜at user_id="ou_evil"＞伪造＜/at＞ <at user_id="ou_owner">Owner ＜/at＞</at>负责人 <at user_id="ou_trigger">Trigger</at>触发人',
+    });
+    expect(captured[0].envelope.payload.presentation.topicMessage).toBe('untrusted override');
+  });
+
+  it('rejects a wrong path token with 401', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token/wrong-token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('accepts the token via query param or Authorization bearer header', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const q = await fetch(`${baseUrl}/webhook/conn_token?token=tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(q.status).toBe(200);
+    const h = await fetch(`${baseUrl}/webhook/conn_token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer tok_plain_value' },
+      body: '{}',
+    });
+    expect(h.status).toBe(200);
+  });
+
+  it('forwards rootMessageId from query, header, and payload', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'queued', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    await seedTokenConnector();
+
+    const query = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value?rootMessageId=om_query`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(query.status).toBe(200);
+    const header = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-botmux-root-message-id': 'om_header' },
+      body: '{}',
+    });
+    expect(header.status).toBe(200);
+    const payload = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { rootMessageId: 'om_payload' } }),
+    });
+    expect(payload.status).toBe(200);
+
+    expect(captured.map(x => x.target.rootMessageId)).toEqual(['om_query', 'om_header', 'om_payload']);
+    expect(captured.every(x => x.target.chatId === 'oc_fixed')).toBe(true);
+  });
+
+  it('rejects when no token is presented at all', async () => {
+    await startWebhookServer();
+    await seedTokenConnector();
+    const res = await fetch(`${baseUrl}/webhook/conn_token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('passes the connector instruction onto the dispatched trigger (top-level, not in envelope)', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_instr',
+      name: 'Instr',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_fixed' },
+      promptEnvelope: { sourceName: 'instr', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024, instruction: 'Summarize and notify oncall.' },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+    const res = await fetch(`${baseUrl}/webhook/conn_instr/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].instruction).toBe('Summarize and notify oncall.');
+    expect(captured[0].envelope.instruction).toBeUndefined();
+  });
+
+  it('wait mode does not require a dynamic chatId and forwards wait options', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, triggerId: 'trg_wait', action: 'completed', output: { content: 'answer' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_dynamic',
+      name: 'Wait Dynamic',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_dynamic/tok_plain_value?wait=1&timeoutMs=120000`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ hello: 'world' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'completed', output: { content: 'answer' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toEqual({ kind: 'turn', botId: 'app1' });
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true, timeoutMs: 120000 });
+  });
+
+  it('wait mode forwards sessionId so callers can continue a headless session', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return {
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          triggerId: 'trg_wait_2',
+          action: 'completed',
+          target: { kind: 'turn', sessionId: 'sess_headless' },
+          output: { content: 'answer' },
+        }),
+      };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_session',
+      name: 'Wait Session',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-06-06T00:00:00.000Z',
+      updatedAt: '2026-06-06T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_session/tok_plain_value?wait=1&sessionId=sess_headless`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: '{"hello":"world"}',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, action: 'completed', output: { content: 'answer' } });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].target).toEqual({ kind: 'turn', botId: 'app1', sessionId: 'sess_headless' });
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true });
+  });
 });
 
 describe('webhook new-group lifecycle', () => {
+  it('rejects turn dry-run before lifecycle reservation or group creation', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_should_not_exist', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn();
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    await seedNoDedupConnector();
+
+    const res = await fetch(`${baseUrl}/webhook/conn_nodedup/tok_plain_value?dryRun=true`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"x":1}',
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ ok: false, errorCode: 'bad_request' });
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('retires a workflow connector before lifecycle reservation or daemon dispatch', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_should_not_exist', creatorLarkAppId: 'app1' }));
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, path: string, init: RequestInit) => {
+      captured.push({ path, body: JSON.parse(String(init.body)) });
+      throw new Error('must not dispatch retired workflow connector');
+    }) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedWorkflowConnector({ mode: 'new-group', dedup: true });
+
+    const result = await postWebhook(connector.id, 'nonce_wf_retired', {
+      alert: { id: 'cpu-high' },
+    });
+
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({ ok: false, errorCode: 'legacy_workflow_retired' });
+    expect(captured).toHaveLength(0);
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+    const lifecyclePath = join(dataDir, 'webhook-lifecycle.json');
+    const lifecycleRecords: Array<{ connectorId?: string }> = existsSync(lifecyclePath)
+      ? JSON.parse(readFileSync(lifecyclePath, 'utf-8')).records ?? []
+      : [];
+    expect(lifecycleRecords.filter(r => r.connectorId === connector.id)).toEqual([]);
+  });
+
+  it('never creates a workflow lifecycle group after retirement', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new_workflow', creatorLarkAppId: 'app1' }));
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      captured.push(body);
+      if (body.options?.dryRun) {
+        return {
+          status: 200,
+          text: async () => JSON.stringify({ ok: true, triggerId: 'trg_preflight', action: 'dry_run' }),
+        };
+      }
+      return {
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          triggerId: 'trg_actual',
+          action: 'delivered',
+          target: { kind: 'workflow', chatId: body.target.chatId, workflowRunId: 'run_1' },
+        }),
+      };
+    }) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedWorkflowConnector({ mode: 'new-group', dedup: true });
+
+    const result = await postWebhook(connector.id, 'nonce_wf_ok', {
+      alert: { id: 'disk-high' },
+    });
+
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({ ok: false, errorCode: 'legacy_workflow_retired' });
+    expect(captured).toHaveLength(0);
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+  });
+
+  it('returns retirement for an externally-requested workflow dry run without creating a group', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_should_not_exist', creatorLarkAppId: 'app1' }));
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return {
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          triggerId: 'trg_external_dry',
+          action: 'dry_run',
+          message: 'validated legacy workflow',
+        }),
+      };
+    }) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedWorkflowConnector({ mode: 'new-group' });
+
+    const result = await postWebhook(
+      connector.id,
+      'nonce_wf_external_dry',
+      { hello: 'world' },
+      '?dryRun=true',
+    );
+
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({ ok: false, errorCode: 'legacy_workflow_retired' });
+    expect(captured).toHaveLength(0);
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+  });
+
   it('creates one lifecycle group and reuses it for duplicate firing events', async () => {
     const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new', creatorLarkAppId: 'app1' }));
     const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => ({
@@ -135,21 +744,194 @@ describe('webhook new-group lifecycle', () => {
     expect(proxyToDaemon).toHaveBeenCalledTimes(2);
   });
 
-  it('closes the lifecycle group on resolved events without triggering a model turn', async () => {
+  it('rejects an event whose configured dedup key is absent from the payload', async () => {
     const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new', creatorLarkAppId: 'app1' }));
-    const closeLifecycleGroup = vi.fn(async () => ({ ok: true }));
+    await startWebhookServer({ createLifecycleGroup });
+    await seedNewGroupConnector();
+    const res = await postWebhook('conn_new_group', 'nonce_x', { other: 'shape' });
+    expect(res.status).toBe(400);
+    expect(res.body.errorCode).toBe('lifecycle_extract_failed');
+    expect(createLifecycleGroup).not.toHaveBeenCalled();
+  });
+
+  it('creates a fresh group for every event when dedup is not configured', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_fresh', creatorLarkAppId: 'app1' }));
     const proxyToDaemon = vi.fn(async () => ({
       status: 200,
-      text: async () => JSON.stringify({ ok: true, action: 'delivered' }),
+      text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fresh' } }),
     })) as any;
-    await startWebhookServer({ createLifecycleGroup, closeLifecycleGroup, proxyToDaemon });
-    await seedNewGroupConnector();
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    await seedNoDedupConnector();
 
-    await postWebhook('conn_new_group', 'nonce_3', { alert: { id: 'disk-full', status: 'firing' } });
-    const resolved = await postWebhook('conn_new_group', 'nonce_4', { alert: { id: 'disk-full', status: 'recovered' } });
-    expect(resolved.status).toBe(200);
-    expect(resolved.body.lifecycle).toMatchObject({ dedupKey: 'disk-full', status: 'resolved', action: 'close', chatId: 'oc_new' });
-    expect(closeLifecycleGroup).toHaveBeenCalledTimes(1);
-    expect(proxyToDaemon).toHaveBeenCalledTimes(1);
+    const a = await fetch(`${baseUrl}/webhook/conn_nodedup/tok_plain_value`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"x":1}' });
+    const b = await fetch(`${baseUrl}/webhook/conn_nodedup/tok_plain_value`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"x":2}' });
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    // Two events → two group creations (no reuse), each dispatched.
+    expect(createLifecycleGroup).toHaveBeenCalledTimes(2);
+    expect(proxyToDaemon).toHaveBeenCalledTimes(2);
+    expect((await a.json()).lifecycle).toMatchObject({ action: 'create', chatId: 'oc_fresh' });
+  });
+
+  it('uses a fixed lifecycle group name for every fresh group when configured', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_fixed_name', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn(async () => ({
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed_name' } }),
+    })) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNoDedupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, lifecycleGroupName: { mode: 'fixed', text: '固定处理群' } });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_nodedup/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"x":1}',
+    });
+
+    expect(res.status).toBe(200);
+    expect(createLifecycleGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'conn_nodedup' }),
+      expect.objectContaining({ groupName: '固定处理群' }),
+    );
+  });
+
+  it('renders a lifecycle group name template from the webhook payload', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_templated_name', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn(async () => ({
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_templated_name' } }),
+    })) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNewGroupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      lifecycleGroupName: { mode: 'template', text: '告警 {{payload.name}} #{{$.payload.id}} {{source}}' },
+    });
+
+    const result = await postWebhook('conn_new_group', 'nonce_group_name_template', {
+      name: 'ROOT_NAME',
+      alert: { id: 'cpu-high' },
+      payload: { id: 'wi_1', name: 'CPU 过高' },
+    });
+
+    expect(result.status).toBe(200);
+    expect(createLifecycleGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'conn_new_group' }),
+      expect.objectContaining({
+        dedupKey: 'cpu-high',
+        groupName: '告警 CPU 过高 #wi_1 alerts',
+      }),
+    );
+  });
+});
+
+describe('webhook suppressFinalOutput passthrough', () => {
+  it('passes suppressFinalOutput onto a loud fixed-chat turn trigger', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedTokenConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, suppressFinalOutput: true });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_token/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBe(true);
+  });
+
+  it('passes suppressFinalOutput onto a loud new-group turn trigger', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_new', creatorLarkAppId: 'app1' }));
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body));
+      captured.push(body);
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: body.target.chatId } }) };
+    }) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNewGroupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, suppressFinalOutput: true });
+
+    const res = await postWebhook('conn_new_group', 'nonce_suppress', { alert: { id: 'cpu-high', status: 'firing' } });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBe(true);
+  });
+
+  it('does not pass suppressFinalOutput onto a wait-mode trigger', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, _path: string, init: RequestInit) => {
+      captured.push(JSON.parse(String(init.body)));
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'completed', output: { content: 'answer' } }) };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    const secret = createWebhookSecret('tok_plain_value');
+    upsertConnector({
+      id: 'conn_wait_suppress',
+      name: 'Wait Suppress',
+      enabled: true,
+      verify: { type: 'token', secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1' },
+      promptEnvelope: { sourceName: 'wait', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024 },
+      suppressFinalOutput: true,
+      loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+      lifecycleExtractors: null,
+      createdAt: '2026-07-01T00:00:00.000Z',
+      updatedAt: '2026-07-01T00:00:00.000Z',
+    });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_wait_suppress/tok_plain_value?wait=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    expect(captured).toHaveLength(1);
+    expect(captured[0].options.suppressFinalOutput).toBeUndefined();
+    expect(captured[0].options).toEqual({ waitForFinalOutput: true });
+  });
+});
+
+describe('legacy workflow connector tombstone', () => {
+  it('retires fixed workflow connectors before daemon dispatch', async () => {
+    const captured: any[] = [];
+    const proxyToDaemon = vi.fn(async (_appId: string, path: string, init: RequestInit) => {
+      captured.push({ path, body: JSON.parse(String(init.body)) });
+      return {
+        status: 409,
+        text: async () => JSON.stringify({
+          ok: false,
+          triggerId: 'trg_fixed_retired',
+          errorCode: 'legacy_workflow_retired',
+          error: 'legacy definition is pending migration',
+          reason: 'pending',
+          targetWorkflowId: 'wf_target',
+        }),
+      };
+    }) as any;
+    await startWebhookServer({ proxyToDaemon });
+    const connector = await seedWorkflowConnector({ mode: 'fixed' });
+
+    const result = await postWebhook(connector.id, 'nonce_fixed_retired', { hello: 'world' });
+
+    expect(result.status).toBe(410);
+    expect(result.body).toMatchObject({
+      ok: false,
+      errorCode: 'legacy_workflow_retired',
+    });
+    expect(captured).toHaveLength(0);
   });
 });

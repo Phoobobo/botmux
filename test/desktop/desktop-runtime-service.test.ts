@@ -1,0 +1,603 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { createRuntimeService, type BundledRuntimeCandidate, type ExternalRuntimeCandidate } from '../../src/desktop/main/runtime-service.js';
+
+const paths = {
+  botmuxHome: '/home/.botmux',
+  dataDir: '/home/.botmux/data',
+  logsDir: '/home/.botmux/logs',
+};
+
+const configuredBots = '[{"larkAppId":"cli_x","larkAppSecret":"secret"}]';
+
+function globalCli(version = '2.9.0'): ExternalRuntimeCandidate {
+  return {
+    kind: 'external',
+    root: '/usr/local/lib/node_modules/botmux',
+    cliPath: '/usr/local/lib/node_modules/botmux/dist/cli.js',
+    binPath: '/usr/local/bin/botmux',
+    version,
+    runtimeSource: 'global-cli',
+  };
+}
+
+function bundledRuntime(version = '3.0.0'): BundledRuntimeCandidate {
+  return {
+    kind: 'bundled',
+    root: '/Applications/Botmux.app/Contents/Resources/runtime',
+    cliPath: '/Applications/Botmux.app/Contents/Resources/runtime/dist/cli.js',
+    nodePath: '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin/node',
+    version,
+    runtimeSource: 'bundled',
+  };
+}
+
+describe('runtime service', () => {
+  it('uses the bundled runtime without requiring a global botmux installation', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin', ELECTRON_RUN_AS_NODE: '1' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      fleetApps: async () => [],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'stopped',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+      runtimeVersion: '3.0.0',
+    });
+    await svc.start();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: bundledRuntime().nodePath,
+      args: [bundledRuntime().cliPath, 'start'],
+    }));
+    expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+  });
+
+  it('repairs the bundled daemon PATH with the probed shell PATH', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      // nvm-in-.zshrc user: their node must stay ahead of the bundled fallback
+      // so PtyBackend-spawned CLIs resolve `#!/usr/bin/env node` like a terminal.
+      shellPathEnv: () => '/Users/me/.nvm/versions/node/v22.22.2/bin:/opt/homebrew/bin',
+      fleetApps: async () => [],
+    });
+
+    await svc.start();
+    expect(run.mock.calls[0]![0].env.PATH).toBe([
+      '/Users/me/.nvm/versions/node/v22.22.2/bin',
+      '/opt/homebrew/bin',
+      '/Applications/Botmux.app/Contents/Resources/node/darwin-arm64/bin',
+      '/usr/local/bin',
+      '/usr/bin',
+      '/bin',
+    ].join(':'));
+  });
+
+  it('detects an external fleet and replaces it through the bundled runtime', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      bundledRuntime: bundledRuntime(),
+      fleetApps: async () => [{
+        name: 'botmux-dashboard',
+        script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js',
+        status: 'online',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'degraded',
+      runtimeSource: 'global-cli',
+      runtimeManaged: false,
+      runtimePath: '/usr/local/lib/node_modules/botmux/dist/dashboard.js',
+    });
+    await svc.takeover();
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: bundledRuntime().nodePath,
+      args: [bundledRuntime().cliPath, 'restart'],
+    }));
+  });
+
+  it('recognises fleet processes launched from the bundled runtime', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      bundledRuntime: bundledRuntime(),
+      fleetApps: async () => [{
+        name: 'botmux-dashboard',
+        script: `${bundledRuntime().root}/dist/dashboard.js`,
+        status: 'online',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'running',
+      runtimeSource: 'bundled',
+      runtimeManaged: true,
+    });
+  });
+
+  it('reclaims same-path processes left behind by an older Desktop version', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '3.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      bundledRuntime: bundledRuntime('3.0.0'),
+      fleetApps: async () => [{
+        name: 'botmux-dashboard',
+        script: `${bundledRuntime().root}/dist/dashboard.js`,
+        status: 'online',
+        version: '2.99.0',
+      }],
+    });
+
+    expect(await svc.getState()).toMatchObject({
+      status: 'degraded',
+      runtimeSource: 'global-cli',
+      runtimeManaged: false,
+    });
+  });
+  it('reports not_configured without binding a private runtime when no global CLI exists', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      run: vi.fn(),
+    });
+
+    const state = await svc.getState();
+
+    expect(state).toMatchObject({
+      status: 'not_configured',
+      runtimeManaged: false,
+      runtimePath: null,
+      runtimeSource: 'none',
+      message: expect.stringContaining('Install the global botmux CLI'),
+    });
+    expect(state.botCount).toBe(0);
+  });
+
+  it('reports degraded when configured bots exist but no global CLI is installed', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+    });
+
+    const state = await svc.getState();
+    const start = await svc.start();
+
+    expect(state).toMatchObject({
+      status: 'degraded',
+      runtimeManaged: false,
+      runtimeSource: 'none',
+      message: expect.stringContaining('Install the global botmux CLI'),
+    });
+    expect(start.stderr).toContain('Install the global botmux CLI');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('reports malformed bots.json as degraded and blocks CLI actions', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: {
+        existsSync: path => path === '/home/.botmux/bots.json',
+        readFileSync: () => '[{"larkAppId":""}]',
+      },
+      run,
+      externalRuntime: globalCli(),
+    });
+
+    const state = await svc.getState();
+    const restart = await svc.restart();
+
+    expect(state).toMatchObject({
+      status: 'degraded',
+      runtimeManaged: false,
+      runtimeSource: 'global-cli',
+      runtimePath: '/usr/local/lib/node_modules/botmux/dist/cli.js',
+    });
+    expect(state.message).toContain('larkAppId');
+    expect(restart.stderr).toContain('larkAppId');
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('reports running without counting dashboard as an online daemon', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      externalRuntime: globalCli(),
+      fleetApps: async () => [
+        { name: 'botmux-dashboard', script: '/Users/me/src/botmux/dist/dashboard.js', status: 'online' },
+        { name: 'botmux', script: '/Users/me/src/botmux/dist/index-daemon.js', status: 'stopped' },
+      ],
+    });
+
+    const state = await svc.getState();
+    await svc.start();
+
+    expect(state).toMatchObject({
+      status: 'running',
+      runtimeManaged: true,
+      runtimeSource: 'global-cli',
+      runtimeVersion: '2.9.0',
+      runtimePath: '/Users/me/src/botmux/dist/dashboard.js',
+      onlineDaemonCount: 0,
+    });
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: '/usr/local/bin/botmux',
+      args: ['start'],
+      env: expect.objectContaining({
+        SESSION_DATA_DIR: '/home/.botmux/data',
+      }),
+    }));
+    expect(run.mock.calls[0]![0].env).not.toHaveProperty('ELECTRON_RUN_AS_NODE');
+    expect(run.mock.calls[0]![0].env).not.toHaveProperty('PM2_HOME');
+  });
+
+  it('keeps the discovered login shell PATH when invoking a wrapper runtime', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const shellPath = '/Users/me/.nvm/versions/node/v22.22.2/bin:/usr/bin:/bin';
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin:/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      externalRuntime: {
+        ...globalCli(),
+        binPath: '/home/.botmux/bin/botmux',
+        pathEnv: shellPath,
+      },
+      fleetApps: async () => [],
+    });
+
+    await svc.start();
+
+    const pathEntries = run.mock.calls[0]![0].env.PATH!.split(':');
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeGreaterThan(-1);
+    expect(pathEntries.indexOf('/Users/me/.nvm/versions/node/v22.22.2/bin')).toBeLessThan(pathEntries.indexOf('/usr/bin'));
+  });
+
+  it('gets device status through the host CLI and exposes only the public DTO', async () => {
+    const run = vi.fn().mockResolvedValue({
+      code: 0,
+      stderr: '',
+      stdout: JSON.stringify({
+        schemaVersion: 1,
+        enrolled: true,
+        issuer: 'https://platform.example.test',
+        deviceExp: 1_800_000_000_000,
+        savedAt: '2026-07-22T06:00:00.000Z',
+      }),
+    });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      run,
+      externalRuntime: globalCli(),
+    });
+
+    const status = await svc.getDeviceStatus();
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({
+      command: '/usr/local/bin/botmux',
+      args: ['device', 'status', '--json'],
+    }), { maxOutputBytes: 4 * 1024 });
+    expect(status).toEqual({
+      ok: true,
+      status: {
+        schemaVersion: 1,
+        enrolled: true,
+        issuer: 'https://platform.example.test',
+        deviceExp: 1_800_000_000_000,
+        savedAt: '2026-07-22T06:00:00.000Z',
+      },
+    });
+  });
+
+  it('returns a fixed device-status failure when no host CLI is installed', async () => {
+    const run = vi.fn();
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => false, readFileSync: () => '' },
+      run,
+    });
+
+    await expect(svc.getDeviceStatus()).resolves.toEqual({
+      ok: false,
+      reason: 'cli_unavailable',
+    });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('kills a replacement CLI before buffering oversized device-status output', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-device-status-limit-'));
+    const script = join(dir, 'oversized-status');
+    writeFileSync(script, '#!/usr/bin/env node\nprocess.stdout.write("x".repeat(128 * 1024));\n');
+    chmodSync(script, 0o755);
+    try {
+      const svc = createRuntimeService({
+        paths,
+        appVersion: '1.0.0',
+        execPath: '/Electron',
+        env: { PATH: process.env.PATH },
+        fs: { existsSync: () => false, readFileSync: () => '' },
+        externalRuntime: {
+          ...globalCli(),
+          root: dir,
+          cliPath: join(dir, 'dist/cli.js'),
+          binPath: script,
+        },
+      });
+
+      await expect(svc.getDeviceStatus()).resolves.toEqual({
+        ok: false,
+        reason: 'command_failed',
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports stopped when global CLI is installed and no botmux fleet app is running', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      externalRuntime: globalCli(),
+      fleetApps: async () => [],
+    });
+
+    const state = await svc.getState();
+
+    expect(state).toMatchObject({
+      status: 'stopped',
+      runtimeManaged: true,
+      runtimeSource: 'global-cli',
+      runtimePath: '/usr/local/lib/node_modules/botmux/dist/cli.js',
+    });
+  });
+
+  it('coalesces concurrent state probes so the fleet is queried once', async () => {
+    let resolvePm2!: (apps: { name: string; script: string }[]) => void;
+    const fleetApps = vi.fn(() => new Promise<{ name: string; script: string }[]>(resolve => {
+      resolvePm2 = resolve;
+    }));
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      externalRuntime: globalCli(),
+      fleetApps,
+    });
+
+    const first = svc.getState();
+    const second = svc.getState();
+    expect(fleetApps).toHaveBeenCalledTimes(1);
+
+    resolvePm2([
+      { name: 'botmux-dashboard', script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js' },
+    ]);
+    const [firstState, secondState] = await Promise.all([first, second]);
+
+    expect(firstState.status).toBe('running');
+    expect(firstState.runtimeManaged).toBe(true);
+    expect(secondState).toEqual(firstState);
+  });
+
+  it('re-checks the global CLI version after the CLI is upgraded', async () => {
+    let externalVersion = '2.9.0';
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      discoverExternalRuntime: () => globalCli(externalVersion),
+    });
+
+    const beforeUpgrade = await svc.getState();
+    externalVersion = '3.0.0';
+    const afterUpgrade = await svc.getState();
+
+    // App does not maintain a bundled runtime contract anymore; the selected
+    // global CLI version is the runtime version displayed and controlled.
+    expect(beforeUpgrade).toMatchObject({ status: 'stopped', runtimeVersion: '2.9.0' });
+    expect(afterUpgrade).toMatchObject({ status: 'stopped', runtimeVersion: '3.0.0' });
+  });
+
+  it('preserves the local dashboard fallback from the current dashboard endpoint', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      externalRuntime: globalCli(),
+      dashboardEndpoint: vi.fn().mockResolvedValue({
+        ok: true,
+        url: 'https://m-test.botmux.example.test/?t=platform-token',
+        localUrl: 'http://10.92.89.226:7891/?t=local-token',
+      }),
+    });
+
+    const result = await svc.currentDashboard();
+
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(result.stdout).toBe([
+      'https://m-test.botmux.example.test/?t=platform-token',
+      '本地直连(平台异常时可用): http://10.92.89.226:7891/?t=local-token',
+    ].join('\n'));
+  });
+
+  it('adopts a controllable CLI runtime during legacy takeover without stopping it', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+      externalRuntime: globalCli(),
+      fleetApps: async () => [
+        { name: 'botmux-dashboard', script: '/usr/local/lib/node_modules/botmux/dist/dashboard.js' },
+      ],
+    });
+
+    await expect(svc.takeover()).resolves.toMatchObject({ code: 0, stderr: '' });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('refuses start, stop, restart, and takeover when no CLI runtime is bound', async () => {
+    const run = vi.fn().mockResolvedValue({ code: 0, stdout: 'ok', stderr: '' });
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: { PATH: '/usr/bin' },
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      run,
+    });
+
+    await expect(svc.start()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
+    await expect(svc.stop()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
+    await expect(svc.restart()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
+    await expect(svc.takeover()).resolves.toMatchObject({ code: 1, stderr: expect.stringContaining('Install the global botmux CLI') });
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('treats signal-terminated child commands as failures', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-runtime-service-'));
+    const script = join(dir, 'kill-self.sh');
+    writeFileSync(script, '#!/bin/sh\nkill -TERM $$\n');
+    chmodSync(script, 0o755);
+    try {
+      const svc = createRuntimeService({
+        paths,
+        appVersion: '1.0.0',
+        execPath: '/Electron',
+        env: {},
+        fs: { existsSync: () => true, readFileSync: () => configuredBots },
+        externalRuntime: {
+          ...globalCli(),
+          root: dir,
+          cliPath: join(dir, 'dist/cli.js'),
+          binPath: script,
+        },
+      });
+
+      const result = await svc.start();
+      expect(result.code).not.toBe(0);
+      expect(result.signal).toBe('SIGTERM');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('times out runtime actions so renderer controls are not left pending forever', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-runtime-timeout-'));
+    const script = join(dir, 'hang.sh');
+    writeFileSync(script, '#!/bin/sh\nsleep 5\n');
+    chmodSync(script, 0o755);
+    try {
+      const svc = createRuntimeService({
+        paths,
+        appVersion: '1.0.0',
+        execPath: '/Electron',
+        env: {},
+        fs: { existsSync: () => true, readFileSync: () => configuredBots },
+        commandTimeoutMs: 25,
+        externalRuntime: {
+          ...globalCli(),
+          root: dir,
+          cliPath: join(dir, 'dist/cli.js'),
+          binPath: script,
+        },
+      });
+
+      const result = await svc.start();
+
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain('timed out');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports degraded instead of stopped when fleet discovery fails', async () => {
+    const svc = createRuntimeService({
+      paths,
+      appVersion: '1.0.0',
+      execPath: '/Electron',
+      env: {},
+      fs: { existsSync: () => true, readFileSync: () => configuredBots },
+      externalRuntime: globalCli(),
+      fleetApps: async () => {
+        throw new Error('Invalid fleet state');
+      },
+    });
+
+    const state = await svc.getState();
+
+    expect(state).toMatchObject({
+      status: 'degraded',
+      runtimeSource: 'global-cli',
+      runtimeManaged: false,
+    });
+    expect(state.message).toContain('Invalid fleet state');
+  });
+});

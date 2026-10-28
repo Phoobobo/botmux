@@ -1,0 +1,234 @@
+# Skill 管理
+
+botmux 支持一套 CLI 无关的自定义 Skill 管理能力。Skill 包本身只描述“能力是什么、什么时候使用、入口和相对资源在哪里”，不绑定 Claude、Codex 或其他 CLI。botmux 在启动每个会话时按 bot 配置解析出 priority skills，再根据目标 CLI 的能力做投递。
+
+## 默认行为
+
+没有给某个 bot 配置 `skills` 字段时，botmux 不生成 session manifest，不注入 prompt catalog，不创建 runtime plugin，也不改 CLI 启动参数。底层 CLI 会完全按自己的默认行为加载原生 skill 目录，例如 Codex 继续读取自己的 `~/.codex/skills`，Claude 继续读取自己的 Claude skill/plugin 目录。
+
+配置了 `skills` 后，默认语义是“优先披露”，不是“独占隔离”。botmux 会把匹配到的 skill 加入本会话的 priority catalog，并提供 `botmux skill show/read/resources` 给 agent 按需读取。底层 CLI 原本能发现的 skill 仍然由 CLI 自己处理。
+
+## Skill 包格式
+
+一个 skill 是一个目录，至少包含 `SKILL.md`：
+
+```text
+deploy-runbook/
+  SKILL.md
+  references/
+  scripts/
+  assets/
+```
+
+推荐在 `SKILL.md` 顶部写 frontmatter：
+
+```markdown
+---
+name: deploy-runbook
+description: Use when handling production deploys and rollbacks.
+version: 1.2.0
+tags: [deploy, sre]
+---
+
+# Deploy Runbook
+```
+
+`SKILL.md` 可以引用 `references/`、`scripts/`、`assets/` 等相对路径。agent 读取资源时应使用：
+
+```bash
+botmux skill show deploy-runbook
+botmux skill read deploy-runbook references/release.md
+botmux skill resources deploy-runbook
+```
+
+这些命令只在 botmux 会话里可用，依赖本会话的 skill manifest。
+
+## 安装
+
+本地安装默认复制到 botmux registry，不写入任何 CLI 的全局 skill 目录：
+
+```bash
+botmux skills install ./skills/deploy-runbook
+botmux skills install ./skills --skill deploy-runbook
+botmux skills install ./skills/deploy-runbook --link
+```
+
+`--link` 用于开发态，registry 记录原目录；不加 `--link` 会 vendor copy 到 `~/.botmux/skills/store`。
+
+Git 仓库安装可以直接给仓库根目录。仓库里只有一个 Skill 时会直接安装；多个 Skill 时先用 `discover` 查看候选，再用 `--skill` 指定一个或用 `--all` 安装全部：
+
+```bash
+botmux skills discover git+https://github.com/acme/agent-skills.git
+botmux skills install git+https://github.com/acme/agent-skills.git --skill deploy-runbook
+botmux skills install git+https://github.com/acme/agent-skills.git --all
+botmux skills install git+https://github.com/acme/agent-skills.git --path skills/deploy-runbook
+botmux skills install git@github.com:acme/agent-skills.git --path skills/deploy-runbook --ref v1.2.0
+```
+
+GitHub 简写：
+
+```bash
+botmux skills install github:acme/agent-skills --skill deploy-runbook
+botmux skills install github:acme/agent-skills/skills/deploy-runbook
+botmux skills install github:acme/agent-skills --path skills/deploy-runbook --ref main
+```
+
+私有仓库可复用部署机已有权限：GitHub HTTPS 来源依次读取进程或 `~/.botmux/.env` 中的 `GITHUB_TOKEN` / `GH_TOKEN`、当前 `gh auth` 账号；若注入的 token 鉴权失败，会先去掉临时请求头，让公开仓库匿名访问或系统 Git credential helper 接管，仍为鉴权失败时才自动改用 SSH URL 重试。显式 `git@github.com:owner/repo.git` 来源也直接使用 SSH agent/key。botmux 只把 HTTPS token 作为限定到 `github.com` 的临时 Git 请求头，不写入 URL、命令行或 registry；带 username/password/token 的 HTTPS Git URL 会被拒绝，避免凭证进入 Dashboard 和错误日志。
+Git/GitHub 的 `--path` 必须是仓库内相对路径；绝对路径、`..` segment 或解析到 checkout 外部的 symlink 会被拒绝。
+Git 安装/更新会给底层 Git 命令设置超时，默认 60 秒；需要更长时间时可设置 `BOTMUX_SKILL_GIT_TIMEOUT_MS`。
+Dashboard/CLI 的 Git `discover` 使用一次性 checkout，扫描结束即删除；只有实际安装/更新的来源保留在 `~/.botmux/skills/sources`，避免预览 URL 与最终安装 URL 不同时留下两份长期缓存。
+
+Dashboard 安装/更新 job 完成后会通过现有 logger 写入 `[skills:audit]` 静态审计摘要，包括来源类型、commit、版本、文件/目录/symlink/字节数、相对可执行文件路径与 shebang runtime。审计不记录来源 URL 或绝对路径，也不会执行 Skill 的安装脚本、二进制或测试；失败 job 记录脱敏后的错误。
+
+### 制品仓库（agentbuddy）
+
+复用外部 `agentbuddy` CLI 从制品仓库安装 skill —— registry 地址与鉴权都在部署机的 `agentbuddy` 里，botmux 源码不硬编码任何仓库信息：
+
+直接粘贴 marketplace「复制安装命令」即可（dashboard 尤其方便，贴上即装、跳过 discover；CLI 里命令带空格要加引号）：
+
+```bash
+botmux skills install "agentbuddy skill collection add <uid>"
+botmux skills install "agentbuddy plugin collection add <uid>"
+botmux skills install "agentbuddy skill add <group> --skill <name>"
+botmux skills install "npm_config_registry=\"https://registry.example.com\" npx -y agentbuddy@latest skill add <group>/<name>"
+```
+
+- 兼容命令前面带的 `npm_config_registry="…" npx agentbuddy@latest …` 前缀（自动剥离），也兼容 marketplace 常见的 `skill add <group>/<name>` 合并路径。botmux 用部署机自己配置的 agentbuddy 执行，**域名无关、无需额外配置**。
+- 仅接受 `skill` / `plugin` 的 `add` / `collection add` 安装类子命令，其它子命令（publish/remove/login 等）不受理。
+- plugin 命令也会执行，但收进 botmux 的是该 plugin **内含的 SKILL.md**（botmux 是 skill registry；plugin 不含 skill 则无内容可装）。
+- **开源 skills**（vercel-labs 的 `skills` CLI）：也认 `skills add owner/repo` / `npx skills add owner/repo` / `add-skill owner/repo`，包括 source 前后的 `-g` / `--global` 和带引号 source —— 这些粘贴命令统一走 botmux 自己的 **GitHub 安装**（无需部署机装 `skills` CLI，公开仓库免鉴权，与贴 GitHub 链接等价；`-g` 仅作输入兼容，安装位置仍由 botmux registry 管理）。
+
+- 需要部署机装好 `agentbuddy` 并登录一次（`agentbuddy login`），凭证缓存后复用；未安装/未登录时返回 `agentbuddy_not_found` / `agentbuddy_command_failed`（dashboard 会提示去安装/登录）。
+- agentbuddy 自解析 skill 集合，安装/更新不走 discover-then-select；同一 identifier 的并发安装/更新会串行化，避免互相清空暂存目录。
+- botmux 在拷进 store 前用 agentbuddy 内置的 `clear-embedded-telemetry` 剥离制品内嵌的用量上报，并做 fail-closed 后置校验（残留即中断安装）；确需保留时设 `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY=1`。
+
+相关环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `BOTMUX_AGENTBUDDY_CMD` | `agentbuddy` | 调用的命令（可设为 `npx -y agentbuddy@latest`）；私有 npm registry 由部署机 npmrc/env 提供 |
+| `BOTMUX_AGENTBUDDY_TIMEOUT_MS` | `180000` | 单次 agentbuddy 调用超时 |
+| `BOTMUX_AGENTBUDDY_KEEP_TELEMETRY` | 关 | 设 `1` 保留内嵌 telemetry（默认剥离） |
+
+更新、查看和移除：
+
+```bash
+botmux skills list
+botmux skills inspect deploy-runbook
+botmux skills update deploy-runbook
+botmux skills remove deploy-runbook
+botmux skills remove deploy-runbook --force
+botmux skills doctor
+```
+
+`remove` 只删除 registry entry 和 botmux 管理的 store 副本，不会自动改写已经配置到 bot 上的引用。CLI 默认会检查 bots.json，发现引用时拒绝删除；确认要保留 dangling policy 时使用 `--force`。Dashboard 会在删除前提示受影响 bot，并把悬挂引用标记为未安装。
+
+Git / GitHub 来源需要部署机器安装 `git` 命令；本机目录安装不依赖 git。缺少 git 时 CLI 和 Dashboard job 会返回 `git_not_found`。
+
+## Bot Priority Policy
+
+bot 级配置只表达“这个 bot 优先披露哪些 Skill”。注入方式和是否读取工作区 Skill 都是全局配置，不支持 per-bot override。配置写在 `bots.json` 的 `skills` 字段，也可以通过 `/botconfig set skills '<json>'` 修改：
+
+```json
+{
+  "skills": {
+    "include": ["skill:deploy-runbook"]
+  }
+}
+```
+
+字段含义：
+
+- `include`: priority selector 列表，支持直接引用 `skill:<name>` 和专项包引用 `pack:<id>`。直接引用始终先于专项包展开，因此同一 Skill 同时出现时以直接引用为准；底层 CLI 原生 Skill 发现机制保持原样。
+- 全局工作区 Skill：`off | all`，决定解析 priority skill 时是否把当前工作区 `.agents/skills` 和 `.botmux/skills` 纳入候选。旧配置里的 `trusted` 会作为 `all` 的兼容别名读取，并在解析诊断里提示 deprecated；当前没有单独的项目 trust store。
+- 全局 delivery：`auto | prompt | native`。`auto` 会优先使用可用 native 投递，否则走 prompt；`native` 在目标 CLI 不支持时会阻止新会话启动并报配置错误。
+
+聊天里可以用快捷命令管理当前 bot 的 registry skill：
+
+```text
+/skills
+/skills attach deploy-runbook
+/skills detach deploy-runbook
+```
+
+`attach` 只接受已通过 `botmux skills install` 安装的 registry skill。项目内 skill 可通过全局“读取工作区 Skill”开关进入解析候选，但 bot 侧仍只维护 direct priority skill 列表。
+
+Dashboard 的 `Skills` 页也提供同一套管理入口：
+
+- 安装、更新、删除 registry skill（支持本机目录、Git、GitHub 简写、agentbuddy 制品仓库）。agentbuddy 源在安装框直接粘贴 `agentbuddy:<group>/<skill>` 或 `agentbuddy:collection/<uid>` 即可，跳过 discover 直接安装。
+- 设置全局 project skill 默认值和全局 delivery 默认值。
+- 为每个 bot attach/detach 已安装 skill，维护 direct priority skill 列表。
+
+Dashboard 的安装/更新会作为后台 job 执行，页面显示处理中状态并轮询结果；慢 Git clone/fetch 不会占住整个 HTTP 请求。
+
+## Skill Pack（专项包）
+
+专项包是一组已安装 Skill 的命名集合，可以一次性分配给多个 bot，避免逐个 bot 重复勾选。专项包只保存 `skill:<name>` 引用，不复制 Skill 文件；修改专项包后，所有引用它的 bot 在新会话中自动使用最新内容。
+
+专项包独立持久化在 `~/.botmux/skills/packs.json`，不写入 `registry.json`，也不需要迁移现有 bot 配置。
+
+### 分配专项包
+
+bot 的 `skills.include` 字段同时接受 `skill:<name>` 和 `pack:<id>`：
+
+```json
+{
+  "skills": {
+    "include": ["pack:sre-oncall", "skill:custom-helper"]
+  }
+}
+```
+
+解析顺序：直接 `skill:*` 引用优先（显式配置拥有最强解释权），然后按 policy 中的顺序展开 `pack:*`，最后按 Skill 名称去重。同一个 Skill 同时被直接引用和专项包引用时，直接引用胜出。
+
+### CLI 管理
+
+```text
+botmux skills pack list
+botmux skills pack show <id>
+botmux skills pack create --id <slug> --name <名称> --skill <name> [--skill <name>]... [--description <说明>] [--tag <标签>]...
+botmux skills pack update <id> [--name <名称>] [--skill <name>]... [--expected-revision <n>]
+botmux skills pack delete <id> [--force]
+```
+
+约束：
+
+- `id` 是稳定 slug（小写字母、数字、连字符），创建后不可修改。
+- `include` 只允许 `skill:*`，不允许嵌套 `pack:*`，至少包含一个 Skill，自动去重。
+- 每次内容更新 `revision` 递增；`update` 可带 `--expected-revision` 做乐观并发控制。
+- 删除被 bot 引用的专项包默认阻止，需 `--force`。删除专项包不会卸载成员 Skill。
+
+### 聊天命令与降级
+
+`/skills attach <name>` / `/skills detach <name>` 只增删 `skill:*` 项，原样保留 `pack:*` 项，不会清空专项包分配。`/skills` 状态输出会同时显示 priority skills 和 packs。
+
+## Delivery 行为
+
+通用路径是 prompt delivery：botmux 在首轮 prompt 后追加 priority catalog，告诉 agent 先查看这些 skill，并用 `botmux skill show/read/resources` 读取内容。这对 Codex、OpenCode、Gemini、Cursor 等 CLI 都可用，而且不会写入 `~/.codex/skills` 或其他 CLI 全局目录。
+
+Claude Code 支持 scoped plugin 优化：botmux 会为当前 session 生成 runtime plugin，并通过 `--plugin-dir` 注入。这个目录是会话派生物，不进入 Git，不污染全局 `~/.claude/skills`。同时仍保留 prompt catalog，方便 agent 明确知道哪些是 botmux priority skills。
+
+检查某个 bot 或 CLI 的解析结果：
+
+```bash
+botmux skills resolve --bot <appId|name|index> --cwd <repo>
+botmux skills delivery --bot <appId|name|index> --cwd <repo>
+botmux skills delivery --cli codex --mode auto
+botmux skills delivery --cli claude-code --mode auto
+```
+
+## Sandbox
+
+开启文件 sandbox 时，prompt delivery 仍通过 `botmux skill read` 按 manifest 读取 selected skills；本功能不会额外把 `~/.botmux/skills` 作为可写目录挂给 CLI，也不会把 selected skills 写入 CLI 全局目录。注意 botmux 当前 sandbox 是 read-all / write-isolated 模型，host 文件系统的只读可见性仍遵循既有 sandbox 规则；需要隐藏具体路径时继续使用 bot 的 sandbox hidePaths 配置。Claude native delivery 需要 CLI 直接读取 runtime plugin 目录，botmux 会把这个会话级目录以只读方式挂入 sandbox。
+
+## 排障
+
+常用命令：
+
+```bash
+botmux skills doctor
+botmux skills resolve --bot <appId|name|index> --cwd <repo>
+botmux skills delivery --bot <appId|name|index> --cwd <repo>
+```
+
+如果某个 bot 没有配置 custom skills，`resolve` 会显示 `skills: default`，表示新能力没有接管或改变底层 CLI 的默认 skill 加载行为。

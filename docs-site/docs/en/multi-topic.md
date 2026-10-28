@@ -1,0 +1,48 @@
+# Multi-Topic Orchestration Mode
+
+An upgrade to [multi-bot collaboration](/en/multi-bot): hand a big task to a main bot, and it automatically breaks the task into multiple sub-projects, opens several topics in the group, assigns a group of bots to each topic to work in parallel (commonly "one writes, one reviews"), uses a single Lark task checklist as a shared progress board, and finally collects the results and summarizes them for you. An ordinary group turns into a parallel workbench.
+
+## How to use
+
+Just tell the main bot, for example:
+
+> "Use multi-topic orchestration mode to split ×× into a few sub-projects and run them in parallel."
+>
+> "You be the orchestrator and coordinate a few bots to push this requirement forward in parallel."
+
+The main bot will then automatically:
+
+1. Split the task into a few sub-projects and first give you **a draft assignment plan** (which bots are assigned to each sub-project), then wait for your confirmation;
+2. Once you approve, open several topics in the group, pull the corresponding bots in, and start working in parallel;
+3. Create a **Lark task checklist** as a progress board — so you can see each sub-project's progress at a glance in Lark tasks;
+4. After each group finishes, the main bot collects everything and summarizes the results for you.
+
+Throughout the whole process, all you need to do is: **state the requirement → confirm the assignment → watch progress / collect results**. Opening topics, dividing the work, collaborating, and reporting back to each other all happen automatically among the bots — you don't have to worry about it.
+
+## Prerequisites
+
+For whichever bots you want to take part in the collaboration, first add them to this group and make sure they can be @-mentioned (see [multi-bot collaboration](/en/multi-bot)). Everything else — which repository to work in, how to open topics and assign tasks — is handled automatically by the main bot, so you don't need to configure anything in advance (no need to enable On-Call or anything like that).
+
+## User identity in dispatch
+
+With `triggerUserAuth` enabled, `botmux dispatch --bot-app` establishes the message-bound identity delegation through the current human turn; the receiver still validates the target app's user mapping, group membership, and tool authorization. An ordinary Bot message never gains human permissions.
+
+A TRAE session ends a started turn at the structured `task_complete` (success or failure) or `turn_aborted` record. A transiently idle terminal while tools run does not revoke the current user identity. If the source turn is stale, a protected dispatch returns `dispatch_turn_unproven` instead of reporting an identity-less task as sent; the session Owner or a historical sender can never substitute for the current initiator.
+
+## Disabling the feature
+
+Multi-topic collaboration is enabled by default. If a machine does not need it, turn off "Enable multi-topic collaboration" under **Settings → Multi-topic collaboration** in the Dashboard. The change takes effect from the next session, no restart required.
+
+When it is off:
+
+- Agents no longer see the `botmux-orchestrate` Skill.
+- `botmux dispatch` cannot create a new sub-project topic.
+- `botmux dispatch --into <root message ID of a topic>` can still append to an existing topic, so ordinary bot handoffs are unaffected.
+
+In deployment environments you can also set `BOTMUX_MULTI_TOPIC_ENABLED=false`. The environment variable takes precedence over the setting saved in the Dashboard.
+
+## Result
+
+![Multi-topic orchestration · Lark task board as a shared progress board](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419243796_multitopic-board.png)
+
+> Related: [multi-bot collaboration](/en/multi-bot) is its infrastructure; use [roles and teams](/en/roles) to give bots roles (who writes, who reviews).

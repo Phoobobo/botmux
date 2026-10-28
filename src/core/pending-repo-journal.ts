@@ -1,0 +1,118 @@
+import type { DaemonSession } from './types.js';
+import type { PendingRepoSetup } from '../types.js';
+import { readGlobalConfig } from '../global-config.js';
+import { getBot } from '../bot-registry.js';
+import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
+import * as sessionStore from '../services/session-store.js';
+
+export function stagePendingRepoSetup(
+  ds: DaemonSession,
+  args: Pick<PendingRepoSetup, 'mode'> & Partial<Pick<
+    PendingRepoSetup,
+    'baseDir' | 'turnId' | 'force' | 'worktreePath' | 'branch' | 'reuseExisting' | 'targetSubdir' | 'linkRefMode'
+  >>,
+): void {
+  const effectiveLinkRefMode = args.linkRefMode
+    ?? ds.pendingLinkRefMode
+    ?? ds.session.pendingRepoSetup?.linkRefMode
+    ?? (() => {
+      try {
+        return resolveEffectiveLinkRefMode({
+          env: process.env,
+          bot: getBot(ds.larkAppId).config.linkRefs,
+          global: readGlobalConfig().linkRefs,
+        });
+      } catch {
+        return 'disabled' as const;
+      }
+    })();
+  const prior = {
+    queued: ds.session.queued,
+    queuedPrompt: ds.session.queuedPrompt,
+    queuedCodexAppText: ds.session.queuedCodexAppText,
+    queuedCodexAppMessageContext: ds.session.queuedCodexAppMessageContext,
+    pendingRepoSetup: ds.session.pendingRepoSetup,
+    pendingLinkRefMode: ds.pendingLinkRefMode,
+  };
+  const setup: PendingRepoSetup = {
+    mode: args.mode,
+    linkRefMode: effectiveLinkRefMode,
+    prompt: ds.pendingPrompt ?? '',
+    ...(ds.pendingRawInput ? { rawInput: ds.pendingRawInput } : {}),
+    ...(args.turnId ? { turnId: args.turnId } : {}),
+    ...(args.baseDir ? { baseDir: args.baseDir } : {}),
+    ...(args.force !== undefined ? { force: args.force } : {}),
+    ...(args.worktreePath ? { worktreePath: args.worktreePath } : {}),
+    ...(args.branch ? { branch: args.branch } : {}),
+    ...(args.reuseExisting !== undefined ? { reuseExisting: args.reuseExisting } : {}),
+    ...(args.targetSubdir ? { targetSubdir: args.targetSubdir } : {}),
+    ...(ds.pendingCodexAppText !== undefined ? { codexAppText: ds.pendingCodexAppText } : {}),
+    ...(ds.pendingCodexAppApplicationContext
+      ? { codexAppApplicationContext: ds.pendingCodexAppApplicationContext }
+      : {}),
+    ...(ds.pendingCodexAppMessageContext
+      ? { codexAppMessageContext: ds.pendingCodexAppMessageContext }
+      : {}),
+    ...(ds.pendingAttachments?.length
+      ? { attachments: ds.pendingAttachments.map(attachment => ({ ...attachment })) }
+      : {}),
+    ...(ds.pendingMentions?.length
+      ? { mentions: ds.pendingMentions.map(mention => ({ ...mention })) }
+      : {}),
+    ...(ds.pendingSubstituteTrigger
+      ? { substituteTrigger: structuredClone(ds.pendingSubstituteTrigger) }
+      : {}),
+    ...(ds.pendingSender ? { sender: { ...ds.pendingSender } } : {}),
+  };
+  ds.session.queued = true;
+  ds.session.queuedPrompt = setup.prompt;
+  ds.session.queuedCodexAppText = setup.codexAppText;
+  ds.session.queuedCodexAppMessageContext = setup.codexAppMessageContext;
+  ds.session.pendingRepoSetup = setup;
+  ds.pendingLinkRefMode = setup.linkRefMode;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    ds.session.queued = prior.queued;
+    ds.session.queuedPrompt = prior.queuedPrompt;
+    ds.session.queuedCodexAppText = prior.queuedCodexAppText;
+    ds.session.queuedCodexAppMessageContext = prior.queuedCodexAppMessageContext;
+    ds.session.pendingRepoSetup = prior.pendingRepoSetup;
+    ds.pendingLinkRefMode = prior.pendingLinkRefMode;
+    throw err;
+  }
+}
+
+export function persistPendingRepoCardMessageId(ds: DaemonSession, messageId: string): void {
+  const setup = ds.session.pendingRepoSetup;
+  if (!setup) return;
+  const prior = setup.repoCardMessageId;
+  setup.repoCardMessageId = messageId;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (err) {
+    setup.repoCardMessageId = prior;
+    throw err;
+  }
+}
+
+export function restorePendingRepoRuntime(ds: DaemonSession): boolean {
+  const setup = ds.session.pendingRepoSetup;
+  if (!setup || ds.session.queuedActivationPending) return false;
+  ds.pendingRepo = true;
+  ds.pendingPrompt = setup.prompt;
+  ds.pendingRawInput = setup.rawInput;
+  ds.pendingCodexAppText = setup.codexAppText;
+  ds.pendingCodexAppApplicationContext = setup.codexAppApplicationContext;
+  ds.pendingCodexAppMessageContext = setup.codexAppMessageContext;
+  ds.pendingAttachments = setup.attachments?.map(attachment => ({ ...attachment }));
+  ds.pendingMentions = setup.mentions?.map(mention => ({ ...mention }));
+  ds.pendingSubstituteTrigger = setup.substituteTrigger
+    ? structuredClone(setup.substituteTrigger)
+    : undefined;
+  ds.pendingSender = setup.sender ? { ...setup.sender } : undefined;
+  ds.pendingLinkRefMode = setup.linkRefMode;
+  ds.repoCardMessageId = setup.repoCardMessageId;
+  ds.initialStartPending = false;
+  return true;
+}

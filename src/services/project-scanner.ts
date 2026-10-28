@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { readdirSync, statSync, existsSync } from 'node:fs';
+import { readdirSync, statSync, existsSync, readFileSync } from 'node:fs';
 import { join, basename, resolve } from 'node:path';
 import { logger } from '../utils/logger.js';
 
@@ -32,38 +32,114 @@ export interface ProjectInfo {
   branch: string;
 }
 
+export interface ProjectScanOptions {
+  includeWorktrees?: boolean;
+  /** Hard cap on directories visited during a single scan. Guards against a
+   *  misconfigured scan root (e.g. `~`) turning the synchronous walk into a
+   *  minutes-long event-loop stall. Defaults to DEFAULT_MAX_SCAN_DIRS. */
+  maxScanDirs?: number;
+  /** Wall-clock budget (ms) for a single scan, checked between filesystem
+   *  calls. A dir-count cap alone doesn't bound a "repo storm" root where
+   *  each repo spawns a slow `git` subprocess; this stops the walk once the
+   *  budget is spent. Defaults to DEFAULT_MAX_SCAN_MS. Note: this cannot
+   *  interrupt a single syscall already blocked in the kernel (e.g. a
+   *  readdir that hangs on a protected/stale directory) — only the space
+   *  between calls. Narrowing the scan root remains the real fix. */
+  maxScanMs?: number;
+  /** Invoked once, after the walk, if either budget (dirs or wall-clock) was
+   *  hit — meaning the returned list may be incomplete. Lets a caller surface a
+   *  "scan root too large / narrow it" hint to the user instead of silently
+   *  showing a partial list or a misleading "no repos found". Not called when
+   *  the scan completes within budget. `reason` says which cap tripped. */
+  onBudgetExceeded?: (info: { reason: 'dirs' | 'time'; dirsVisited: number; baseDir: string }) => void;
+}
+
+/** Upper bound on directories a single `scanProjects` walk will visit before
+ *  bailing out. `scanProjects` is fully synchronous (readdirSync + a `git`
+ *  subprocess per repo), so an unbounded walk over a huge root such as the
+ *  home directory blocks the daemon's event loop — no repo card is ever sent
+ *  and the whole bot appears hung. 4000 dirs comfortably covers a normal
+ *  projects root while capping the worst case. */
+export const DEFAULT_MAX_SCAN_DIRS = 4000;
+
+/** Wall-clock budget for one scan. A normal projects root scans in well under
+ *  a second; anything past a few seconds means the root is misconfigured
+ *  (pointed at `~` or similar). Bailing keeps the daemon responsive. */
+export const DEFAULT_MAX_SCAN_MS = 4000;
+
 /**
- * Describe a single directory as a project: its basename + current git ref,
- * or null if the directory isn't a git repo/worktree. Used by `/repo <path>`
- * to label an explicitly given path that may sit outside the scanned roots
- * (the card's project list, by contrast, only covers the scan dirs).
+ * Describe a single directory as a project: the main worktree basename +
+ * current git ref, or null if the directory isn't a git repo/worktree. Using
+ * the main worktree name preserves the picker label for an explicitly selected
+ * linked worktree without recursively scanning the configured roots first.
  */
 export function describeProjectDir(dir: string): { name: string; branch: string } | null {
   if (!isValidGitMarker(dir)) return null;
-  return { name: basename(dir), branch: getGitRef(dir) };
+  const worktreeList = runGit('worktree list --porcelain', dir);
+  const mainWorktree = worktreeList
+    ?.split('\n')
+    .find(line => line.startsWith('worktree '))
+    ?.slice('worktree '.length);
+  return {
+    name: mainWorktree ? basename(mainWorktree) : basename(dir),
+    branch: getGitRef(dir),
+  };
 }
 
 /** `rev-parse --abbrev-ref HEAD` returns the literal string `HEAD` when
- *  detached — that's the signal to fall through to tag/SHA. */
+ *  detached — that's the signal to fall back to the short SHA.
+ *
+ *  We deliberately do NOT run `git describe --tags --exact-match HEAD` here:
+ *  it only returns something when HEAD sits exactly on a tagged commit (a rare
+ *  "checked out a release tag" case), yet to decide that it must load every tag
+ *  ref into a map first — on a repo with a huge tag count (~100k observed) that
+ *  single call costs 2–6s. The common detached case (a worktree parked on an
+ *  ordinary dev commit) matches no tag and pays that cost for nothing, then
+ *  falls back to the SHA anyway. So skip straight to the short SHA. */
 function getGitRef(dir: string): string {
   const branch = runGit('rev-parse --abbrev-ref HEAD', dir);
   if (branch && branch !== 'HEAD') return branch;
-  const tag = runGit('describe --tags --exact-match HEAD', dir);
-  if (tag) return tag;
   const sha = runGit('rev-parse --short HEAD', dir);
   return sha || 'unknown';
 }
 
-function describeDetachedHead(worktreePath: string, headSha: string): string {
-  const tag = runGit('describe --tags --exact-match HEAD', worktreePath);
-  if (tag) return tag;
+/** The worktree-list porcelain already hands us the detached HEAD's full SHA,
+ *  so return its short form directly — no `git` subprocess, and (same reasoning
+ *  as getGitRef) no expensive tag describe on huge-tag repos. */
+function describeDetachedHead(_worktreePath: string, headSha: string): string {
   return headSha ? headSha.slice(0, 7) : 'unknown';
 }
 
 /** Sibling worktrees of one repo share a common-dir — used as the dedup
  *  key so the scanner doesn't double-register when main + linked sit
- *  side-by-side in the scan root. */
+ *  side-by-side in the scan root.
+ *
+ *  Fast path reads `.git` directly: for main repos it is a directory; for
+ *  worktrees it is a gitlink file whose `gitdir: <path>` points to
+ *  `<common-dir>/worktrees/<name>`. Reading this synchronously avoids spawning
+ *  hundreds of `git rev-parse` subprocesses over a large workspace. Falls back
+ *  to `git rev-parse --git-common-dir` on unusual or unreadable layouts. */
 function getGitCommonDir(dir: string): string {
+  const gitPath = join(dir, '.git');
+  try {
+    const st = statSync(gitPath);
+    if (st.isDirectory()) {
+      return gitPath;
+    }
+    if (st.isFile()) {
+      const line = readFileSync(gitPath, 'utf-8').trim();
+      if (line.startsWith('gitdir:')) {
+        let target = line.slice('gitdir:'.length).trim();
+        target = resolve(dir, target);
+        const idx = target.lastIndexOf('/worktrees/');
+        if (idx !== -1) {
+          return target.slice(0, idx);
+        }
+      }
+    }
+  } catch {
+    // fallback below
+  }
   const out = runGit('rev-parse --git-common-dir', dir);
   return out ? resolve(dir, out) : dir;
 }
@@ -71,7 +147,11 @@ function getGitCommonDir(dir: string): string {
 /** Index 0 of `git worktree list --porcelain` is always the main worktree.
  *  All entries share its basename as `name`, so display stays stable
  *  regardless of which sibling readdir hits first. */
-function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
+function scanRepoFromAnyWorktree(
+  anyWorktreePath: string,
+  options: ProjectScanOptions = {},
+  knownPaths?: Set<string>,
+): ProjectInfo[] {
   const fallback: ProjectInfo[] = [{
     name: basename(anyWorktreePath),
     path: anyWorktreePath,
@@ -93,6 +173,7 @@ function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
   for (const line of lines) {
     if (line.startsWith('worktree ')) {
       currentPath = line.slice('worktree '.length);
+      knownPaths?.add(currentPath);
     } else if (line.startsWith('HEAD ')) {
       currentHead = line.slice('HEAD '.length);
     } else if (line.startsWith('branch ')) {
@@ -111,7 +192,10 @@ function scanRepoFromAnyWorktree(anyWorktreePath: string): ProjectInfo[] {
   if (entries.length === 0) return fallback;
 
   const repoName = basename(entries[0]!.path);
-  return entries.map((wt, i) => ({
+  const includeWorktrees = options.includeWorktrees !== false;
+  return entries
+    .filter((_wt, i) => includeWorktrees || i === 0)
+    .map((wt, i) => ({
     name: repoName,
     path: wt.path,
     type: i === 0 ? 'repo' : 'worktree',
@@ -127,13 +211,27 @@ function compareProjects(a: ProjectInfo, b: ProjectInfo): number {
 /**
  * Scan a directory for git repositories and their worktrees.
  */
-export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo[] {
+export function scanProjects(baseDir: string, maxDepth: number = 3, options: ProjectScanOptions = {}): ProjectInfo[] {
   const projects: ProjectInfo[] = [];
   const seenRepos = new Set<string>();   // by git-common-dir
   const seenPaths = new Set<string>();   // by absolute path
+  const maxScanDirs = options.maxScanDirs ?? DEFAULT_MAX_SCAN_DIRS;
+  const maxScanMs = options.maxScanMs ?? DEFAULT_MAX_SCAN_MS;
+  const deadline = Date.now() + maxScanMs;
+  let dirsVisited = 0;
+  let budgetReason: 'dirs' | 'time' | null = null;
+
+  function overBudget(): boolean {
+    if (dirsVisited >= maxScanDirs) { budgetReason ??= 'dirs'; return true; }
+    if (Date.now() >= deadline) { budgetReason ??= 'time'; return true; }
+    return false;
+  }
 
   function walk(dir: string, depth: number): void {
     if (depth > maxDepth) return;
+    if (seenPaths.has(dir)) return;
+    if (overBudget()) return;
+    dirsVisited++;
 
     let entries: string[];
     try {
@@ -147,9 +245,12 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
       if (seenRepos.has(commonDir)) return;
       seenRepos.add(commonDir);
 
-      for (const p of scanRepoFromAnyWorktree(dir)) {
+      for (const p of scanRepoFromAnyWorktree(dir, options, seenPaths)) {
         if (!seenPaths.has(p.path)) {
           seenPaths.add(p.path);
+          projects.push(p);
+        } else if (!projects.some(existing => existing.path === p.path)) {
+          // In case knownPaths already marked it but it's not yet in projects list
           projects.push(p);
         }
       }
@@ -159,6 +260,8 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
     for (const entry of entries) {
       if (entry.startsWith('.') || entry === 'node_modules' || entry === 'vendor' || entry === 'dist') continue;
       const fullPath = join(dir, entry);
+      if (seenPaths.has(fullPath)) continue;
+      if (overBudget()) return;
       try {
         if (statSync(fullPath).isDirectory()) {
           walk(fullPath, depth + 1);
@@ -172,19 +275,25 @@ export function scanProjects(baseDir: string, maxDepth: number = 3): ProjectInfo
   walk(baseDir, 0);
   projects.sort(compareProjects);
 
-  logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
+  if (budgetReason) {
+    const limit = budgetReason === 'dirs' ? `${maxScanDirs}-dir` : `${maxScanMs}ms`;
+    logger.warn(`Scanned ${baseDir}: hit ${limit} budget after ${dirsVisited} dirs, found ${projects.length} project(s) so far — results may be incomplete. Configure a narrower workingDirs to avoid scanning a huge root.`);
+    options.onBudgetExceeded?.({ reason: budgetReason, dirsVisited, baseDir });
+  } else {
+    logger.info(`Scanned ${baseDir}: found ${projects.length} project(s)`);
+  }
   return projects;
 }
 
 /**
  * Scan multiple directories and deduplicate by path.
  */
-export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3): ProjectInfo[] {
+export function scanMultipleProjects(baseDirs: string[], maxDepth: number = 3, options: ProjectScanOptions = {}): ProjectInfo[] {
   const seen = new Set<string>();
   const merged: ProjectInfo[] = [];
 
   for (const dir of baseDirs) {
-    for (const project of scanProjects(dir, maxDepth)) {
+    for (const project of scanProjects(dir, maxDepth, options)) {
       if (!seen.has(project.path)) {
         seen.add(project.path);
         merged.push(project);

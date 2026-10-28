@@ -1,6 +1,15 @@
 import type { LarkMessage, LarkMention } from '../../types.js';
 import { getMessageDetail } from './client.js';
 import { logger } from '../../utils/logger.js';
+import { getAllBots, effectiveBotDisplayName } from '../../bot-registry.js';
+import {
+  REPLY_CARD_FOOTER_ELEMENT_ID,
+  REPLY_CARD_FOOTER_MARKER,
+  REPLY_CARD_HEADING_ELEMENT_ID_RE,
+} from './reply-card-footer-signature.js';
+import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -8,6 +17,7 @@ interface RawEventData {
   sender: {
     sender_id: {
       open_id?: string;
+      app_id?: string;
       user_id?: string;
       union_id?: string;
     };
@@ -17,19 +27,261 @@ interface RawEventData {
   message: {
     message_id: string;
     root_id?: string;
+    thread_id?: string;
     parent_id?: string;
     message_type: string; // NOT msg_type
     content: string;
     chat_id: string;
     chat_type: string;
     create_time: string;
+    update_time?: string;
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
-      id?: { open_id?: string; user_id?: string; union_id?: string };
+      // Two shapes exist in the wild. The WS event (im.message.receive_v1)
+      // delivers an OBJECT: { open_id, union_id, user_id }. The REST API
+      // (im.message.get / list) delivers a bare STRING ("ou_xxx") plus a
+      // sibling `id_type`. Always read the open_id via mentionOpenId() so both
+      // forms are handled — see its doc-comment for why this matters.
+      id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string;
+      id_type?: string;  // present only in the REST string form, e.g. "open_id" / "app_id"
       tenant_key?: string;
     }>;
   };
+}
+
+/**
+ * Extract a mention's open_id, tolerating BOTH Lark shapes for `mention.id`:
+ *
+ *   - WebSocket event (im.message.receive_v1): `id` is an OBJECT
+ *       { open_id, union_id, user_id }            ← what botmux has always seen
+ *   - Message REST API (im.message.get / list):  `id` is a bare STRING "ou_xxx"
+ *       with a sibling `id_type` ("open_id" | "union_id" | "user_id")
+ *
+ * The two diverged in production: the API already ships the flat-string form
+ * while the event still ships the object form. If Lark ever converges the event
+ * onto the string form, every `m.id.open_id` read across botmux would silently
+ * become `undefined` and @-detection (isBotMentioned) would fail closed with no
+ * log. Reading through this helper keeps every caller robust regardless of
+ * which shape arrives.
+ *
+ * For the string form we return the value only when it actually IS an open_id
+ * (id_type === 'open_id', or absent — mentions are open_id-keyed by default). A
+ * string carrying a non-open_id id_type (union_id / user_id, which Lark may
+ * return when the app lacks the open_id scope) yields `undefined` rather than
+ * being mis-compared against a botOpenId.
+ */
+export function mentionOpenId(m: { id?: { open_id?: string; app_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.open_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type && m.id_type !== 'open_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
+}
+
+export interface MentionIdentity {
+  key?: string;
+  name?: string;
+  openId?: string;
+  userId?: string;
+  unionId?: string;
+  appId?: string;
+  idType?: string;
+}
+
+/** Extract all stable ids Lark provides for @mentions, across WS and REST shapes. */
+export function mentionIdentity(m: {
+  key?: string;
+  name?: string;
+  id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+} | null | undefined): MentionIdentity {
+  const id = m?.id;
+  const out: MentionIdentity = {
+    key: m?.key,
+    name: m?.name,
+    idType: m?.id_type,
+  };
+  if (id && typeof id === 'object') {
+    out.openId = id.open_id || undefined;
+    out.userId = id.user_id || undefined;
+    out.unionId = id.union_id || undefined;
+    out.appId = id.app_id || undefined;
+    return out;
+  }
+  if (typeof id === 'string' && id) {
+    if (!m?.id_type || m.id_type === 'open_id') out.openId = id;
+    else if (m.id_type === 'user_id') out.userId = id;
+    else if (m.id_type === 'union_id') out.unionId = id;
+    else if (m.id_type === 'app_id') out.appId = id;
+  }
+  return out;
+}
+
+/** id_type across both shapes Lark uses (snake_case REST, camelCase legacy). */
+export function mentionIdType(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.id_type === 'string') return m.id_type;
+  if (typeof m.idType === 'string') return m.idType;
+  return undefined;
+}
+
+/**
+ * Extract a bot mention's app_id across ALL shapes Lark has been observed to
+ * use. app_id-form bot mentions must never flow through mentionOpenId() (which
+ * is persisted/used as an open_id), so they are matched separately:
+ *   1. top-level camelCase `m.appId`
+ *   2. top-level snake_case `m.app_id`
+ *   3. string `m.id` with id_type === 'app_id' (REST bare-string OR legacy)
+ *   4. object `m.id.app_id`
+ * Keep this exhaustive: the realtime @-gate (isBotMentioned) depends on it, so
+ * dropping a shape silently un-@'s a bot in that shape.
+ */
+export function mentionAppId(m: any): string | undefined {
+  if (!m || typeof m !== 'object') return undefined;
+  if (typeof m.appId === 'string') return m.appId;
+  if (typeof m.app_id === 'string') return m.app_id;
+  const idType = mentionIdType(m);
+  if (idType === 'app_id' && typeof m.id === 'string') return m.id;
+  if (m.id && typeof m.id === 'object' && typeof m.id.app_id === 'string') return m.id.app_id;
+  return undefined;
+}
+
+/**
+ * Extract @-mentions carried by a post (rich-text) message's inline `at` nodes,
+ * as routing-only `LarkMention`s for the --mention-back participant window.
+ *
+ * WHY separate from parseEventMessage().mentions: a post's `message.mentions[]`
+ * is frequently empty — the real @s live as inline `{ tag: 'at', user_id,
+ * user_name }` nodes in the content (the realtime @-gate isBotMentioned already
+ * scans these). Folding them into the general `parsed.mentions` would ripple
+ * into prompt rendering / stripLeadingMentions / mention hints, so this stays a
+ * dedicated lane consumed ONLY by buildTurnParticipants.
+ *
+ * A post `at`'s `user_id` is an `ou_` open_id (in-group) or a `cli_` app_id
+ * (out-of-group bot). We classify into openId vs appId; `all` and any other
+ * shape are surfaced WITHOUT an executable id so the participant core marks the
+ * window incomplete rather than inventing a candidate. Deliberately NO position
+ * filtering (unlike mention-targets' command parsing) — every counterpart in the
+ * turn counts, including a leading @ of the answering bot (excluded later by
+ * self open_id/app_id). Returns [] on non-post shapes / parse errors.
+ */
+export function extractPostAtParticipants(message: { content?: string } | null | undefined): LarkMention[] {
+  const out: LarkMention[] = [];
+  let content: any;
+  try { content = JSON.parse(message?.content ?? '{}'); } catch { return out; }
+  const inner = content?.zh_cn ?? content?.en_us ?? content;
+  if (!Array.isArray(inner?.content)) return out;
+  let seq = 0;
+  for (const para of inner.content) {
+    if (!Array.isArray(para)) continue;
+    for (const node of para) {
+      if (node?.tag === 'at') {
+        const uid: string | undefined = typeof node.user_id === 'string' ? node.user_id : undefined;
+        const name: string | undefined = typeof node.user_name === 'string' ? node.user_name : undefined;
+        const isOpenId = !!uid && uid.startsWith('ou_');
+        const isAppId = !!uid && uid.startsWith('cli_');
+        out.push({
+          key: `@_post_at_${seq}`,
+          name: name ?? uid ?? '',
+          ...(isOpenId ? { openId: uid } : {}),
+          ...(isAppId ? { appId: uid } : {}),
+          idType: isAppId ? 'app_id' : 'open_id',
+        });
+      }
+      seq++;
+    }
+  }
+  return out;
+}
+
+/**
+ * truth for the @-gate across every consumer (realtime routing's isBotMentioned,
+ * the 30s poll backfill, and the dashboard preview/run-preview collector) so the
+ * "explicit @ hands off to normal routing, not the listener" rule can never
+ * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
+ * covers every observed app_id shape), and also scans post-content inline `at`
+ * tags (post messages may not populate `mentions`).
+ */
+export function messageMentionsBot(
+  message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
+  larkAppId: string | undefined,
+  botOpenId: string | undefined,
+): boolean {
+  if (!botOpenId && !larkAppId) return false;
+  const mentions: any[] = message?.mentions ?? [];
+  for (const m of mentions) {
+    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (larkAppId && mentionAppId(m) === larkAppId) return true;
+  }
+  // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
+  // Realtime events carry the body in `content`; the REST message-list API
+  // (poll + dashboard preview/run-preview) carries it in `body.content` — read
+  // both so the @-gate is identical across all three legs.
+  if (botOpenId) {
+    const rawContent = message?.content ?? message?.body?.content;
+    try {
+      const content = JSON.parse(rawContent ?? '{}');
+      const inner = content.zh_cn ?? content.en_us ?? content;
+      if (Array.isArray(inner?.content)) {
+        for (const paragraph of inner.content) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const node of paragraph) {
+            if (node?.tag === 'at' && node.user_id === botOpenId) return true;
+          }
+        }
+      }
+    } catch { /* ignore parse errors */ }
+  }
+  return false;
+}
+
+export function extractMentionIdentities(message: {
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    id?: { open_id?: string; user_id?: string; union_id?: string; app_id?: string } | string | null;
+    id_type?: string;
+  }>;
+  content?: string;
+} | null | undefined): MentionIdentity[] {
+  const out = (message?.mentions ?? []).map(mentionIdentity);
+  try {
+    const content = JSON.parse(message?.content ?? '{}');
+    const inner = content.zh_cn ?? content.en_us ?? content;
+    if (Array.isArray(inner?.content)) {
+      for (const paragraph of inner.content) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const node of paragraph) {
+          if (node?.tag !== 'at') continue;
+          // In post/rich-text content Lark carries the mentionee's OPEN_ID in the
+          // at-node's `user_id` field (cf. isBotMentioned, which compares
+          // node.user_id against botOpenId), NOT a tenant user_id. Map it to
+          // openId only — mislabeling it as userId would both miss a userId-only
+          // target and pollute the userId leg with an open_id value.
+          out.push({
+            name: node.user_name,
+            openId: node.user_id,
+          });
+        }
+      }
+    }
+  } catch { /* ignore non-JSON content */ }
+  return out;
+}
+
+export function mentionUnionId(m: { id?: { union_id?: string } | string | null; id_type?: string } | null | undefined): string | undefined {
+  const id = m?.id;
+  if (id == null) return undefined;
+  if (typeof id === 'object') return id.union_id || undefined;
+  if (typeof id === 'string') {
+    if (m?.id_type !== 'union_id') return undefined;
+    return id || undefined;
+  }
+  return undefined;
 }
 
 /**
@@ -133,7 +385,7 @@ export function isPureCardUpgradeFallback(content: string): boolean {
 }
 
 export interface MessageResource {
-  type: 'image' | 'file';
+  type: 'image' | 'file' | 'video';
   key: string;
   name: string;
   /** When set, download uses this message_id instead of the parent (e.g. merge_forward sub-messages). */
@@ -146,10 +398,10 @@ export interface MessageResource {
  * the same number, so duplicates across merge_forward sub-messages collapse
  * correctly.
  *
- * Image and file counters are INDEPENDENT — `formatAttachmentsHint` emits
- * `<image n=...>` and `<file n=...>` separately numbered, so a message with
+ * Image, file and video counters are INDEPENDENT — `formatAttachmentsHint`
+ * emits each attachment type separately numbered, so a message with
  * one image and one file should render as `[图片 1]` + `[文件 1]`, not
- * `[图片 1]` + `[文件 2]`. Keys are typed via the `image:` / `file:` prefix.
+ * `[图片 1]` + `[文件 2]`. Keys use the `image:` / `file:` / `video:` prefix.
  */
 export interface ImgNumberer {
   assign(key: string): { num: number; isNew: boolean };
@@ -159,18 +411,48 @@ export function createImgNumberer(): ImgNumberer {
   const map = new Map<string, number>();
   let imgCounter = 0;
   let fileCounter = 0;
+  let videoCounter = 0;
   return {
     assign(key: string) {
       const existing = map.get(key);
       if (existing !== undefined) return { num: existing, isNew: false };
-      // Key prefix selects the counter so image/file numbering stays
-      // independent (mirrors formatAttachmentsHint's per-type imgN/fileN).
-      // Unknown prefixes share the image counter as a safe default.
-      const num = key.startsWith('file:') ? ++fileCounter : ++imgCounter;
+      // Typed keys share the same independent counters as formatAttachmentsHint.
+      // Unknown prefixes retain the historical image counter.
+      const num = key.startsWith('file:') ? ++fileCounter
+        : key.startsWith('video:') ? ++videoCounter : ++imgCounter;
       map.set(key, num);
       return { num, isNew: true };
     },
   };
+}
+
+const VIDEO_FILE_NAME = /\.(mp4|m4v|mov|webm|mkv|avi|flv|3gp|wmv|mts)$/i;
+
+/** A single classifier keeps extraction, deduplication and text numbering aligned. */
+function fileResource(node: any): MessageResource | null {
+  if (typeof node.file_key !== 'string' || !node.file_key) return null;
+  const name = typeof node.file_name === 'string' && node.file_name ? node.file_name : node.file_key;
+  return { type: VIDEO_FILE_NAME.test(name) ? 'video' : 'file', key: node.file_key, name };
+}
+
+function mediaResource(node: any): MessageResource | null {
+  // image_key is only the poster; it must never replace a present video body.
+  if (typeof node.file_key === 'string' && node.file_key) {
+    return { type: 'video', key: node.file_key,
+      name: typeof node.file_name === 'string' && node.file_name ? node.file_name : `${node.file_key}.mp4` };
+  }
+  // A legacy poster-only payload is an image, never a JPEG renamed to .mp4.
+  if (typeof node.image_key === 'string' && node.image_key) {
+    return { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` };
+  }
+  return null;
+}
+
+function resourcePlaceholder(resource: MessageResource, numberer?: ImgNumberer, includeName = false): string {
+  const label = resource.type === 'image' ? '图片' : resource.type === 'video' ? '视频' : '文件';
+  const index = numberer ? ` ${numberer.assign(`${resource.type}:${resource.key}`).num}` : '';
+  const name = includeName ? `: ${resource.name}` : '';
+  return `[${label}${index}${name}]`;
 }
 
 export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
@@ -189,10 +471,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       return resources;
     }
 
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       const resources: MessageResource[] = [];
-      const fileKey = parsed.file_key;
-      if (fileKey) pushIfNew(resources, { type: 'file', key: fileKey, name: parsed.file_name ?? fileKey });
+      const resource = msgType === 'media' ? mediaResource(parsed) : fileResource(parsed);
+      if (resource) pushIfNew(resources, resource);
       return resources;
     }
 
@@ -202,12 +484,26 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       for (const block of contentBlocks) {
         const nodes = Array.isArray(block) ? block : [block];
         for (const node of nodes) {
-          if ((node.tag === 'img' || node.tag === 'media') && node.image_key) {
+          if (node.tag === 'media') {
+            const resource = mediaResource(node);
+            if (resource) pushIfNew(resources, resource);
+          } else if (node.tag === 'img' && node.image_key) {
             pushIfNew(resources, { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
+          } else if (node.tag === 'file') {
+            const resource = fileResource(node);
+            if (resource) pushIfNew(resources, resource);
           }
-          if (node.tag === 'file' && node.file_key) {
-            pushIfNew(resources, { type: 'file', key: node.file_key, name: node.file_name ?? node.file_key });
-          }
+        }
+      }
+      // Rich-text uploads made through some Lark clients are not inline nodes.
+      // They arrive beside the localized post body as a top-level `files` array.
+      // Resolve that body first (above), then append these descriptors; pushIfNew
+      // collapses a file that Lark happens to represent in both places.
+      const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
+      for (const file of topLevelFiles) {
+        if (file?.file_key) {
+          const resource = fileResource(file);
+          if (resource) pushIfNew(resources, resource);
         }
       }
       return resources;
@@ -226,10 +522,7 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
           for (const block of rootElements) {
             if (!Array.isArray(block)) continue;
             for (const node of block) {
-              const key = node.image_key ?? node.img_key;
-              if ((node.tag === 'img' || node.tag === 'image') && key) {
-                pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
-              }
+              extractElementImages(node, resources, pushIfNew);
             }
           }
         } else {
@@ -246,7 +539,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
   return [];
 }
 
-export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; resources: MessageResource[] } {
+export function parseEventMessage(
+  data: RawEventData,
+  numberer: ImgNumberer = createImgNumberer(),
+): { parsed: LarkMessage; resources: MessageResource[] } {
   const { sender, message } = data;
 
   // Trace non-text messages at debug only (DEBUG=1 gated). The raw card/post
@@ -261,7 +557,6 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
   // Share numberer so in-body [图片 N] placeholders use the same numbers as
   // the attachment list. Resources first → numbers assigned; text second →
   // reuses them.
-  const numberer = createImgNumberer();
   const resources = extractResources(message.message_type, message.content, numberer);
 
   // Extract structured mentions
@@ -270,37 +565,160 @@ export function parseEventMessage(data: RawEventData): { parsed: LarkMessage; re
       ? message.mentions.map(m => ({
           key: m.key,
           name: m.name,
-          openId: m.id?.open_id,
+          openId: mentionOpenId(m),
+          userId: mentionIdentity(m).userId,
+          unionId: mentionUnionId(m),
+          appId: mentionIdentity(m).appId,
+          idType: m.id_type,
         }))
       : undefined;
 
   const parsed: LarkMessage = {
     messageId: message.message_id,
     rootId: message.root_id ?? '',
+    threadId: message.thread_id || undefined,
     parentId: message.parent_id || undefined,
     senderId: sender.sender_id?.open_id ?? '',
     senderUnionId: sender.sender_id?.union_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
-    content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
+    ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),
+    content: extractTextContent(message.message_type, message.content, message.mentions ?? [], numberer),
     createTime: message.create_time,
     mentions,
   };
   return { parsed, resources };
 }
 
-export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
+/** `resolveMentions`: render `@_user_N` placeholders with the message's own
+ *  structured `mentions[]` (the REST list/get shapes carry them) exactly as the
+ *  event parser does, instead of dropping them. Opt-in: default output is
+ *  unchanged for every existing caller. */
+export function parseApiMessage(msg: any, numberer?: ImgNumberer, options?: { resolveMentions?: boolean }): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  const mentions = options?.resolveMentions
+    ? (Array.isArray(msg.mentions) ? msg.mentions as RawEventData['message']['mentions'] : [])
+    : undefined;
+  // sender_name is only present when the fetch opted in via with_sender_name=true
+  // (all client.ts message read paths do). Covers bot senders too — the one case
+  // local rosters can't resolve for third-party bots.
+  const senderName = typeof msg.sender?.sender_name === 'string' && msg.sender.sender_name.trim()
+    ? msg.sender.sender_name.trim()
+    : undefined;
   return {
     messageId: msg.message_id ?? '',
     rootId: msg.root_id ?? msg.thread_id ?? '',
     senderId: msg.sender?.id ?? '',
     senderType: msg.sender?.sender_type ?? 'unknown',
+    ...(senderName ? { senderName } : {}),
     msgType,
-    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
+    ...(msgType === 'post' ? { rawPostContent: rawContent } : {}),
+    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), mentions, numberer),
     createTime: msg.create_time ?? '',
   };
+}
+
+/** Structured mention evidence from either Lark shape, for observers that
+ *  must compare representations across live events and history reads. */
+export function structuredMentionRefs(mentions: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  if (!Array.isArray(mentions) || !mentions.length) return undefined;
+  const out = mentions.flatMap((m: any) => {
+    if (!m || typeof m.key !== 'string' || typeof m.name !== 'string' || !m.key || !m.name) return [];
+    const identity = mentionIdentity(m);
+    const openId = mentionOpenId(m); const appId = mentionAppId(m);
+    return [{ key: m.key, name: m.name, ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+      ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) }];
+  });
+  return out.length ? out : undefined;
+}
+
+/** The body as the platform stores it, with `@_user_N` placeholders left in
+ *  place, for message types whose rendered text depends on the mention list.
+ *  Live events and history reads of one platform version share this form
+ *  regardless of whether a `mentions[]` list was attached, so it is the
+ *  canonical identity of the body; undefined for other message types. */
+export function rawPlaceholderText(msgType: string, rawContent: string): string | undefined {
+  try {
+    if (msgType === 'text') {
+      const parsed = JSON.parse(rawContent);
+      const text = typeof parsed?.text === 'string' ? parsed.text : rawContent;
+      return text.trim();
+    }
+    if (msgType === 'post') return postCanonicalBody(JSON.parse(rawContent));
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const POST_CANONICAL_PREFIX = '{"post":';
+
+/** A post's identity as a typed node sequence: text nodes keep their literal
+ *  text, `at` nodes carry only their target id, other nodes their rendering.
+ *  Node boundaries are preserved, so literal prose can never collide with a
+ *  mention marker, and both observation paths (event with a top-level
+ *  `mentions[]`, history without one) derive the same body from the content. */
+function postCanonicalBody(parsed: any): string {
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs = content.map((paragraph: any[]) => (Array.isArray(paragraph) ? paragraph : [paragraph]).map((node: any) => {
+    if (node?.tag === 'at') return { at: postAtTargetId(node) };
+    if (node?.tag === 'text') return { t: String(node.text ?? '') };
+    return { x: renderPostNode(node) };
+  }));
+  return `${POST_CANONICAL_PREFIX}${JSON.stringify({ title: String(title ?? ''), content: paragraphs })}}`;
+}
+
+function postAtTargetId(node: any): string {
+  return typeof node?.user_id === 'string' && node.user_id ? node.user_id : `name:${String(node?.user_name ?? 'unknown')}`;
+}
+
+/** Target ids of a post's `at` nodes in document order, from its canonical body. */
+export function postCanonicalMentionOrder(canonical: string): string[] | undefined {
+  if (!canonical.startsWith(POST_CANONICAL_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(canonical).post;
+    const order: string[] = [];
+    for (const paragraph of parsed.content ?? []) for (const node of paragraph) if (typeof node?.at === 'string') order.push(node.at);
+    return order;
+  } catch { return undefined; }
+}
+
+/** Mention identities of a post, derived from its inline `at` nodes in
+ *  document order (the one source both observation paths share). A top-level
+ *  `mentions[]` list, when present, only enriches the entry whose id matches
+ *  the node target (display name, typed app/union/user ids); it never defines
+ *  the order or the set. Keys are `@_at:<target id>`. */
+export function postMentionRefs(rawContent: string, topLevel?: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  try {
+    const { content } = resolvePostBody(JSON.parse(rawContent));
+    const enrich = new Map<string, { name: string; openId?: string; appId?: string; userId?: string; unionId?: string }>();
+    for (const m of Array.isArray(topLevel) ? topLevel : []) {
+      if (!m || typeof m !== 'object') continue;
+      const identity = mentionIdentity(m); const openId = mentionOpenId(m); const appId = mentionAppId(m);
+      const entry = { name: String((m as any).name ?? ''), ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+        ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) };
+      for (const id of [openId, appId, identity.userId, identity.unionId]) if (id) enrich.set(id, entry);
+    }
+    const out: Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> = [];
+    const seen = new Set<string>();
+    for (const paragraph of content) {
+      for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+        if (node?.tag !== 'at') continue;
+        const target = postAtTargetId(node);
+        if (seen.has(target)) continue;
+        seen.add(target);
+        const known = enrich.get(target);
+        const name = String(node.user_name ?? known?.name ?? 'unknown');
+        if (known) { out.push({ key: `@_at:${target}`, ...known, name }); continue; }
+        const openId = typeof node.user_id === 'string' && node.user_id ? node.user_id : undefined;
+        out.push({ key: `@_at:${target}`, name, ...(openId ? { openId } : {}) });
+      }
+    }
+    return out.length ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeApiMessageContent(msgType: string, rawContent: string): string {
@@ -309,7 +727,7 @@ function normalizeApiMessageContent(msgType: string, rawContent: string): string
 }
 
 /** Resolve post body from either wrapped {"zh_cn":{title,content}} or unwrapped {title,content} format */
-function resolvePostBody(parsed: any): { title: string; content: any[] } {
+export function resolvePostBody(parsed: any): { title: string; content: any[] } {
   // Unwrapped: has content array directly
   if (Array.isArray(parsed.content)) {
     return { title: parsed.title ?? '', content: parsed.content };
@@ -322,6 +740,90 @@ function resolvePostBody(parsed: any): { title: string; content: any[] } {
     }
   }
   return { title: '', content: [] };
+}
+
+/** Narrow rich-post projection for keyword listeners. It intentionally keeps
+ * only visible title/text/link content so listener matching does not inherit
+ * unrelated mention, file, image, or code-rendering semantics. */
+export function extractPostListenerText(parsed: unknown): string {
+  if (!parsed || typeof parsed !== 'object') return '';
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs: string[] = [];
+  for (const paragraph of content) {
+    const parts: string[] = [];
+    for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+      if (!node || typeof node !== 'object') continue;
+      if (node.tag === 'text' && typeof node.text === 'string') {
+        parts.push(node.text);
+      } else if (node.tag === 'a') {
+        const label = typeof node.text === 'string' ? node.text.trim() : '';
+        const href = typeof node.href === 'string' ? node.href.trim() : '';
+        if (label) parts.push(label);
+        if (href && href !== label) parts.push(label ? ` (${href})` : href);
+      }
+    }
+    const text = parts.join('').trim();
+    if (text) paragraphs.push(text);
+  }
+  return [typeof title === 'string' ? title.trim() : '', ...paragraphs].filter(Boolean).join('\n');
+}
+
+/** 一条 @mention 在两种形状下的松散视图：`parseEventMessage` 产出的 `LarkMention`
+ *  （openId/appId 已解析）与飞书事件里的原始 `message.mentions[]`（id/id_type）。 */
+type LooseMention = {
+  name?: string;
+  openId?: string;
+  appId?: string;
+  id?: { open_id?: string; app_id?: string } | string | null;
+  id_type?: string;
+};
+
+/**
+ * 剥掉**对本 bot** 的所有 `@名字`，不限位置。
+ *
+ * 话题指令头的解析前置步骤：路由判定本来就按 `mentions` 数组（`isBotMentioned`），
+ * 与 @ 在文本里的位置无关，所以 `标题 /t … 正文 @机器人` 里那个结尾的 @ 只是寻址，
+ * 不能占住一个 token 位把正文切歪（决策 D8）。
+ *
+ * 与 {@link stripLeadingMentions} 的分工：那个按**位置**剥（开头连续的 @，谁的都剥），
+ * 这个按**身份**剥（只剥本 bot 的，任意位置）。对其他成员 / 其它 bot 的 @ 一律保留
+ * ——那是正文内容，CLI 需要看到。两者可以叠加：daemon 先按位置剥前导，再按身份剥自己。
+ *
+ * 认不出本 bot（没有 mentions、或没有一条匹配 open_id / app_id）时原样返回。
+ */
+export function stripBotMentions(
+  content: string,
+  mentions: readonly LooseMention[] | undefined,
+  self: { botOpenId?: string; larkAppId?: string },
+): string {
+  if (!mentions || mentions.length === 0) return content;
+  const names = new Set<string>();
+  for (const m of mentions) {
+    const openId = m?.openId ?? mentionOpenId(m as any);
+    const appId = m?.appId ?? mentionAppId(m as any);
+    const isSelf = (!!self.botOpenId && openId === self.botOpenId)
+      || (!!self.larkAppId && appId === self.larkAppId);
+    if (isSelf && typeof m?.name === 'string' && m.name.trim()) names.add(m.name);
+  }
+  if (names.size === 0) return content;
+  // 长名字优先，否则 "@Claude" 会先吃掉 "@Claude分身" 的前半截，留下孤儿 "分身"
+  //（与 stripLeadingMentions 里同一条教训）。
+  const alternation = [...names]
+    .sort((a, b) => b.length - a.length)
+    .map(escapeRegExp)
+    .join('|');
+  // 连同紧贴的**行内**空白一起吃掉，只在 @ 两侧都有空白时补回一个空格：句中的
+  // "干活 @bot 继续" 不粘连，行首/行尾的 @ 不留下孤零零的空格。换行与正文缩进
+  // 一个字符都不动——正文要按原始排版交给 CLI。
+  const pattern = new RegExp(`([^\\S\\r\\n]*)@(?:${alternation})([^\\S\\r\\n]*)`, 'g');
+  return content
+    .replace(pattern, (_match, before: string, after: string) => (before && after ? ' ' : ''))
+    .trim();
+}
+
+/** 把用户可控的名字安全地嵌进正则（名字里可能有 `.` `+` `(` 等元字符）。 */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**
@@ -370,15 +872,219 @@ export function stripLeadingMentions(content: string, mentions?: { name: string 
   return s;
 }
 
-function resolveMentions(text: string, mentions?: RawEventData['message']['mentions']): string {
-  if (!mentions || mentions.length === 0) {
-    // No mention info available — strip placeholders
-    return text.replace(/@_user_\d+/g, '').replace(/[^\S\r\n]{2,}/g, ' ').trim();
-  }
+/**
+ * Dispatcher 路由侧复刻 daemon **命令车道**对入站消息的渲染：即 daemon 在
+ * `handleNewTopicAdmitted` / `handleThreadReplyAdmitted` 里做斜杠判定前看到的
+ * `parsed.content`（post 标题拼成首行、段落以 `\n` 连接、`at`→`@user_name`
+ * 不带前导空格、`a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）。
+ *
+ * 热路径上的 {@link extractMessageTextForRouting}（在 dispatcher 里）只拼 text
+ * 节点、丢弃 title 与附件节点，是给 `/t` 等判定用的轻量窥视，**不能**拿它判内置
+ * 免 @ 命令：两套渲染在带标题富文本、text 与 at 紧贴等形态上会给出不同文本，
+ * 导致「群闸放行、daemon 却不认命令」地误建会话。需要与 daemon 结论对齐的判定
+ * 用本函数取车道文本，再走同一个 {@link stripLeadingMentions } +
+ * `parseSlashCommandInvocation`，两侧同一结论才放行。
+ *
+ * 纯解析：不做资源下载、合并转发展开或语音转写（那些发生在 daemon 更深处；本函数
+ * 的调用方只在轻量窥视已形似单行内置命令时才调用，附件/语音候选在 dispatcher
+ * 更早处已被路由）。
+ */
+export function daemonCommandLanePreview(data: RawEventData): { text: string; mentions: LarkMention[] } {
+  const { parsed } = parseEventMessage(data, createImgNumberer());
+  return { text: parsed.content, mentions: parsed.mentions ?? [] };
+}
+
+function matchesMentionId(m: any, id: string): boolean {
+  if (!m || !id) return false;
+  const openId = m.openId ?? mentionOpenId(m);
+  if (openId === id) return true;
+  const identity = mentionIdentity(m);
+  if (identity.userId === id || m.userId === id) return true;
+  if (identity.unionId === id || m.unionId === id) return true;
+  if (identity.appId === id || m.appId === id || mentionAppId(m) === id) return true;
+  if (typeof m.id === 'string' && m.id === id) return true;
+  if (m.key === id) return true;
+  return false;
+}
+
+function lookupBotDisplayName(id: string): string | undefined {
+  if (!id) return undefined;
+  try {
+    const list = getAllBots();
+    if (Array.isArray(list)) {
+      const b = list.find(bot => bot.botOpenId === id || bot.config?.larkAppId === id);
+      if (b) return effectiveBotDisplayName(b);
+    }
+  } catch { /* best-effort */ }
+  return undefined;
+}
+
+export function resolveMentions(text: string, mentions?: Array<any>): string {
+  if (!text) return '';
+
+  const mentionList = (mentions ?? []).filter(
+    (m: any) => m && typeof m.name === 'string' && m.name.trim().length > 0,
+  );
+  const consumed = new Set<any>();
+
   let result = text;
-  for (const m of mentions) {
-    result = result.replace(m.key, `@${m.name}`);
+
+  // 1. Replace explicit @_user_N or other structured mention keys present in text
+  for (const m of mentionList) {
+    if (typeof m.key === 'string' && m.key.startsWith('@') && result.includes(m.key)) {
+      result = result.replaceAll(m.key, `@${m.name.trim()}`);
+      consumed.add(m);
+    }
   }
+
+  // 2. Resolve <at ...> tags (Lark card markdown / rich text inline mentions)
+  // Use negative lookahead to prevent swallowed nested tags across malformed inputs
+  const AT_TAG_RE = /<at\b([^>]*?)(?:\/>|>((?:(?!<at\b)[\s\S])*?)<\/at>)/gis;
+
+  if (AT_TAG_RE.test(result)) {
+    AT_TAG_RE.lastIndex = 0;
+
+    interface TagMatch {
+      fullMatch: string;
+      start: number;
+      end: number;
+      id: string;
+      nameAttr: string;
+      innerText: string;
+      resolved?: string;
+    }
+
+    const tagMatches: TagMatch[] = [];
+
+    let match: RegExpExecArray | null;
+    while ((match = AT_TAG_RE.exec(result)) !== null) {
+      const fullMatch = match[0];
+      const start = match.index;
+      const end = start + fullMatch.length;
+      const attrs = match[1] || '';
+      const body = match[2];
+
+      const idMatch = attrs.match(/\b(?:id|user_id)=["']?([^"'\s>]+)["']?/i);
+      const id = idMatch ? idMatch[1] : '';
+
+      const nameMatch = attrs.match(/\bname=["']([^"']+)["']?/i);
+      const nameAttr = nameMatch ? nameMatch[1].trim() : '';
+
+      const innerText = (body ?? '').trim();
+
+      tagMatches.push({ fullMatch, start, end, id, nameAttr, innerText });
+    }
+
+    // Pass 1: Exact matches & explicit naming
+    // Matches by ID against mentionList, @all, local bot registry, or explicit inner text / name attribute.
+    let exactIdMatchCount = 0;
+
+    for (const tag of tagMatches) {
+      if (tag.id.toLowerCase() === 'all') {
+        tag.resolved = '@所有人';
+        continue;
+      }
+
+      if (tag.id) {
+        const exact = mentionList.find(m => matchesMentionId(m, tag.id));
+        if (exact) {
+          consumed.add(exact);
+          tag.resolved = `@${exact.name.trim()}`;
+          exactIdMatchCount++;
+          continue;
+        }
+      }
+
+      if (tag.innerText && !/<at\b/i.test(tag.innerText)) {
+        tag.resolved = `@${tag.innerText}`;
+        continue;
+      }
+
+      if (tag.nameAttr) {
+        tag.resolved = `@${tag.nameAttr}`;
+        continue;
+      }
+
+      if (tag.id) {
+        const botName = lookupBotDisplayName(tag.id);
+        if (botName) {
+          tag.resolved = `@${botName}`;
+          continue;
+        }
+      }
+    }
+
+    // Pass 2: Positional fallback for remaining unresolved tags
+    // ONLY in cross-app forwarding scenarios where NO tag had an exact ID match.
+    // When exactIdMatchCount > 0, the message and mentions share the same ID namespace,
+    // so any unmatched tag ID must not steal an unclaimed mention.
+    if (exactIdMatchCount === 0) {
+      // Propagate resolved names across duplicate tag IDs if any sibling resolved
+      for (const tag of tagMatches) {
+        if (tag.resolved === undefined && tag.id) {
+          const sibling = tagMatches.find(t => t !== tag && t.id === tag.id && t.resolved !== undefined);
+          if (sibling) {
+            tag.resolved = sibling.resolved;
+          }
+        }
+      }
+
+      const remainingTags = tagMatches.filter(t => t.resolved === undefined);
+      const remainingMentions = mentionList.filter(m => !consumed.has(m));
+
+      // In cross-app scenarios, Lark delivers mentions in the same document order as the tags.
+      // If tag count and mention count are aligned (or 1-to-1), assign by position.
+      // If counts diverge (e.g. 2 tags but 1 mention), avoid guessing to prevent false attribution.
+      if (remainingTags.length > 0 && remainingMentions.length > 0) {
+        if (remainingTags.length === remainingMentions.length) {
+          for (let i = 0; i < remainingTags.length; i++) {
+            const tag = remainingTags[i];
+            const m = remainingMentions[i];
+            consumed.add(m);
+            tag.resolved = `@${m.name.trim()}`;
+          }
+        } else if (remainingTags.length === 1 && remainingMentions.length >= 1) {
+          const tag = remainingTags[0];
+          const m = remainingMentions[0];
+          consumed.add(m);
+          tag.resolved = `@${m.name.trim()}`;
+        }
+      }
+    }
+
+    // Pass 3: Apply replacements from right to left
+    for (let i = tagMatches.length - 1; i >= 0; i--) {
+      const item = tagMatches[i];
+      let repl: string;
+      if (item.resolved !== undefined) {
+        repl = item.resolved;
+      } else if (mentions !== undefined) {
+        repl = '';
+      } else {
+        repl = item.fullMatch;
+      }
+
+      let start = item.start;
+      let end = item.end;
+      // If stripping tag between spaces, collapse the redundant double space locally
+      // without touching code block indentation or multi-space formatting elsewhere
+      if (repl === '' && start > 0 && end < result.length && result[start - 1] === ' ' && result[end] === ' ') {
+        end++;
+      }
+      result = result.slice(0, start) + repl + result.slice(end);
+    }
+
+    // Clean up any orphaned </at> tags left behind by malformed markup when resolving mentions
+    if (mentions !== undefined && /<\/at>/i.test(result)) {
+      result = result.replace(/<\/at>/gi, '');
+    }
+  }
+
+  // 3. Strip any unresolvable @_user_\d+ placeholders and normalize spacing around them
+  if (/@_user_\d+/.test(result)) {
+    result = result.replace(/@_user_\d+/g, '').replace(/[^\S\r\n]{2,}/g, ' ');
+  }
+
   return result.trim();
 }
 
@@ -403,28 +1109,55 @@ function renderPostCodeBlock(node: any): string {
 
 function renderPostNode(node: any, numberer?: ImgNumberer): string {
   if (node.tag === 'text') return node.text ?? '';
-  if (node.tag === 'a') return node.text ?? node.href ?? '';
+  if (node.tag === 'a') {
+    // Titled links keep their destination only in href. Preserve it just as
+    // card anchors do, without duplicating links whose label is already a URL.
+    const text = node.text ?? '';
+    return text && node.href && text !== node.href
+      ? `${text}(${node.href})`
+      : (text || node.href || '');
+  }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
-  if (node.tag === 'img' || node.tag === 'media') {
-    const key = node.image_key ?? node.file_key;
+  if (node.tag === 'media') {
+    const resource = mediaResource(node);
+    return resource ? resourcePlaceholder(resource, numberer) : '[视频]';
+  }
+  if (node.tag === 'img') {
+    const key = node.image_key;
     if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
     return '[图片]';
   }
   if (node.tag === 'file') {
-    const key = node.file_key;
-    const name = node.file_name ?? '';
-    if (key && numberer) {
-      const n = numberer.assign(`file:${key}`).num;
-      return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
-    }
-    return name ? `[文件: ${name}]` : '[文件]';
+    const resource = fileResource(node);
+    if (resource) return resourcePlaceholder(resource, numberer, !!node.file_name);
+    return node.file_name ? `[文件: ${node.file_name}]` : '[文件]';
   }
   return '';
 }
 
 function joinPostNodeText(parts: string[]): string {
   return parts.join('').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** Placeholder for inbound voice messages. The daemon's audio-transcribe hook
+ *  replaces it with the ASR transcript (prefixed) before the turn is
+ *  dispatched; paths the hook doesn't cover still get this safe placeholder
+ *  instead of the raw {"file_key":...} JSON. */
+export const AUDIO_PLACEHOLDER = '[语音]';
+
+/** Authored text only: file names, media placeholders and forwarded content are
+ * resource metadata, not statements by the sender. Ordinary rendering is unchanged. */
+export function extractAuthoredMessageText(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions']): string {
+  if (msgType === 'text') return extractTextContent(msgType, rawContent, mentions ?? []);
+  if (msgType !== 'post') return '';
+  const { title, content } = resolvePostBody(JSON.parse(rawContent));
+  const body = content.map(paragraph => {
+    const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
+    return joinPostNodeText(nodes.filter(node => !['img', 'image', 'file', 'media', 'audio'].includes(node?.tag))
+      .map(node => renderPostNode(node)));
+  }).filter(Boolean).join('\n');
+  return title ? `${title}\n${body}` : body;
 }
 
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
@@ -452,48 +1185,176 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       } catch { /* fall through */ }
       return '[图片]';
     }
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       try {
         const p = JSON.parse(rawContent);
-        if (p.file_key && numberer) {
-          const n = numberer.assign(`file:${p.file_key}`).num;
-          return p.file_name ? `[文件 ${n}: ${p.file_name}]` : `[文件 ${n}]`;
-        }
-        return `[文件: ${p.file_name ?? 'unknown'}]`;
+        const resource = msgType === 'media' ? mediaResource(p) : fileResource(p);
+        if (resource) return resourcePlaceholder(resource, numberer, msgType === 'file' && !!p.file_name);
+        return msgType === 'media' ? '[视频]' : `[文件: ${p.file_name ?? 'unknown'}]`;
       } catch {
-        return '[文件]';
+        return msgType === 'media' ? '[视频]' : '[文件]';
       }
     }
+    if (msgType === 'audio') {
+      // 语音消息的转写在 daemon 的 audio-transcribe hook 里完成（下载 opus →
+      // ASR → 带前缀文本）；这里只给占位符，避免原始 JSON 注入 CLI。
+      return AUDIO_PLACEHOLDER;
+    }
     if (msgType === 'interactive') {
-      return extractCardContent(rawContent, numberer);
+      return extractCardContent(rawContent, numberer, mentions);
     }
     if (msgType === 'merge_forward') {
       return '[合并转发消息]';
     }
-    return rawContent;
+    return resolveMentions(rawContent, mentions);
   } catch {
-    return rawContent;
+    return resolveMentions(rawContent, mentions);
   }
 }
 
 /**
- * botmux-generated card footer signature. Every card `botmux send` /
- * buildMarkdownCard emits ends with a small grey note linking back to the repo
- * (`[botmux](https://github.com/deepcoldy/botmux)`, optionally `· 发送给：@owner`).
- * That footer is human-facing chrome — when another bot receives the card it
- * must NOT leak into the receiving bot's prompt (it surfaces as a stray
- * `<font color='grey'>botmux</font>` block and duplicates mention info). Both
- * Lark render formats carry the canonical repo URL on that footer line (Format B
- * as the markdown link target, Format A as the `<a href>`), so the URL is a
- * reliable, format-agnostic marker. Anchored on the full repo URL so genuine
- * body text merely mentioning "botmux" survives. Known, accepted trade-off: a
- * card whose own body puts this exact repo URL on a line would lose that line
- * too — vanishingly rare versus the value of a simple format-agnostic anchor.
+ * Extract the download key from an inbound audio message's raw content
+ * (`{"file_key":"...","duration":<ms>}`). Returns null when the content isn't
+ * valid JSON or carries no usable file_key — callers should treat that as a
+ * permanent failure (reply, don't retry). `duration` is optional and surfaced
+ * as durationMs for callers that want to log/skip overlong clips.
  */
-const BOTMUX_FOOTER_MARKER = 'github.com/deepcoldy/botmux';
+export function extractAudioMeta(rawContent: string): { fileKey: string; durationMs?: number } | null {
+  try {
+    const parsed = JSON.parse(rawContent);
+    if (!parsed || typeof parsed.file_key !== 'string' || !parsed.file_key) return null;
+    return {
+      fileKey: parsed.file_key,
+      ...(typeof parsed.duration === 'number' ? { durationMs: parsed.duration } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
 
-function isBotmuxFooterLine(line: string): boolean {
-  return line.includes(BOTMUX_FOOTER_MARKER);
+/**
+ * botmux-generated reply-card footer signature. New cards carry both an
+ * invisible text marker and an exact element id. Older signed cards used a
+ * versioned link, which remains recognized for compatibility. The canonical
+ * repository URL is NOT a signature: it is valid body content. For pre-signature cards we
+ * recognize only the exact old default-brand + recipient chrome shape; a
+ * default-brand-only old card is intentionally preserved because it is
+ * indistinguishable from an ordinary repository link.
+ */
+const LEGACY_DEFAULT_FOOTER_URL = 'https://github.com/deepcoldy/botmux';
+const FOOTER_MARKER_HASHES = new Set(['#reply-card-footer', '#reply-card-footer-v1']);
+
+function isBotmuxFooterMarkerUrl(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:'
+      && url.hostname === 'github.com'
+      && url.port === ''
+      && url.username === ''
+      && url.password === ''
+      && url.search === ''
+      && decodeURIComponent(url.pathname) === '/deepcoldy/botmux'
+      && FOOTER_MARKER_HASHES.has(url.hash);
+  } catch {
+    return false;
+  }
+}
+
+function isBotmuxFooterMarkerText(value: unknown): boolean {
+  return value === '·' || value === '\u200B';
+}
+
+function isBotmuxFooterMarkerAnchor(href: unknown, text: unknown): boolean {
+  return isBotmuxFooterMarkerText(text) && isBotmuxFooterMarkerUrl(href);
+}
+
+function greyFontInner(line: string): string | null {
+  const font = /^\s*<font\b([^>]*)>([\s\S]*?)<\/font>\s*$/i.exec(line);
+  if (!font || !/\bcolor\s*=\s*(?:"grey"|'grey'|grey)(?:\s|$)/i.test(font[1])) return null;
+  return font[2];
+}
+
+function hasExactMarkerMarkdown(value: string): boolean {
+  // Match only the protocol's reserved anchor texts. A generic Markdown-link
+  // regex can start at an unmatched `[` inside a custom brand and swallow the
+  // later marker before it gets a chance to match.
+  for (const match of value.matchAll(/\[(·|\u200B)\]\(([^)\s]+)\)/gu)) {
+    if (isBotmuxFooterMarkerAnchor(match[2], match[1])) return true;
+  }
+  return false;
+}
+
+function hasCurrentFooterMarker(value: unknown): value is string {
+  return typeof value === 'string' && value.includes(REPLY_CARD_FOOTER_MARKER);
+}
+
+function isSignedFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  return inner !== null && (hasCurrentFooterMarker(inner) || hasExactMarkerMarkdown(inner));
+}
+
+/** Strict compatibility recognizer for Format A cards emitted before the
+ * versioned marker existed. Recipient chrome is required; without it, the old
+ * default-brand-only footer is indistinguishable from a real repository link. */
+function isMeaningfulFormatANode(node: unknown): boolean {
+  if (!node || typeof node !== 'object') return false;
+  const value = node as any;
+  if (value.tag === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
+  return true;
+}
+
+function isLegacyFormatAFooterParagraph(paragraph: unknown[]): boolean {
+  const nodes = paragraph.filter(isMeaningfulFormatANode) as any[];
+  const first = nodes[0];
+  if (
+    first?.tag !== 'a'
+    || first.href !== LEGACY_DEFAULT_FOOTER_URL
+    || typeof first.text !== 'string'
+    || first.text.trim().toLowerCase() !== 'botmux'
+  ) {
+    return false;
+  }
+
+  let label = '';
+  let sawAt = false;
+  for (const node of nodes.slice(1)) {
+    if (node.tag === 'at') {
+      sawAt = true;
+      continue;
+    }
+    if (node.tag !== 'text' || typeof node.text !== 'string') return false;
+    if (sawAt && node.text.trim() !== '') return false;
+    label += node.text;
+  }
+  return sawAt && /^\s*·\s*(?:发送给：|Sent to:)\s*$/i.test(label);
+}
+
+/** Strict compatibility recognizer for an old original-format footer line.
+ * Grey styling plus exact default brand, locale label, and one or more native
+ * mentions are all required; styling or the canonical URL alone proves
+ * nothing. */
+function isLegacyFormatBFooterLine(line: string): boolean {
+  const inner = greyFontInner(line);
+  if (inner === null) return false;
+  return /^\s*\[botmux\]\(https:\/\/github\.com\/deepcoldy\/botmux\)\s*·\s*(?:发送给：|Sent to:)\s*(?:<at\s+id=(?:"[^"]+"|'[^']+'|[^\s>]+)\s*><\/at>\s*)+$/i
+    .test(inner);
+}
+
+function extractRenderedCardContent(rawContent: string): string | undefined {
+  const match = rawContent.match(/^\s*<card(?:\s+title="([^"]*)")?\s*>([\s\S]*)<\/card>\s*$/);
+  if (!match) return undefined;
+  const title = match[1]?.trim();
+  const body = match[2]
+    .split('\n')
+    .map(line => line.trimEnd())
+    .filter(line => !isSignedFormatBFooterLine(line))
+    .join('\n')
+    .trim();
+  return [
+    title ? `[卡片: ${title}]` : '',
+    body,
+  ].filter(Boolean).join('\n') || '[卡片]';
 }
 
 /**
@@ -504,14 +1365,17 @@ function isBotmuxFooterLine(line: string): boolean {
  * This is similar to post message body.  We also handle the original card JSON
  * (header/config/elements with tag objects) for locally-cached cards.
  */
-function extractCardContent(rawContent: string, numberer?: ImgNumberer): string {
+export function extractCardContent(rawContent: string, numberer?: ImgNumberer, mentions?: RawEventData['message']['mentions']): string {
+  const rendered = extractRenderedCardContent(rawContent);
+  if (rendered !== undefined) return resolveMentions(rendered, mentions);
+
   try {
     const card = JSON.parse(rawContent);
 
     // Pre-resolved merged text injected by resolveMergedCardContent (the
     // A+B union for complex cards). Return it verbatim so the merge flows
     // through both parseEventMessage (live) and parseApiMessage (history).
-    if (typeof card[RESOLVED_TEXT_KEY] === 'string') return card[RESOLVED_TEXT_KEY];
+    if (typeof card[RESOLVED_TEXT_KEY] === 'string') return resolveMentions(card[RESOLVED_TEXT_KEY], mentions);
 
     // Template-based card — no inline content to extract
     if (card.type === 'template') {
@@ -526,8 +1390,11 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
     // 卡片的 outgoing 消息）让 elements 内容自己说话，避免在正文前堆一行
     // 多余的 `[卡片]`。整张卡片真的没内容时下方 `parts.join('\n') || '[卡片]'`
     // 会兜底返回占位。
-    const title = card.title ?? card.header?.title?.content;
+    const title = nestedCardText(card.title) ?? nestedCardText(card.header?.title);
     if (title) parts.push(`[卡片: ${title}]`);
+    for (const tagText of extractCardHeaderTagTexts(card.header)) {
+      parts.push(`[标签: ${tagText}]`);
+    }
 
     // v2 cards nest elements under `body`; fall back to legacy top-level.
     const rootElements = Array.isArray(card.body?.elements)
@@ -541,17 +1408,61 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
 
       if (isApiFormat) {
         // Format A: [[{tag:"text",text:"..."}, {tag:"img",...}, {tag:"button",...}], ...]
-        for (const paragraph of rootElements) {
+        let lastMeaningfulParagraphIndex = -1;
+        for (let i = rootElements.length - 1; i >= 0; i--) {
+          const candidate = rootElements[i];
+          if (Array.isArray(candidate) && candidate.some(isMeaningfulFormatANode)) {
+            lastMeaningfulParagraphIndex = i;
+            break;
+          }
+        }
+        for (let paragraphIndex = 0; paragraphIndex < rootElements.length; paragraphIndex++) {
+          const paragraph = rootElements[paragraphIndex];
           if (!Array.isArray(paragraph)) continue;
+          if (
+            paragraphIndex === lastMeaningfulParagraphIndex
+            && isLegacyFormatAFooterParagraph(paragraph)
+          ) {
+            continue;
+          }
           const textNodes: string[] = [];
           const buttons: string[] = [];
+          let inSignedFooter = false;
           for (const node of paragraph) {
-            if (node.tag === 'text') { if (node.text) textNodes.push(node.text); }
+            if (inSignedFooter) continue;
+            if (node.tag === 'text') {
+              const visibleText = typeof node.text === 'string'
+                ? stripTrailingGroupContextCardPurposeMarker(node.text)
+                : node.text;
+              if (visibleText !== node.text
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                if (visibleText) textNodes.push(visibleText);
+                continue;
+              }
+              if (hasCurrentFooterMarker(node.text)) {
+                textNodes.push(node.text.slice(0, node.text.indexOf(REPLY_CARD_FOOTER_MARKER)));
+                inSignedFooter = true;
+                continue;
+              }
+              if (node.text) textNodes.push(node.text);
+            }
             else if (node.tag === 'a') {
+              if (isBotmuxFooterMarkerAnchor(node.href, node.text)) {
+                inSignedFooter = true;
+                continue;
+              }
               // Keep the href so links survive — Format A separates text/href,
               // and dropping href loses real content (规则配置/详情/Trace 链接).
+              // Bare long URLs (e.g. Argos Kibana 处理建议) come back with
+              // text === href, both cut at the same offset, and the remainder
+              // spilling into the FOLLOWING text nodes of the same paragraph.
+              // Emitting `text(href)` would double the truncated URL and
+              // corrupt the line; a single copy lets join('') below reconnect
+              // the full URL from those remainder nodes.
               const t = node.text ?? '';
-              textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
+              if (t && t === node.href) textNodes.push(t);
+              else textNodes.push(node.href && t ? `${t}(${node.href})` : (t || node.href || ''));
             }
             else if (node.tag === 'at') textNodes.push(`@${node.user_name ?? 'unknown'}`);
             else if (node.tag === 'img' || node.tag === 'image') {
@@ -559,14 +1470,24 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
               if (k) textNodes.push(imgLabel(k));
             }
             else if (node.tag === 'button') {
+              // Same jump-URL policy as Format B: simple cards reach history
+              // via the Format A list view WITHOUT a resolve pass, so dropping
+              // the URL here would lose button links on that main path.
+              if (isBotmuxCallbackButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
-              if (btnText) buttons.push(`[${btnText}]`);
+              if (btnText) {
+                const url = buttonOpenUrl(node);
+                buttons.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+              }
             }
             else if (node.tag === 'input') {
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
               if (ph) buttons.push(`[输入框: ${ph}]`);
             }
             else if (node.tag === 'select_static' || node.tag === 'multi_select_static' || node.tag === 'overflow') {
+              // botmux's own callback controls (reply-card menu/model picker,
+              // effort/config selects) are pure UI chrome — drop them.
+              if (isBotmuxCallbackButton(node)) continue;
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
               const opts = Array.isArray(node.options)
                 ? node.options.map((o: any) => (typeof o.text === 'string' ? o.text : o.text?.content)).filter(Boolean)
@@ -576,7 +1497,19 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
             }
           }
           const line = textNodes.join('').trim();
-          if (line) parts.push(line);
+          if (line) {
+            if (inSignedFooter) {
+              const lastBreak = line.lastIndexOf('\n');
+              if (lastBreak >= 0) {
+                const beforeFooter = line.slice(0, lastBreak).trim();
+                if (beforeFooter) parts.push(beforeFooter);
+              }
+              // No newline before the signed marker means the whole paragraph is
+              // footer chrome (brand/usage/recipient). Keep nothing.
+            } else {
+              parts.push(line);
+            }
+          }
           if (buttons.length) parts.push(buttons.join(' '));
         }
       } else {
@@ -589,12 +1522,31 @@ function extractCardContent(rawContent: string, numberer?: ImgNumberer): string 
     // Drop the botmux footer chrome so a receiving bot's prompt isn't polluted
     // by the grey `botmux` badge / `发送给：@owner` line. Line-level (not
     // part-level) so a footer never takes adjacent real content with it.
-    const cleaned = parts
-      .join('\n')
-      .split('\n')
-      .filter(line => !isBotmuxFooterLine(line))
-      .join('\n');
-    return cleaned || '[卡片]';
+    // Stable legacy markers may occur inside a multiline element, so remove
+    // only their exact line. Marker-less footer-shaped text is deliberately
+    // preserved: an arbitrary custom brand is indistinguishable from user data.
+    let visibleParts = parts
+      .map(part => part
+        .split('\n')
+        .filter(line => !isSignedFormatBFooterLine(line))
+        .join('\n'))
+      .filter(part => !!part.trim());
+    // Marker-less legacy compatibility is intentionally tail-only. Old
+    // botmux footers were always last; applying this heuristic in the middle
+    // of a foreign card would turn a footer-shaped body note into data loss.
+    if (visibleParts.length > 0) {
+      const lastIndex = visibleParts.length - 1;
+      const lines = visibleParts[lastIndex].split('\n');
+      let lastLine = lines.length - 1;
+      while (lastLine >= 0 && !lines[lastLine].trim()) lastLine--;
+      if (lastLine >= 0 && isLegacyFormatBFooterLine(lines[lastLine])) {
+        lines.splice(lastLine, 1);
+        visibleParts[lastIndex] = lines.join('\n');
+        visibleParts = visibleParts.filter(part => !!part.trim());
+      }
+    }
+    const cleaned = visibleParts.join('\n');
+    return resolveMentions(cleaned || '[卡片]', mentions);
   } catch {
     return '[卡片]';
   }
@@ -613,9 +1565,38 @@ const RESOLVED_TEXT_KEY = '__botmux_card_text__';
  */
 export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客户端展开查看]';
 
-/** Wrap merged text so extractCardContent returns it verbatim downstream. */
-export function wrapResolvedCardText(text: string): string {
-  return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });
+/**
+ * True when the text carries **no information beyond "an attachment was sent"**
+ * — i.e. it is nothing but bare placeholders emitted by the renderers above.
+ *
+ * Only the *bare* forms count as zero-information. A placeholder that carries
+ * real text — `[文件 1: 季度汇报.pdf]`, `[图片 2: 报警前30分钟同比]` (see
+ * {@link withImgAlt}), `[卡片: 发布单 #123]`, `[标签: P0]`, `[输入框: 收件人]`,
+ * or a button's own `[确认发布]` — is deliberately NOT stripped: that text is
+ * the whole point, and for an attachment-only message it is the only thing
+ * worth naming the chat after.
+ *
+ * Used as the AI-title gate for session groups: feeding `[图片 1]` to the
+ * titler yields a confident-but-content-free name ("图片内容分析请求") and,
+ * because a successful rename sets `titled` (see `markSessionGroupTitled`),
+ * permanently closes both the birth and the heal gate. Skipping instead leaves
+ * the group on its placeholder name until the user's next real message — ugly
+ * for a moment, but self-healing rather than wrong forever.
+ *
+ * ⚠️ Coupled to the placeholder literals rendered in this file (`renderPostNode`,
+ * `extractTextContent`, `extractCardContent` and {@link CARD_EMBEDDED_PLACEHOLDER}).
+ * Adding a new zero-information placeholder means adding it here too.
+ */
+export function isPlaceholderOnlyText(text: string): boolean {
+  if (!text.trim()) return false;
+  const stripped = text
+    // Media placeholders carry no authored text, including numbered videos.
+    .replace(/\[(?:图片|文件|视频|语音|卡片)(?:\s+\d+)?\]/g, '')
+    .replace(/\[卡片 \(模板\)\]/g, '')
+    .replace(/\[合并转发消息\]/g, '')
+    .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
+    .trim();
+  return stripped === '';
 }
 
 /** Strip inline markup (font/text_tag tags, bold markers) but keep text,
@@ -669,6 +1650,34 @@ export function mergeCardText(textA: string, textB: string): string {
   const baseLines = b.split('\n').filter(l => !isPureCardUpgradeFallback(l));
   const bAll = baseLines.map(normalizeForDedup).join('');
 
+  // CardKit can expose header metadata in only one of the two message-detail
+  // representations. B remains authoritative for the single card title, while
+  // tags are an exact-value union: if B renders one tag and A renders a second,
+  // neither fact may disappear merely because both share the same metadata kind.
+  const metadataKind = (line: string): 'card' | 'tag' | undefined => {
+    if (/^\[卡片(?::[^\]]+)?\]$/.test(line.trim())) return 'card';
+    if (/^\[标签:[^\]]+\]$/.test(line.trim())) return 'tag';
+    return undefined;
+  };
+  const bHasCardMetadata = baseLines.some(line => metadataKind(line) === 'card');
+  const bTagMetadata = new Set(
+    baseLines
+      .filter(line => metadataKind(line) === 'tag')
+      .map(normalizeForDedup)
+      .filter(Boolean),
+  );
+  const seenMetadata = new Set<string>();
+  const missingMetadata = a.split('\n').filter(line => {
+    const kind = metadataKind(line);
+    if (!kind) return false;
+    const key = normalizeForDedup(line);
+    if (kind === 'card' && bHasCardMetadata) return false;
+    if (kind === 'tag' && bTagMetadata.has(key)) return false;
+    if (!key || seenMetadata.has(key)) return false;
+    seenMetadata.add(key);
+    return true;
+  });
+
   const filled = baseLines.map(line => {
     const sm = stripInlineMarkup(line).trimEnd();
     // empty-value field label, e.g. "值班人:" — but not bracketed section
@@ -682,6 +1691,16 @@ export function mergeCardText(textA: string, textB: string): string {
     if (normalizeForDedup(value) && bAll.includes(normalizeForDedup(value))) return line;
     return `${line.replace(/\s*$/, '')} ${value}`;
   });
+  const missingCards = missingMetadata.filter(line => metadataKind(line) === 'card');
+  const missingTags = missingMetadata.filter(line => metadataKind(line) === 'tag');
+  if (missingCards.length > 0) filled.unshift(...missingCards);
+  if (missingTags.length > 0) {
+    let lastCardIndex = -1;
+    for (let index = 0; index < filled.length; index++) {
+      if (metadataKind(filled[index]) === 'card') lastCardIndex = index;
+    }
+    filled.splice(lastCardIndex + 1, 0, ...missingTags);
+  }
 
   // One honest marker if A carried sub-cards Lark only renders client-side.
   if (aHoleCount > 0) filled.push(CARD_EMBEDDED_PLACEHOLDER);
@@ -697,7 +1716,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[]; updateTime?: number } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -705,6 +1724,14 @@ export async function resolveMergedCardContent(
   const aContent = aRes?.items?.[0]?.body?.content;
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
+  const structuredContent = (bContent ?? aContent)!;
+  const structuredMessage = bContent != null ? bRes?.items?.[0] : aRes?.items?.[0];
+  const updateTime = Number(structuredMessage?.update_time);
+  // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
+  // order and the text extraction below reuses those numbers (same ordering
+  // contract as parseEventMessage / buildForwardedTree). Callers that don't
+  // pass a numberer are unaffected (fresh internal one, unnumbered text).
+  const resources = extractResources('interactive', structuredContent, numberer);
   const textA = aContent ? extractCardContent(normalizeApiMessageContent('interactive', aContent), numberer) : '';
   const textB = bContent ? extractCardContent(normalizeApiMessageContent('interactive', bContent), numberer) : '';
   const merged = mergeCardText(textA, textB);
@@ -712,7 +1739,8 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent: (bContent ?? aContent)! };
+  return { text: merged, structuredContent, resources,
+    ...(Number.isFinite(updateTime) && updateTime > 0 ? { updateTime } : {}) };
 }
 
 /**
@@ -723,16 +1751,211 @@ export async function resolveMergedCardContent(
  * by the live daemon path so forwarded cards reach the model fully parsed.
  */
 export async function resolveEventCard(data: RawEventData, larkAppId: string): Promise<void> {
-  let resolved: { text: string; structuredContent: string } | null = null;
+  let resolved: Awaited<ReturnType<typeof resolveMergedCardContent>> = null;
   try {
     resolved = await resolveMergedCardContent(larkAppId, data.message.message_id);
   } catch { /* fall through to local unwrap */ }
   if (resolved) {
     const structured = (() => { try { return JSON.parse(resolved!.structuredContent); } catch { return {}; } })();
     data.message.content = JSON.stringify({ ...structured, [RESOLVED_TEXT_KEY]: resolved.text });
+    if (resolved.updateTime !== undefined) data.message.update_time = String(resolved.updateTime);
     return;
   }
   unwrapUserDsl(data);
+}
+
+/** First non-empty string among the candidates. Deliberately NOT `??` — Lark
+ *  payloads carry empty-string placeholders (e.g. multi_url: {url: '', pc_url:
+ *  'https://…'}) which nullish coalescing would return, swallowing the valid
+ *  platform URL behind it. */
+function firstNonEmptyString(...candidates: unknown[]): string | undefined {
+  for (const c of candidates) {
+    if (typeof c === 'string' && c) return c;
+  }
+  return undefined;
+}
+
+/** botmux's own card control buttons (🔊 语音总结 / 关闭会话 / 重启 / 配置 …) are
+ *  pure callbacks back into the daemon: when another bot reads the card
+ *  (history / cross-bot relay / quote), rendering them as `[🔊 语音总结]`
+ *  pollutes the receiving prompt with affordances it can never click, so
+ *  drop them structurally — same rationale as the botmux grey-footer strip
+ *  in extractElementText.
+ *
+ *  Primary detection is the egress-stamped ownership marker
+ *  (callback-button-marker.ts). This wordlist is a defense-in-depth fallback
+ *  for two cases: cards still in chat history that were sent by pre-marker
+ *  builds (history is long-lived), and any delivery path that fails to stamp
+ *  the egress marker. It covers every action dispatched by card-handler; when
+ *  adding a new internal control that can traverse an unstamped path, register
+ *  it here (with a parser test asserting it does not leak), do not rely on the
+ *  marker alone.
+ *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
+ *  marker and their `value` never uses botmux's action vocabulary. */
+const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
+  // session / reply card controls (card-handler's actionType dispatch)
+  'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
+  'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
+  'retry_last_task', 'takeover', 'term_action', 'toggle_display',
+  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  'reply_card_menu', 'reply_model_pick', 'reply_menu_cancel',
+  // pendingRepo gates
+  'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
+  'worktree_toggle_mode', 'repo_rebuild_worktree',
+  // config / grant / relay cards
+  'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
+  'config_quota_save', 'config_text_open', 'config_text_save',
+  'grant_chat', 'grant_global', 'grant_deny',
+  'relay_search', 'relay_page', 'relay_select', 'relay_confirm',
+  // host-overload alert + codex notifier cards
+  'overload_noop', 'overload_clean_stopped', 'overload_suspend_idle',
+  'codex_notifier_continue', 'codex_notifier_open_app',
+]);
+
+/** True when the button is one of botmux's own callback buttons. Primary
+ *  signal: the egress-stamped ownership marker (see
+ *  callback-button-marker.ts) — future-proof against any new botmux action
+ *  name. Legacy fallback: cards sent by pre-marker builds are still
+ *  recognized via the internal action wordlist, in EITHER of the two real
+ *  payload shapes — legacy top-level `value.action` (session/config cards)
+ *  or v2 `behaviors:[{type:'callback', value.action}]` (reply-card voice
+ *  button inside column_set). A button that somehow carries BOTH a botmux
+ *  signal AND an open_url jump target is kept, since a real link is always
+ *  worth surfacing. */
+function isBotmuxCallbackButton(el: any): boolean {
+  if (buttonOpenUrl(el)) return false;
+  if (hasBotmuxCallbackMarker(el)) return true;
+  let action: unknown = el?.value?.action;
+  if (typeof action !== 'string' && Array.isArray(el?.behaviors)) {
+    action = el.behaviors.find((b: any) => b?.type === 'callback')?.value?.action;
+  }
+  return typeof action === 'string' && BOTMUX_INTERNAL_CARD_ACTIONS.has(action);
+}
+
+/** Resolve a card button's jump target across schema generations: v1 `url` /
+ *  `multi_url`, v2 `behaviors: [{type:'open_url', default_url, pc_url, …}]`.
+ *  Returns undefined for callback-only buttons (they have no followable URL). */
+function buttonOpenUrl(el: any): string | undefined {
+  const direct = firstNonEmptyString(
+    el.url,
+    el.multi_url?.url, el.multi_url?.pc_url, el.multi_url?.android_url, el.multi_url?.ios_url,
+  );
+  if (direct) return direct;
+  if (Array.isArray(el.behaviors)) {
+    for (const b of el.behaviors) {
+      if (b?.type !== 'open_url') continue;
+      const u = firstNonEmptyString(b.default_url, b.pc_url, b.url, b.android_url, b.ios_url);
+      if (u) return u;
+    }
+  }
+  return undefined;
+}
+
+/** Fold an image's alt text into its placeholder: `[图片 2]` + alt →
+ *  `[图片 2: 报警前30分钟今(红)昨(蓝)同比]`. Consumers that pattern-match the
+ *  placeholder tolerate the suffix (they match `[图片…]` loosely). */
+function withImgAlt(label: string, alt: string): string {
+  return label.endsWith(']') ? `${label.slice(0, -1)}: ${alt}]` : `${label} (${alt})`;
+}
+
+/** Read visible text from a CardKit value. Lark message reads often replace
+ *  the builder JSON with a rendered tree (`property.elements[].property.content`).
+ *  Header titles/tags and native table labels/cells all use this same normalizer
+ *  so quoted/history does not depend on the original send shape. */
+function nestedCardText(value: unknown): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    const parts = value.map(nestedCardText).filter((part): part is string => Boolean(part));
+    return parts.length > 0 ? parts.join('') : undefined;
+  }
+  if (!value || typeof value !== 'object') return undefined;
+
+  const record = value as Record<string, any>;
+  const direct = firstNonEmptyString(
+    record.text?.content,
+    record.content,
+    record.property?.content,
+    typeof record.text === 'string' ? record.text : undefined,
+  );
+  if (direct) return direct;
+
+  // CardKit may expose both a rendered `elements` tree and markdown metadata.
+  // Prefer the rendered tree and only fall back to metadata to avoid repeating
+  // the same visible cell text twice.
+  const childGroups = [
+    record.property?.elements,
+    record.elements,
+    record.property?.markdownElements,
+    record.markdownElements,
+  ];
+  for (const children of childGroups) {
+    if (!Array.isArray(children) || children.length === 0) continue;
+    const nested = nestedCardText(children);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+function extractCardHeaderTagTexts(header: unknown): string[] {
+  if (!header || typeof header !== 'object') return [];
+  const record = header as Record<string, any>;
+  const groups: unknown[] = [record.text_tag_list];
+  if (record.i18n_text_tag_list && typeof record.i18n_text_tag_list === 'object') {
+    groups.push(...Object.values(record.i18n_text_tag_list));
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const group of groups) {
+    if (!Array.isArray(group)) continue;
+    for (const tag of group) {
+      const text = nestedCardText(tag?.text ?? tag)?.trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      result.push(text);
+    }
+  }
+  return result;
+}
+
+/** Newlines become `<br>` so a single value cannot split the reconstructed
+ *  table into extra rows. */
+function cardTableCellText(value: unknown): string {
+  const text = nestedCardText(value);
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\\/g, '\\\\')
+    .replace(/\|/g, '\\|')
+    .replace(/\n/g, '<br>');
+}
+
+/** Reconstruct an original schema-v2 native table as readable pipe Markdown.
+ *  `botmux send` deliberately emits native tables because Lark's markdown
+ *  widget cannot draw a grid; history/quoted/cross-bot reads must still retain
+ *  those facts instead of silently dropping the whole component. */
+function extractTableMarkdown(el: any): string | null {
+  if (!Array.isArray(el?.columns) || el.columns.length === 0) return null;
+  const columns = el.columns.map((column: any, index: number) => ({
+    key: typeof column?.name === 'string' && column.name ? column.name : `c${index}`,
+    label: cardTableCellText(column?.display_name) || `列 ${index + 1}`,
+  }));
+  const lines = [
+    `| ${columns.map((column: any) => column.label).join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
+  ];
+  for (const row of Array.isArray(el.rows) ? el.rows : []) {
+    const cells = columns.map((column: any, index: number) => {
+      const value = Array.isArray(row)
+        ? row[index]
+        : row && typeof row === 'object'
+          ? row[column.key]
+          : undefined;
+      return cardTableCellText(value);
+    });
+    lines.push(`| ${cells.join(' | ')} |`);
+  }
+  return lines.join('\n');
 }
 
 type ResourcePusher = (resources: MessageResource[], r: MessageResource) => void;
@@ -745,6 +1968,25 @@ function extractElementImages(el: any, resources: MessageResource[], pushIfNew: 
   const key = el.image_key ?? el.img_key;
   if ((tag === 'img' || tag === 'image') && key) {
     pushIfNew(resources, { type: 'image', key, name: `${key}.jpg` });
+  }
+
+  // `botmux send --images` keeps ordinary full-width/inline images inside a
+  // Markdown element as `![alt](img_vN_...)`.  Feishu does not always promote
+  // those tokens to native `img` nodes on readback, so native-node-only
+  // extraction made `quoted` render the image while returning resources: [].
+  // Reuse the outbound Markdown parser so code examples and escaped syntax do
+  // not become fake downloadable attachments.
+  if (tag === 'markdown' || tag === 'md' || tag === 'lark_md') {
+    const markdown = typeof el.content === 'string'
+      ? el.content
+      : typeof el.text === 'string'
+        ? el.text
+        : typeof el.text?.content === 'string'
+          ? el.text.content
+          : '';
+    for (const markdownKey of extractFeishuCardMarkdownImageKeys(markdown)) {
+      pushIfNew(resources, { type: 'image', key: markdownKey, name: `${markdownKey}.jpg` });
+    }
   }
 
   // div.extra can contain an image
@@ -769,22 +2011,55 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
 
   const tag = el.tag;
 
-  // botmux card footer: the only element rendered as a small grey notation
-  // (text_size 'notation_small_v2' + a grey <font> wrapper). Drop it
-  // structurally — brand-agnostic, so a peer bot's *custom* brandLabel footer
-  // is stripped from cross-bot / quote / history prompts without us needing to
-  // know its label (the receiving bot can't see the sender's config). The
-  // repo-URL line filter below still covers the default brand in the simplified
-  // Format A representation, which carries no text_size.
-  if ((tag === 'markdown' || tag === 'div' || tag === 'plain_text') && el.text_size === 'notation_small_v2') {
-    const c = el.text?.content ?? el.content ?? '';
-    if (/color=['"]grey['"]/i.test(c)) return;
+  // The public element id alone is not ownership proof: third-party cards may
+  // collide with it. New botmux footers carry the id plus the reserved text
+  // marker; legacy cards carry the exact reserved link marker.
+  const elementText = el.text?.content ?? el.content;
+  if (
+    el.element_id === REPLY_CARD_FOOTER_ELEMENT_ID
+    && tag === 'markdown'
+    && (
+      el.text_size === undefined
+      || el.text_size === 'notation'
+      || el.text_size === 'notation_small_v2'
+    )
+    && typeof elementText === 'string'
+    && (hasCurrentFooterMarker(elementText) || hasExactMarkerMarkdown(elementText))
+  ) {
+    return;
+  }
+
+  // Promoted H1/H2 heading widgets: Lark strips `text_size` when a message is
+  // read back, so the ATX prefix is rebuilt from the element id (the only
+  // carrier that survives normalization). This keeps heading hierarchy across
+  // sessions and lets a cross-bot re-send promote the line again.
+  if (tag === 'markdown' && typeof el.element_id === 'string') {
+    const idMatch = REPLY_CARD_HEADING_ELEMENT_ID_RE.exec(el.element_id);
+    if (idMatch) {
+      const heading = stripTrailingGroupContextCardPurposeMarker(
+        (typeof elementText === 'string' ? elementText : nestedCardText(el)) ?? '',
+      ).trim();
+      if (heading) {
+        parts.push(`${'#'.repeat(Number(idMatch[1]))} ${heading}`);
+        return;
+      }
+    }
   }
 
   // div / markdown / plain_text blocks
   if (tag === 'div' || tag === 'markdown' || tag === 'plain_text') {
     const text = el.text?.content ?? el.content;
-    if (text) parts.push(text);
+    if (text) {
+      const visibleText = typeof text === 'string'
+        ? stripTrailingGroupContextCardPurposeMarker(text)
+        : text;
+      if (visibleText) parts.push(visibleText);
+    }
+  }
+
+  if (tag === 'table') {
+    const table = extractTableMarkdown(el);
+    if (table) parts.push(table);
   }
 
   // div.fields[] — v2 cards put most body text in a fields array of lark_md
@@ -800,9 +2075,17 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // button — text may be a plain_text object (v2) or a string (v1 simplified).
+  // Jump buttons carry their target as v1 `url`/`multi_url` or v2 `behaviors`
+  // open_url; keep it so the reader can actually follow the link (e.g. Argos
+  // [分析报告] → the report URL). Callback buttons have no URL and stay bare.
+  // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
+    if (isBotmuxCallbackButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
-    if (btnText) parts.push(`[${btnText}]`);
+    if (btnText) {
+      const url = buttonOpenUrl(el);
+      parts.push(url ? `[${btnText}](${url})` : `[${btnText}]`);
+    }
   }
 
   // input — surface the placeholder so the reader knows the field is there.
@@ -812,7 +2095,10 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // select / multi-select / overflow — surface placeholder + selectable
-  // options so the choices the card offers aren't lost.
+  // options so the choices the card offers aren't lost. botmux's own callback
+  // controls (reply card menu/model picker, effort/config selects) are dropped.
+  if ((tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow')
+    && isBotmuxCallbackButton(el)) return;
   if (tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow') {
     const ph = el.placeholder?.content;
     const opts = Array.isArray(el.options)
@@ -823,9 +2109,13 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // image — emit a numbered placeholder matching the attachment list order.
+  // Carry the alt text when present: for chart images (Argos 同比曲线图) the
+  // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    if (k) parts.push(imgLabel(k));
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
+    if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 
   // note blocks (v1 only — v2 removed the tag but we still parse v1 cards)

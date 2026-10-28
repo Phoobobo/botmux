@@ -6,7 +6,7 @@
 
 botmux 此前对 codex 强制串行（忙时消息排队、等 idle 才逐条发），原因是 fallback 桥的 `CodexBridgeQueue` 单 `collecting` 指针归因没在 type-ahead 的 back-to-back user_message 排序下验证过。
 
-申晗要求支持 codex type-ahead。第一版「直接摘 gate + 置 `supportsTypeAhead`」被 Codex review 否决并经实测推翻：
+需求要求支持 codex type-ahead。第一版「直接摘 gate + 置 `supportsTypeAhead`」被 Codex review 否决并经实测推翻：
 
 - codex 0.134.0 的忙时投递是 **active-turn steer**（消息进 pending_steers → steer_input 注入当前 active turn 的 pending_input，下一个采样边界 drain），**不是** CoCo 那种"等当前 turn 完整结束再处理下一轮"。
 

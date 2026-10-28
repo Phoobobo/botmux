@@ -4,27 +4,167 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub Release tag to refresh (for example, v3.3.0)
+        required: true
+        type: string
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  desktop:
+    if: >-
+      github.actor == 'deepcoldy' &&
+      github.triggering_actor == 'deepcoldy' &&
+      (github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-'))
+    runs-on: macos-14
+    environment: macos-signing
     permissions:
-      contents: write
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
+        # Build from the EXACT released commit in both trigger paths:
+        #   - push: use github.sha (the immutable commit the tag pointed at when
+        #     the event fired), NOT github.ref. Passing the ref name would make
+        #     checkout re-resolve the tag at checkout time — and desktop runs
+        #     behind a manual approval that can lag up to 30 days, during which
+        #     the tag could be moved (repo ruleset excludes canary/beta/rc from
+        #     tag-update protection). If tag moves A→B after `release` already
+        #     published npm from A, a ref-name checkout would sign B → assets
+        #     diverge from the npm tarball. A pinned SHA cannot move.
+        #   - workflow_dispatch: no event SHA for the tag, so resolve the tag ref
+        #     explicitly (default checkout would be the dispatch ref = master).
+        # The Verify step below then fail-closes if the tag no longer points at
+        # the commit we built (tag moved), so mismatched assets never attach.
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+
+      - name: Verify HEAD is the tagged commit
+        # Prove the built commit still equals what the tag points at. On push,
+        # HEAD is github.sha; if the tag was moved during the approval wait, the
+        # current tag commit won't match HEAD → fail-closed (never attach assets
+        # built from a commit the tag no longer names). On workflow_dispatch this
+        # also catches a mis-resolved ref (e.g. accidental master checkout).
+        run: |
+          git fetch origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}" --force --quiet 2>/dev/null || true
+          TAG_SHA=$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "tag ${RELEASE_TAG} → $TAG_SHA ; HEAD (built) → $HEAD_SHA"
+          if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+            echo "REFUSING: built commit $HEAD_SHA is not what tag ${RELEASE_TAG} now points at ($TAG_SHA)."
+            echo "The tag was likely moved after npm was published from the original commit."
+            echo "Signed assets must match the released commit; aborting to avoid attaching mismatched assets."
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+
+      - name: Sync version from git tag to package.json
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+
+      - name: Validate existing release for manual refresh
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+      - run: bun run build
+      - run: bun run desktop:bundle
+      - run: bun run desktop:runtime
+
+      - name: Decode App Store Connect API key
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          printf '%s' "$APPLE_API_KEY_P8" | /usr/bin/base64 -D > "$RUNNER_TEMP/AuthKey.p8"
+          chmod 600 "$RUNNER_TEMP/AuthKey.p8"
+
+      - name: Build, sign, and notarize macOS app
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY: ${{ runner.temp }}/AuthKey.p8
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          ./node_modules/.bin/electron-builder --mac dmg zip --universal --publish never \
+            --config electron-builder.yml \
+            -c.forceCodeSigning=true \
+            -c.mac.notarize=true \
+            -c.mac.entitlements=build/entitlements.mac.release.plist \
+            -c.mac.entitlementsInherit=build/entitlements.mac.release.plist
+
+      - name: Verify macOS signature and notarization
+        run: |
+          APP_PATH="$(find dist -maxdepth 2 -type d -name 'Botmux.app' -print -quit)"
+          test -n "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --verbose --type exec "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)"
+
+      - name: Upload macOS release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: botmux-macos
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── PREFLIGHT: resolve the dist-tag and run every `latest` guard FIRST ───────
+  # Resolves the npm dist-tag / prerelease flag and runs ALL the `latest`
+  # authority guards BEFORE anything irreversible is published.
+  #
+  # WHY THESE GUARDS MOVED OUT OF `release`: the publish order is now inverted
+  # (binaries → platform subpackages → main package; see the `release` job), so
+  # the FIRST npm publish for a tag is the four `botmux-<os>-<arch>` subpackages,
+  # no longer the main package. Guards left inside `release` would therefore fire
+  # only AFTER those subpackages are already public and immutable — a
+  # non-deepcoldy stable tag would get four `latest`-tagged subpackages published
+  # and only then be refused, and a downgrade tag would leave four downgraded
+  # subpackages on `latest`. Hoisting the guards into a job that every publishing
+  # job depends on restores the invariant "nothing is published unless the gate
+  # passed". The guards themselves are unchanged (same conditions, same
+  # fail-closed behavior); only their location moved.
+  #
+  # Side benefit for the ancestry guard: it now fetches origin/master sooner
+  # after the tag push than before, which shrinks (does not remove) its
+  # documented "master moved between tag creation and this fetch" race window.
+  preflight:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.dist_tag.outputs.tag }}
+      prerelease: ${{ steps.dist_tag.outputs.prerelease }}
+      # The origin/master SHA the ancestry guard below actually validated against.
+      # `release` re-checks against THIS value rather than re-fetching, so a commit
+      # landing on master mid-run cannot flip the verdict after the platform
+      # subpackages are already on npm (issue #1150).
+      master_sha: ${{ steps.master_ancestry.outputs.master_sha }}
+    steps:
+      - uses: actions/checkout@v6
+        # fetch-depth: 0 —— 「stable 必须包含最新 master」那道闸要跑
+        # `git merge-base --is-ancestor origin/master HEAD`,浅克隆拿不到共同祖先。
         with:
           fetch-depth: 0
 
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - run: npm install -g pnpm
-      - run: pnpm install --frozen-lockfile
-
-      - name: Sync version from git tag to package.json
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
 
       - name: Resolve npm dist-tag + prerelease flag
         id: dist_tag
@@ -41,6 +181,24 @@ jobs:
           echo "tag=$NPM_TAG"           >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
           echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
+
+      - name: Require deepcoldy authority for stable (latest) releases
+        # npm-first removed the transitive authority gate that used to come via
+        # `needs: desktop` (desktop only runs for deepcoldy; the old "Require
+        # signed macOS assets" step then failed non-deepcoldy stable tags). With
+        # release decoupled from desktop, re-assert it explicitly: only deepcoldy
+        # may publish the `latest` dist-tag that every `npm i botmux` user gets.
+        # canary/beta/rc/next go to side dist-tags and stay open for branch
+        # gray-release by anyone.
+        #
+        # Now enforced in `preflight` so it also covers the four platform
+        # subpackages, which under the inverted order publish before the main
+        # package.
+        if: steps.dist_tag.outputs.tag == 'latest' && (github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy')
+        run: |
+          echo "REFUSING: stable (latest) releases may only be published by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
+          exit 1
 
       - name: Guard against downgrading npm latest
         # 防止把比 npm 当前 latest 还小的版本号发到 latest dist-tag（曾发生
@@ -72,8 +230,18 @@ jobs:
         # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
         # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        #
+        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
+        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
+        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
+        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
+        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
+        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
+        # 而 #593 那次真正漏的是 changelog（changelog 已锚到「上一个已发布 Release」，
+        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
         # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
         # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        id: master_ancestry
         if: steps.dist_tag.outputs.tag == 'latest'
         run: |
           git fetch origin master --quiet
@@ -84,13 +252,237 @@ jobs:
             exit 1
           fi
           echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
+          # PIN the exact master this verdict was computed against, so `release`
+          # can re-check the SAME fact instead of re-reading a moving ref. See the
+          # TOCTOU note on the release-side guard below.
+          echo "master_sha=$(git rev-parse origin/master)" >> "$GITHUB_OUTPUT"
 
-      - run: pnpm build
+  # ── MAIN PACKAGE PUBLISH — DELIBERATELY LAST ─────────────────────────────────
+  # Publishes `botmux-workflow-core` + the main `botmux` package, then creates
+  # the GitHub Release.
+  #
+  # WHY THE MAIN PACKAGE IS PUBLISHED LAST (release order inverted): `botmux`
+  # declares `optionalDependencies` on `botmux-linux-x64` / `botmux-linux-arm64`
+  # / `botmux-darwin-x64` / `botmux-darwin-arm64` at the SAME version, and its
+  # postinstall points the launcher at whichever of those npm actually installed
+  # for the host. npm treats an unresolvable OPTIONAL dependency as a no-op — it
+  # does NOT fail the install, it silently skips it. So publishing the main
+  # package before the subpackages exist means every `npm i -g botmux` racing
+  # that window installs a botmux with NO binary and degrades silently (no error,
+  # just a launcher that finds nothing). Publishing the main package only after
+  # all four subpackages are live makes the optional dependency actually
+  # satisfiable.
+  #
+  # ACCEPTED COST: this gives up the previous "npm-first" property, where npm
+  # publish did not wait on binary production. npm now waits for the compile
+  # matrix and, for stable releases, Developer ID signing of the standalone
+  # macOS binaries. That manual approval may delay a stable release, but
+  # publishing ad-hoc-signed CLI binaries would make macOS TCC permissions
+  # version-specific and prompt users again after every update. Desktop asset
+  # packaging/notarization remains asynchronous; only the two CLI executables
+  # are a prerequisite for npm and the GitHub Release.
+  #
+  # NOTE ON `needs` vs `if` (do not "tidy" this): this job intentionally has NO
+  # `if:`. GitHub applies the implicit "all needs succeeded" gate only to jobs
+  # WITHOUT a condition; adding any `if:` here would make this job run even when
+  # `bun-binaries` or `binary-subpackages` FAILED or was skipped, silently
+  # defeating the entire ordering guarantee above (that is exactly why
+  # `attach-desktop-assets` has to spell out `needs.*.result == 'success'`). The
+  # tag-push-only restriction is inherited through `preflight`, which carries
+  # `if: github.event_name == 'push'`. If you ever add an `if:` here you MUST
+  # also re-assert `needs.<each>.result == 'success'` for every entry in `needs`.
+  # `binary-subpackages` below is the deliberate counterpart: it needs an `if:`
+  # to admit a skipped signing job on prereleases, so it explicitly re-asserts
+  # success for every other prerequisite and for stable signing.
+  release:
+    needs: [preflight, bun-binaries, bun-binaries-musl, binary-subpackages]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # pull-requests: write —— 发版后给本版本包含的 PR 逐条留「Released in vX.Y.Z」
+      # 评论(见下方 Comment "Released in" 步骤)。GitHub 原生那个侧栏 released 徽标
+      # 判定用的是 PR 分支的原始 head commit,squash 合并会把它变成孤儿 commit → 徽标
+      # 永远不显示(即便 squash 出的新 commit 能从 tag 到达也不行)。此权限用于发一条
+      # 可见的时间线评论作为 squash 兼容的替代。
+      pull-requests: write
+      # id-token: write —— npm Trusted Publishing (OIDC) 要求 GitHub 能为本 job 签发
+      # OIDC token，npm CLI 用它向 registry 证明「确实是从已授权的 workflow 发布」，
+      # 无需存储长期 npm token。发布前须在 npmjs.com 上为两个包配置 Trusted Publisher。
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Publish to npm
-        run: npm publish --tag "${{ steps.dist_tag.outputs.tag }}"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+
+      - name: Upgrade npm for Trusted Publishing
+        # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
+        # Node 22 自带的 npm 可能不够新，这里升级到固定的 11.19.0（2026-07-28 的最新
+        # 11.x）。不用 npm@latest —— floating latest 可能跳到 npm 12 并在 tag-push 发版
+        # 时引入破坏性改动；固定版本确保发版流程可预测。
+        run: npm install -g npm@11.19.0
+
+      - name: Sync version from git tag to package.json
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
+
+      - name: Sync workflow core version from git tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version --prefix packages/workflow-core
+
+      - name: Resolve npm dist-tag + prerelease flag
+        id: dist_tag
+        run: |
+          # 含 prerelease 后缀（v1.2.3-canary.0 / -beta.x / -rc.x）发到对应 dist-tag，
+          # 不覆盖 latest；纯净 vX.Y.Z 仍走默认 latest。
+          VERSION="${GITHUB_REF_NAME#v}"
+          if   [[ "$VERSION" == *"-canary"* ]]; then NPM_TAG=canary;  PRERELEASE=true
+          elif [[ "$VERSION" == *"-beta"*   ]]; then NPM_TAG=beta;    PRERELEASE=true
+          elif [[ "$VERSION" == *"-rc"*     ]]; then NPM_TAG=rc;      PRERELEASE=true
+          elif [[ "$VERSION" == *"-"*       ]]; then NPM_TAG=next;    PRERELEASE=true
+          else                                       NPM_TAG=latest;  PRERELEASE=false
+          fi
+          echo "tag=$NPM_TAG"           >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Publishing $VERSION → npm dist-tag=$NPM_TAG, prerelease=$PRERELEASE"
+
+      - name: Require deepcoldy authority for stable (latest) releases
+        # npm-first removed the transitive authority gate that used to come via
+        # `needs: desktop` (desktop only runs for deepcoldy; the old "Require
+        # signed macOS assets" step then failed non-deepcoldy stable tags). With
+        # release decoupled from desktop, re-assert it explicitly: only deepcoldy
+        # may publish the `latest` dist-tag that every `npm i botmux` user gets.
+        # canary/beta/rc/next go to side dist-tags and stay open for branch
+        # gray-release by anyone.
+        if: steps.dist_tag.outputs.tag == 'latest' && (github.actor != 'deepcoldy' || github.triggering_actor != 'deepcoldy')
+        run: |
+          echo "REFUSING: stable (latest) releases may only be published by deepcoldy."
+          echo "actor=${{ github.actor }} triggering_actor=${{ github.triggering_actor }}"
+          exit 1
+
+      - name: Guard against downgrading npm latest
+        # 防止把比 npm 当前 latest 还小的版本号发到 latest dist-tag（曾发生
+        # `git tag | tail` 拿到字典序末尾 v2.9.x 被当成最新版的事故，
+        # CI 直接把 npm latest 从 2.27.4 覆盖到 2.9.x，导致所有
+        # `npm i botmux` 用户被回退）。只在 dist-tag=latest 时校验；
+        # canary/beta/rc/next 走旁路 dist-tag 不影响 latest。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CURRENT_LATEST=$(npm view botmux@latest version 2>/dev/null || echo "0.0.0")
+          echo "npm latest currently: $CURRENT_LATEST"
+          echo "this tag             : $VERSION"
+          # semver compare via Node's built-in semver in npm
+          if ! node -e "
+            const a='$VERSION', b='$CURRENT_LATEST';
+            const parse = s => s.split('.').map(Number);
+            const [a1,a2,a3] = parse(a), [b1,b2,b3] = parse(b);
+            const cmp = a1!==b1 ? a1-b1 : a2!==b2 ? a2-b2 : a3-b3;
+            if (cmp <= 0) { console.error('REFUSING to publish ' + a + ' as latest (current latest is ' + b + ', would downgrade users)'); process.exit(1); }
+            console.log('OK: ' + a + ' > ' + b);
+          "; then
+            exit 1
+          fi
+
+      - name: Guard — stable release must contain the latest master
+        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
+        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
+        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
+        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+        # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
+        #
+        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
+        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
+        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
+        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
+        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
+        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
+        # 而 #593 那次真正漏的是 changelog（下一步已把 changelog 锚到「上一个已发布 Release」，
+        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
+        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
+        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        if: steps.dist_tag.outputs.tag == 'latest'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_ACCESS_TOKEN }}
+          # ⚠️ TOCTOU (issue #1150): re-reading `origin/master` HERE is what burned
+          # v3.18.10. `binary-subpackages` publishes the six platform packages BEFORE
+          # this job — and it must, because the main package declares OPTIONAL deps on
+          # them and an unresolvable optional dep is a silent npm no-op that would
+          # install a binary-less main package. Those publishes are irreversible.
+          #
+          # Measured timeline of the lost release, all UTC:
+          #   09:53:46  preflight ancestry OK   (origin/master = 61620be7, the tag itself)
+          #   09:56:22  six subpackages PUBLISHED to npm        <- irreversible
+          #   09:57:47  def4275b (#1128) lands on master        <- inside the window
+          #   09:58:33  this guard REFUSES      (origin/master = def4275b)
+          #
+          # Same guard, same run, opposite verdicts, 4m47s apart — the tag never moved.
+          # Retrying cannot recover: re-tagging changes the code, so rebuilt binaries
+          # hash differently and publish-npm-if-missing.mjs correctly refuses to
+          # overwrite a published version with different content. 3.18.10 was burned.
+          #
+          # So this job re-checks the SHA preflight PINNED, not whatever master is now.
+          # The guard keeps its meaning — the tag must contain the master that was
+          # current when this release was ADMITTED — while the verdict stays immutable
+          # for the rest of the run. A commit landing mid-release belongs to the next
+          # release, not to a burned version number.
+          PINNED_MASTER: ${{ needs.preflight.outputs.master_sha }}
+        run: |
+          if [ -z "$PINNED_MASTER" ]; then
+            echo "REFUSING: preflight pinned no master SHA, so this job cannot re-check the"
+            echo "same fact preflight admitted. Failing closed rather than re-reading a ref"
+            echo "that may have moved since (issue #1150)."
+            exit 1
+          fi
+          # Fetch by SHA — the pinned commit is not necessarily master's tip any more.
+          git fetch origin "$PINNED_MASTER" --quiet
+          if ! git merge-base --is-ancestor "$PINNED_MASTER" HEAD; then
+            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
+            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
+            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
+            exit 1
+          fi
+          echo "OK: tagged commit contains the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
+
+      - run: bun run build
+
+      - run: bun run workflow-core:test
+
+      - name: Publish workflow core to npm
+        # npm Trusted Publishing (OIDC) 流程:actions/setup-node 已配置 registry-url,
+        # npm CLI 检测到 id-token 权限后会自动向 GitHub OIDC Provider 请求 token 并用
+        # 它向 registry 认证,无需 NODE_AUTH_TOKEN。不传 NODE_AUTH_TOKEN 环境变量是
+        # 必需的 —— 若该变量存在,npm 会优先用它做传统认证而跳过 OIDC 流程。
+        run: node scripts/publish-npm-if-missing.mjs ./packages/workflow-core "${{ steps.dist_tag.outputs.tag }}"
+
+      - name: Inject platform-binary optionalDependencies
+        # MUST run after the version-sync step and before packing the main
+        # package. The four `optionalDependencies` are NOT committed to
+        # package.json, for two measured reasons:
+        #
+        #  1. `bun install --frozen-lockfile` (used by every job in this repo)
+        #     fails with `error: lockfile had changes, but lockfile is frozen`
+        #     when package.json names a dependency the lockfile does not — it
+        #     would turn all of CI red.
+        #  2. `npm version` does not rewrite dependency ranges, so a committed
+        #     "0.0.0" would stay "0.0.0" and point at a version that never
+        #     exists. npm treats an unresolvable OPTIONAL dep as a silent no-op,
+        #     so users would install a botmux with no binary and no error.
+        #
+        # Injecting here sidesteps both: the lockfile never sees these entries,
+        # and the versions equal this tag. `npm pack` picks the mutation up from
+        # disk. The script fails closed if package.json's version was not synced
+        # first, or if handed a leading "v".
+        run: node scripts/inject-optional-binaries.mjs "${GITHUB_REF_NAME#v}"
+
+      - name: Publish botmux to npm
+        run: node scripts/publish-npm-if-missing.mjs . "${{ steps.dist_tag.outputs.tag }}"
 
       - name: Generate changelog
         id: changelog
@@ -99,60 +491,837 @@ jobs:
         run: |
           # actions/checkout 默认把 tag 存成轻量指针，需重新 fetch 才能拿到 annotated tag object
           git fetch origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" --force
-          # 上一个 tag: stable 只跟 stable 比 (词法排序会把 canary 排到 stable 前面,
-          # 不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X 而不是 v2.24.3)
+          # 上一版锚点：
+          # - prerelease（canary/beta/rc/next）：仍按 v:refname 排序取上一个 tag（灰度链条只关心
+          #   相邻 tag，且 prerelease 常不发 GitHub Release）。stable 只跟 stable 比（词法排序会把
+          #   canary 排到 stable 前面，不过滤的话 v2.24.4 的 compare 会指向 v2.24.4-canary.X）。
+          # - stable（latest）：锚到「上一个**已发布** stable GitHub Release」的 tag，而不是
+          #   git tag 排序的第一个。原因：若某个 stable tag 因签名/npm/权限/guard 失败而**只打了
+          #   tag、没发 Release**（如 v3.5.1），旧逻辑会把它当 PREV_TAG，导致下一版 changelog 从
+          #   那个「隐身版本」起算、漏掉它本该带上的 PR（#593 就是这么漏的）。锚到最近已发布
+          #   Release 后，任何中途没发成的 tag 都不会截断 changelog——它们引入的 PR 会被下一版
+          #   一并带上，保证「覆盖上次发布以来的所有 PR」。取不到已发布 Release 时回退到 tag 排序。
           if [[ "$GITHUB_REF_NAME" == *"-"* ]]; then
             PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | head -1)
           else
-            PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            PREV_TAG=$(gh release list --limit 40 \
+              --json tagName,isPrerelease,isDraft,publishedAt \
+              --jq '[.[] | select(.isPrerelease==false and .isDraft==false and .tagName!="'"$GITHUB_REF_NAME"'")]
+                    | sort_by(.publishedAt) | reverse | .[0].tagName // ""' 2>/dev/null || echo "")
+            # 回退：无已发布 Release，或该 tag 在本地取不到 commit（异常）→ 用 tag 排序兜底。
+            if [ -z "$PREV_TAG" ] || ! git rev-parse -q --verify "refs/tags/${PREV_TAG}^{commit}" >/dev/null; then
+              PREV_TAG=$(git tag --sort=-v:refname | grep -Fxv "$GITHUB_REF_NAME" | grep -v -e '-' | head -1)
+            fi
           fi
+          echo "changelog range: ${PREV_TAG}..${GITHUB_REF_NAME}"
           TAG_MSG=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME")
 
-          # '本次合并'只列 PR 标题（合并/squash commit subject 形如 "xxx (#123)"），
-          # 不把 PR 内部的逐条 commit 全倒进 changelog——那会让区间含整条分支时长到吓人，
-          # 而且手写的 tag message 已经讲清本次发了什么。直接走 git log 过滤 (#N)，
-          # 不再用 git-cliff（它按区间内每个 tag 重复堆叠'本次合并'段、且翻全仓做 PR 关联
-          # 偶发触发 GitHub 二级限流 401）。
-          PRLIST=$(git log --no-merges --reverse --pretty='- %s' "${PREV_TAG}..${GITHUB_REF_NAME}" | grep -E '\(#[0-9]+\)' || true)
-          if [ -n "$PRLIST" ]; then
-            CLIFF=$(printf -- '---\n\n## 本次合并（PR）\n%s' "$PRLIST")
-          else
-            CLIFF=""
-          fi
-
-          # '感谢贡献者'独立用 gh 按区间内每个 commit 反查所属 PR 作者：有界调用（约等于区间 commit 数），
-          # 不翻全仓、不会触发上面那种限流；去重并排除仓库 owner。不再依赖 git-cliff 的
-          # github.contributors —— 那个只收录'首次贡献者'，会漏掉之前贡献过的人。
-          THANKS=""
-          declare -A SEEN
+          # 区间内每个非 merge commit → 反查所属 PR（gh api，有界：约等于区间 commit 数，
+          # 不翻全仓、不触发 git-cliff 那种二级限流 401）。squash 与 merge-commit 两种合并
+          # 都覆盖：squash 时区间含该 commit；merge-commit（"Merge pull request #N"）时区间
+          # 含其子 commit，子 commit 的 /pulls 仍指向同一 PR——靠 PR number 在 node 侧去重。
+          # （旧逻辑只 grep "(#N)" squash subject，merge-commit 的 PR 整条隐身，是真 bug。）
+          # 无关联 PR 的直推 commit 回退用自身 subject。结果 TSV 交给 changelog-sections.mjs
+          # 按约定式 `type(scope):` 前缀分桶成 ✨新功能/🐛修复/… 段落 + 去重的贡献者名单。
+          # 单次遍历同时兼顾 PR 列表与致谢，gh 调用量与旧版致谢循环持平。
+          RAW=$(mktemp)
           for sha in $(git rev-list --no-merges --reverse "${PREV_TAG}..${GITHUB_REF_NAME}"); do
-            for login in $(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" --jq '.[].user.login' 2>/dev/null); do
-              if [ "$login" != "${GITHUB_REPOSITORY_OWNER}" ] && [ -z "${SEEN[$login]:-}" ]; then
-                SEEN[$login]=1
-                THANKS="$THANKS @$login"
-              fi
-            done
+            PULLS=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${sha}/pulls" \
+              --jq '.[] | [.number, .title, .user.login] | @tsv' 2>/dev/null || true)
+            if [ -n "$PULLS" ]; then
+              printf '%s\n' "$PULLS" | while IFS=$'\t' read -r num title login; do
+                printf 'pr\t%s\t%s\t%s\n' "$num" "$title" "$login"
+              done >> "$RAW"
+            else
+              printf 'commit\t%s\t%s\t\n' "${sha:0:7}" "$(git log -1 --pretty=%s "$sha")" >> "$RAW"
+            fi
           done
-          THANKS="${THANKS# }"
+          SECTIONS=$(node .github/scripts/changelog-sections.mjs < "$RAW")
+
+          # 复用上面已算好的 PR 列表(不再多打一次 API),抽出本版本包含的**去重** PR
+          # 号,持久化到 $RUNNER_TEMP,交给后面的「Comment "Released in"」步骤逐个留言。
+          # 从 $RAW 里 type=='pr' 的行取第 2 列(PR number),排序去重。可能为空(纯直推
+          # commit、无关联 PR)——那样评论步骤自然什么都不做。
+          awk -F'\t' '$1=="pr"{print $2}' "$RAW" | sort -un > "$RUNNER_TEMP/released_prs.txt"
+          echo "PRs in this release: $(paste -sd' ' "$RUNNER_TEMP/released_prs.txt")"
 
           {
             echo 'body<<CHANGELOG_EOF'
-            # TAG_MSG 后必须空一行再接 CLIFF：CLIFF 以 '---' 开头，紧贴正文末行会被
-            # markdown 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
+            # TAG_MSG 后必须空一行再接自动段落：分隔线 '---' 紧贴正文末行会被 markdown
+            # 当成 setext 标题（末行变 H2），空行后才渲染成分隔线。
             if [ -n "$TAG_MSG" ]; then echo "$TAG_MSG"; echo ""; fi
-            [ -n "$CLIFF" ] && echo "$CLIFF"
-            if [ -n "$THANKS" ]; then
-              echo ""
-              echo "## 感谢贡献者"
-              echo "$THANKS"
-            fi
+            if [ -n "$SECTIONS" ]; then echo "---"; echo ""; echo "$SECTIONS"; fi
             echo ""
             echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${GITHUB_REF_NAME}"
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release as a DRAFT (published once binaries are attached)
+        # WHY A DRAFT (this was a real user-facing 404): `releases/latest/download/…`
+        # starts resolving to a release the moment it is PUBLISHED, but the binaries
+        # are uploaded by the separate `attach-bun-binaries` job which cannot run
+        # until the release exists. On v3.18.0 that gap was 72 seconds (published
+        # 09:11:58, assets attached 09:13:10) and a user running install.sh inside it
+        # got:
+        #   curl: (56) The requested URL returned error: 404
+        #   botmux install: download failed: …/releases/latest/download/botmux-darwin-arm64
+        #
+        # A draft is invisible to `latest` and to anonymous downloads, so the window
+        # closes: `publish-github-release` below flips it public only after the
+        # binaries are in place. Verified against the real API: uploading to a draft
+        # BY TAG NAME works, publishing preserves the assets, and the asset is then
+        # anonymously downloadable (HTTP 200).
+        #
+        # Desktop (.dmg/.zip) is deliberately NOT part of this gate — signing sits
+        # behind a human approval that can wait up to 30 days, so it still attaches
+        # asynchronously to the already-published release, exactly as before.
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ steps.dist_tag.outputs.prerelease == 'true' }}
+          draft: true
+
+      - name: Comment "Released in" on included PRs
+        # squash 兼容的「已发布」标记:GitHub 原生侧栏 released 徽标只认 PR 分支的原始
+        # head commit,squash 会把它变成孤儿 commit → 徽标永不显示。这里改为在本版本
+        # 包含的每个 PR 上留一条**可见、可点**的时间线评论作为等效替代。PR 列表来自上面
+        # changelog 步骤已算好的 released_prs.txt(不额外打 API 拉取)。
+        #
+        # 只在 stable(latest)发版时评论:canary/beta/rc/next 是分支灰度,常不从 master
+        # 出、也不是用户装到的正式版;若也评论,PR 会先被刷「Released in v3.7.0-canary.0」
+        # 再来一条「v3.7.0」,既噪又易误导。对齐原生徽标只关心正式 Release 的语义。
+        if: steps.dist_tag.outputs.tag == 'latest'
+        # 设计要点:
+        # - fail-soft:npm + Release 此时已经发布,评论失败绝不能让本 job 失败 →
+        #   continue-on-error + 每个 PR 内部 || true,单个 PR 评论失败不影响其它。
+        # - 幂等:workflow 重跑(如签名恢复 re-run)时不重复刷评论——先查该 PR 是否已
+        #   有带本版本隐藏标记 `<!-- released-in:vX.Y.Z -->` 的评论,有就跳过。
+        # - 只在有 PR 时动作;纯直推(released_prs.txt 为空)自然 no-op。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          PR_FILE="$RUNNER_TEMP/released_prs.txt"
+          if [ ! -s "$PR_FILE" ]; then
+            echo "No PRs associated with this release; nothing to comment."
+            exit 0
+          fi
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          MARKER="<!-- released-in:${RELEASE_TAG} -->"
+          # 从 FD 3 读 PR 列表(而非 stdin),避免循环体内的 gh 子进程吃掉 stdin 里剩余的
+          # PR 行导致漏评论。
+          while read -r pr <&3; do
+            [ -n "$pr" ] || continue
+            # 幂等检查:该 PR 是否已有本版本的「已发布」评论
+            if gh api "repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" \
+                 --jq '.[].body' 2>/dev/null | grep -qF "$MARKER"; then
+              echo "PR #${pr}: already has released-in ${RELEASE_TAG} comment, skipping."
+              continue
+            fi
+            BODY="${MARKER}
+          🚀 Released in [**${RELEASE_TAG}**](${RELEASE_URL})"
+            if gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$BODY" 2>/dev/null; then
+              echo "PR #${pr}: commented released-in ${RELEASE_TAG}."
+            else
+              echo "PR #${pr}: comment failed (non-fatal), continuing." >&2
+            fi
+          done 3< "$PR_FILE"
+
+      - name: Note — desktop assets pending
+        # Make the npm-first window visible in the run log: npm + Release are
+        # live now; the macOS .dmg/.zip attach in the parallel attach-desktop-assets
+        # job after signing. If signing is rejected/fails/cancelled, recover by
+        # re-running this workflow via workflow_dispatch with this release_tag.
+        run: |
+          echo "npm ${GITHUB_REF_NAME#v} published and GitHub Release ${GITHUB_REF_NAME} created."
+          echo "macOS desktop assets (.dmg/.zip) attach asynchronously in attach-desktop-assets after signing."
+          echo "If Desktop signing is rejected/fails/cancelled, re-run this workflow via workflow_dispatch with release_tag=${GITHUB_REF_NAME} to rebuild+sign and attach Desktop assets."
+  bun-binaries:
+    # Build the self-contained Bun single-file executables (see
+    # scripts/build-bun-binary.mjs). These let users run botmux with NO Node on
+    # the machine (one file, one runtime), sidestepping the "two Node versions
+    # each carry their own global botmux" breakage — and under the inverted
+    # release order they are now the PRIMARY npm payload too, shipped inside the
+    # four platform subpackages rather than only as Release attachments.
+    #
+    # RUNS FIRST — this job no longer `needs: [release]`. It used to, because the
+    # binaries were attached to an already-created GitHub Release. Now the main
+    # package's optionalDependencies point at subpackages built from these
+    # binaries, so the order had to invert: compile → publish subpackages →
+    # publish main package. Only `preflight` gates it (tag-push path + the
+    # latest-dist-tag authority/downgrade/master guards), so nothing publishes
+    # before those guards have passed.
+    #
+    # Binaries leave here as WORKFLOW ARTIFACTS, not Release uploads: the Release
+    # does not exist yet at this point. `binary-subpackages` downloads them to
+    # pack the npm subpackages, and `attach-bun-binaries` re-attaches them to the
+    # Release once `release` has created it (keeping install.sh's
+    # `botmux-<os>-<arch>` + `.sha256` asset names intact).
+    #
+    # WHY a per-OS matrix instead of one cross-compile job: node-pty's native
+    # `pty.node` (and macOS `spawn-helper`) must match the target OS. Bun can
+    # cross-compile the JS + runtime, but the embedded `.node` has to be the one
+    # `bun install` compiled ON that OS. So we build each OS's binaries on its
+    # own native architecture. Linux compiles inside manylinux_2_28 so the embedded
+    # native stays compatible with Node 22's glibc floor; darwin uses macos-14.
+    needs: [preflight]
+    # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
+    # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
+    # runtime, but the embedded `.node` has to be the one `bun install` produced
+    # for that platform.
+    #
+    # darwin: node-pty SHIPS prebuilds (`prebuilds/darwin-{x64,arm64}/`), so one
+    # macOS runner can emit both arches.
+    # linux: installs run with `npm_config_build_from_source=true` (so the glibc
+    # floor and musl gates inspect what we compiled, not node-pty's prebuilds), so
+    # node-pty's install script is `node-gyp rebuild`, which compiles
+    # `build/Release/pty.node` for the HOST arch only. So an x64 runner cannot
+    # produce a linux-arm64 binary: the build script fails closed ("node-pty native not found for linux-arm64") rather than
+    # shipping a binary with the wrong native. Because the compile step loops with
+    # `set -e`, that failure also discarded the successfully-built linux-x64 in the
+    # same leg — and with the release order inverted, `binary-subpackages` and
+    # `release` both `needs` this job, so the whole publish chain stalled.
+    # Hence linux-arm64 gets its own native arm64 runner (`ubuntu-24.04-arm`,
+    # GA and free for public repos), which runs the aarch64 manylinux container.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: bun-linux-x64
+            artifact: linux-x64
+            glibc_baseline: '2.28'
+          - os: ubuntu-24.04-arm
+            targets: bun-linux-arm64
+            artifact: linux-arm64
+            glibc_baseline: '2.28'
+          - os: macos-14
+            targets: bun-darwin-x64 bun-darwin-arm64
+            artifact: darwin
+            glibc_baseline: ''
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        if: matrix.glibc_baseline == ''
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.glibc_baseline == ''
+        with:
+          bun-version: 1.4.3
+      # Only the darwin leg installs here (linux installs inside the glibc-baseline
+      # container); node-pty's darwin prebuilds are what the embed plugin bundles.
+      - if: matrix.glibc_baseline == ''
+        run: bun install --frozen-lockfile
+
+      - name: Sync version from git tag to package.json
+        if: matrix.glibc_baseline == ''
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+
+      - if: matrix.glibc_baseline == ''
+        run: bun run build
+
+      - name: Build Linux binary on the glibc 2.28 floor
+        if: matrix.glibc_baseline != ''
+        run: |
+          target="${{ matrix.targets }}"
+          scripts/build-linux-glibc-baseline.sh \
+            "$target" "dist-bin/botmux-${target#bun-}" \
+            "${RELEASE_TAG#v}"
+
+      - name: Compile Bun single-file executables
+        if: matrix.glibc_baseline == ''
+        # Build each target this runner is responsible for. The script fails
+        # closed if a target's native (pty.node) is absent rather than shipping a
+        # broken binary.
+        run: |
+          mkdir -p dist-bin
+          for t in ${{ matrix.targets }}; do
+            bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+          done
+
+      - name: Verify Mach-O signatures on every darwin binary
+        if: matrix.glibc_baseline == '' && runner.os == 'macOS'
+        # `bun build --compile` ad-hoc-signs darwin binaries, and Bun 1.4.0 wrote
+        # an INVALID signature (oven-sh/bun#39764, fixed in #39837 → 1.4.1). The
+        # macos-14 runner tolerated it, so 3.18.14 built, smoke-passed and shipped
+        # — and macOS 27 SIGKILLed it before main(), which is all `botmux upgrade`
+        # saw. The smoke step below only runs the HOST arch; this verifies BOTH
+        # darwin outputs (the cross-built one included) with the same strictness
+        # newer macOS applies, so a bad signature fails the release here instead
+        # of on a user machine.
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            echo "verifying signature: $f"
+            codesign --verify --strict --verbose=2 "$f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
+      - name: Verify the canvas skia native is embedded in every darwin binary
+        if: matrix.glibc_baseline == '' && runner.os == 'macOS'
+        # botmux-darwin-x64 shipped in v3.40.0 without @napi-rs/canvas's skia native:
+        # the cross-built x64 target could not resolve it, and the smoke below runs
+        # only the host arch, so nothing ever inspected the x64 file. Bun embeds the
+        # skia .node as raw bytes, so a skia-only symbol name is a cheap presence
+        # check. `SkBitmap` (not the generic napi-rs `Create Custom GC
+        # ThreadsafeFunction`, which rolldown/lightningcss also carry, and not
+        # `SkCanvas`/`GrDirectContext`, which are stripped out of the published
+        # .node) is measurably present 3x in the pinned skia and absent from every
+        # other embedded native. Fail closed: a darwin binary without it cannot
+        # render cards and must not ship.
+        run: |
+          shopt -s nullglob
+          found=0
+          for f in dist-bin/botmux-darwin-*; do
+            case "$f" in *.map|*.sha256) continue;; esac
+            found=1
+            if ! grep -aq "SkBitmap" "$f"; then
+              echo "::error::skia native missing from $f"
+              exit 1
+            fi
+            echo "skia native present: $f"
+          done
+          if [ "$found" = 0 ]; then echo "no darwin binaries in dist-bin"; exit 1; fi
+
+      - name: Smoke-test the host-arch binary
+        if: matrix.glibc_baseline == ''
+        # Each leg executes the binary it just built for its OWN arch, so with the
+        # per-arch matrix every linux target is now genuinely run (linux-x64 on the
+        # x64 runner, linux-arm64 on the arm64 runner). Only darwin still has one
+        # cross-built arch that cannot be executed here: the macOS leg emits both
+        # x64 and arm64 from prebuilds, and a runner can only run its own.
+        #
+        # Shares scripts/smoke-bun-binary.mjs with the CI `bun-binary` job so the
+        # release gate is never weaker than the PR gate. It used to run only
+        # `capabilities --json`, which is a static feature-flag document: it
+        # proved the module graph loaded and nothing else, and a crashlooping
+        # dashboard shipped straight past it. The shared script instead exercises
+        # the hidden self-spawn entries, the supervised dashboard member booting
+        # with its embedded modules, its HTTP listener, and the wrapper-write
+        # self-destruct guard — from a scratch HOME with no node_modules, so a
+        # broken native/embedded module surfaces here instead of being masked by a
+        # sibling install.
+        run: |
+          HOST_ARCH="$(node -e 'process.stdout.write(process.arch)')"
+          HOST_OS="$(node -e 'process.stdout.write(process.platform==="darwin"?"darwin":"linux")')"
+          BIN="dist-bin/botmux-${HOST_OS}-${HOST_ARCH}"
+          if [ ! -x "$BIN" ]; then echo "host-arch binary $BIN not built on this runner"; exit 1; fi
+          node scripts/smoke-bun-binary.mjs "$BIN"
+
+      - name: Checksums
+        # `sha256sum` is GNU coreutils and DOES NOT EXIST on the macOS runner —
+        # BSD userland ships `shasum -a 256` instead. The darwin leg failed here
+        # with `sha256sum: command not found` (exit 127) AFTER both darwin
+        # binaries had built and smoke-passed, and because `binary-subpackages`
+        # and `release` both `needs` this job, that one missing command skipped
+        # the entire publish chain.
+        #
+        # Both commands print `<hash>  <filename>`, which is the format
+        # install.sh parses (`cut -d' ' -f1`), so this fallback keeps the
+        # published .sha256 files byte-compatible with what the installer and any
+        # already-released assets expect.
+        run: |
+          cd dist-bin
+          if command -v sha256sum >/dev/null 2>&1; then
+            hash_cmd() { sha256sum "$1"; }
+          elif command -v shasum >/dev/null 2>&1; then
+            hash_cmd() { shasum -a 256 "$1"; }
+          else
+            echo "no sha256 tool available (need sha256sum or shasum)"; exit 1
+          fi
+          for f in botmux-*; do hash_cmd "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload binaries as workflow artifacts
+        # `retention-days` only has to outlive this run. Downstream consumers are
+        # `binary-subpackages` (packs them into npm tarballs) and
+        # `attach-bun-binaries` (attaches them to the Release).
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-binaries-${{ matrix.artifact }}
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+          retention-days: 7
+
+  bun-binaries-musl:
+    # The musl (Alpine) legs. The build runs inside Alpine via `docker run`; the
+    # job itself runs on the plain glibc runner.
+    #
+    # WHY A SEPARATE JOB: `pty.node` is embedded into the binary at build time, and
+    # node-pty's linux prebuilds are glibc-only — so musl needs a from-source
+    # compile, which links against whatever libc the builder runs on. Measured: on a
+    # glibc host the result is
+    # `NEEDED libc.so.6`; inside node:22-alpine it is `NEEDED libc.musl-x86_64.so.1`.
+    # Cross-compiling a musl target from the glibc runner would therefore embed a
+    # glibc native and fail at PTY spawn on Alpine — at RUNTIME, silently, not at
+    # build time. So the musl targets must be compiled on musl.
+    #
+    # WHY `docker run` AND NOT A JOB-LEVEL `container:` (this cost a failed release):
+    # with `container: node:22-alpine`, the arm64 leg died before running anything:
+    #   JavaScript Actions in Alpine containers are only supported on x64 Linux
+    #   runners. Detected Linux Arm64
+    # actions/checkout is a JS action, and GitHub cannot inject its Node runtime
+    # into a musl container on arm64. The x64 leg was unaffected, which is why the
+    # PR gate (x64-only) stayed green while the release failed. Running JS actions
+    # on the HOST and only the build inside `docker run` sidesteps the limitation
+    # entirely and keeps both arches on one code path.
+    #
+    # Verified end-to-end: inside node:22-alpine, building with
+    # scripts/build-bun-binary.mjs --target bun-linux-x64-musl and then running the
+    # result spawned a real PTY (`PTY_OK_FROM_MUSL`). That check matters because a
+    # binary that merely STARTS proves nothing — a libc mismatch fails at the moment
+    # the native module loads. The bind-mount writeback (artifact readable back on
+    # the host for upload-artifact) was verified with the same shape.
+    if: github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: bun-linux-x64-musl
+            artifact: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            targets: bun-linux-arm64-musl
+            artifact: linux-arm64-musl
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      # Runs on the HOST (glibc), so the JS action works on both arches.
+      - uses: actions/checkout@v6
+
+      - name: Build the musl binary inside Alpine
+        # Every musl-side step in one container invocation: toolchain, bun, install
+        # (this is what compiles pty.node against musl), the fail-closed linkage
+        # check, version stamp, build, compile, and the shared smoke script.
+        #
+        # `--platform` is deliberately NOT passed: the image resolves to the
+        # runner's own architecture, which is the whole point — the native must be
+        # built for the arch it will ship on, not emulated.
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e RELEASE_TAG \
+            -e MATRIX_TARGETS="${{ matrix.targets }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+
+              # setup-bun does not support musl, and npm ships musl builds of bun
+              # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
+              npm i -g bun@1.4.3 --loglevel=error
+              echo "bun $(bun --version) on $(uname -m)"
+
+              # Compiles node-pty against MUSL — the whole point of this job.
+              # build_from_source makes node-pty'"'"'s install script delete its
+              # (glibc) prebuilds and run node-gyp. It only takes effect when
+              # node-pty is actually (re)installed — a clean checkout here.
+              npm_config_build_from_source=true bun install --frozen-lockfile
+
+              # Fail closed rather than shipping a glibc native inside a musl
+              # binary: that mistake survives the build and only surfaces when the
+              # native is loaded, on a user machine.
+              f=node_modules/node-pty/build/Release/pty.node
+              test -f "$f" || { echo "node-pty native missing at $f"; exit 1; }
+              if ! readelf -d "$f" | grep -q "libc\.musl"; then
+                echo "REFUSING: $f is not musl-linked:"; readelf -d "$f" | grep NEEDED; exit 1
+              fi
+              echo "ok: $(readelf -d "$f" | grep NEEDED | tr -s " ")"
+
+              npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+              bun run build
+
+              mkdir -p dist-bin
+              for t in $MATRIX_TARGETS; do
+                bun scripts/build-bun-binary.mjs --target "$t" --out "dist-bin/botmux-${t#bun-}"
+              done
+
+              # Run the binary this container just built, on musl — the only place
+              # it can be executed. Same shared script as the glibc legs and the PR
+              # gate, so no leg is gated more weakly than another.
+              HOST_ARCH="$(node -e "process.stdout.write(process.arch)")"
+              BIN="dist-bin/botmux-linux-${HOST_ARCH}-musl"
+              if [ ! -x "$BIN" ]; then echo "musl binary $BIN not built"; exit 1; fi
+              node scripts/smoke-bun-binary.mjs "$BIN"
+
+              # The process/socket probes in the legacy-pm2 reaper, exercised against
+              # BusyBox. Mirrors the PR gate deliberately: `bun run test` runs on
+              # glibc, where reverting either probe to `ps -p`/`lsof` leaves the
+              # unit suite green while the musl binary we ship stops reaping at all
+              # (and can never clear its own stale warning). Keeping this in BOTH
+              # workflows is the same "no leg gated more weakly" rule as above —
+              # last time the legs diverged, the PR gate was green while the release
+              # failed.
+              node scripts/smoke-musl-reaper-probes.mjs dist/core/legacy-pm2-reaper.js
+
+              # Hand dist-bin back to the HOST user before exiting.
+              #
+              # WHY (this broke v3.18.0-canary.5, after the container work itself had
+              # fully succeeded): the container runs as root, so everything it writes
+              # through the bind mount is uid 0. The runner host user is `runner`
+              # (uid 1001) and CANNOT create files inside a root-owned directory:
+              #   dist-bin/botmux-linux-arm64-musl.sha256: Permission denied
+              # Both musl legs built, smoke-passed, and then died in `Checksums`.
+              #
+              # `-v` bind mounts share the host inode, so ownership is not remapped
+              # for us (a `container:` job did not have this problem because GitHub
+              # ran the whole job as the same user). Reproduced and fixed as a
+              # non-root user before committing — my original verification ran as
+              # root, which can write anywhere and therefore could not see it.
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - name: Checksums
+        # Runs on the host, writing .sha256 files INTO dist-bin — which is why the
+        # container hands ownership back above. Readable is not enough; this step
+        # needs write permission on the directory.
+        run: |
+          cd dist-bin
+          for f in botmux-*; do sha256sum "$f" > "$f.sha256"; done
+          ls -la
+
+      - name: Upload binaries as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-binaries-${{ matrix.artifact }}
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-darwin-binaries:
+    # Stable CLI releases need a stable code identity, not merely a structurally
+    # valid ad-hoc signature. macOS TCC records an ad-hoc executable by cdhash;
+    # replacing the binary on upgrade changes that hash and invalidates Full Disk
+    # Access / App Data grants. The Developer ID identity already used by the
+    # desktop release gives both architectures one durable designated requirement.
+    #
+    # This intentionally gates stable publication on the protected environment's
+    # manual approval. Prereleases remain ad-hoc signed so contributors can publish
+    # canary/beta/rc builds without access to the repository owner's certificate.
+    if: github.event_name == 'push' && needs.preflight.outputs.tag == 'latest'
+    needs: [preflight, bun-binaries]
+    runs-on: macos-14
+    environment: macos-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download ad-hoc signed darwin binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: bun-binaries-darwin
+          path: dist-bin
+
+      - name: Developer ID sign darwin CLI binaries
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: scripts/sign-macos-cli-binaries.sh dist-bin
+
+      - name: Smoke-test the signed host-arch binary
+        run: |
+          chmod +x dist-bin/botmux-darwin-arm64
+          node scripts/smoke-bun-binary.mjs dist-bin/botmux-darwin-arm64
+
+      - name: Smoke-test the signed darwin native PTY path
+        run: dist-bin/botmux-darwin-arm64 __pty-smoke
+
+      - name: Replace darwin artifact with Developer ID signed binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-binaries-darwin
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  binary-subpackages:
+    # Publish the four platform subpackages — `botmux-linux-x64`,
+    # `botmux-linux-arm64`, `botmux-darwin-x64`, `botmux-darwin-arm64` — each
+    # carrying exactly one file: the compiled `botmux` binary for its os/arch.
+    # npm installs only the subpackage matching the host (that is what the `os`
+    # and `cpu` fields in packages/binary-*/package.json do), and the main
+    # package's postinstall points the single launcher at whichever one landed.
+    #
+    # MUST run before `release`: the main package declares OPTIONAL dependencies
+    # on these. An unresolvable optional dep is a silent no-op for npm, so a main
+    # package published first would install with no binary and degrade quietly.
+    #
+    # Single runner, not a matrix: publishing is pure npm I/O with no native
+    # build, so both OSes' binaries are packed here from the artifacts.
+    # A skipped sign job is valid only for prereleases. Stable releases fail
+    # closed unless both darwin binaries were Developer ID signed first.
+    if: >-
+      ${{
+        always() &&
+        needs.preflight.result == 'success' &&
+        needs.bun-binaries.result == 'success' &&
+        needs.bun-binaries-musl.result == 'success' &&
+        (
+          needs.preflight.outputs.tag != 'latest' ||
+          needs.sign-darwin-binaries.result == 'success'
+        )
+      }}
+    needs: [preflight, bun-binaries, bun-binaries-musl, sign-darwin-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token: write —— npm Trusted Publishing (OIDC), same as the main
+      # package's publish step. Each of the four subpackages needs its own
+      # Trusted Publisher configured on npmjs.com, pointing at this workflow.
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Upgrade npm for Trusted Publishing
+        # Same pin and reason as the main publish job: OIDC needs npm >= 11.5.1,
+        # and a floating `latest` could jump to npm 12 mid-release.
+        run: npm install -g npm@11.19.0
+
+      - name: Download compiled binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bun-binaries-*
+          merge-multiple: true
+          path: dist-bin
+
+      - name: Stage each binary into its subpackage and publish
+        # The binary must land as the file named exactly `botmux` (that is the
+        # sole entry in each subpackage's `files` allowlist) and must be
+        # EXECUTABLE: npm pack preserves the mode bit, and a non-executable
+        # binary installs a dud that only fails much later when the launcher
+        # tries to exec it. `chmod +x` here rather than trusting the artifact
+        # round-trip, because upload-artifact does NOT preserve permissions.
+        #
+        # Version is stamped per subpackage with the same `npm version --prefix`
+        # form the workflow-core step uses, so all five packages plus the main
+        # one carry the tag's version.
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          for plat in linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl darwin-x64 darwin-arm64; do
+            src="dist-bin/botmux-${plat}"
+            dir="packages/binary-${plat}"
+            if [ ! -f "$src" ]; then echo "missing compiled binary $src"; exit 1; fi
+            cp "$src" "$dir/botmux"
+            chmod +x "$dir/botmux"
+            test -x "$dir/botmux" || { echo "$dir/botmux is not executable"; exit 1; }
+            npm version "$VERSION" --no-git-tag-version --allow-same-version --prefix "$dir"
+            node scripts/publish-npm-if-missing.mjs "./$dir" "${{ needs.preflight.outputs.tag }}"
+          done
+
+  attach-bun-binaries:
+    # Attach the compiled binaries + checksums to the GitHub Release.
+    #
+    # Split out from `bun-binaries` because of the order inversion: the binaries
+    # are now built BEFORE the Release exists, so `gh release upload` cannot run
+    # in the build job any more. This tail job waits for `release` to create the
+    # Release, then uploads the artifacts under the SAME names install.sh expects
+    # (`botmux-<os>-<arch>` and `<asset>.sha256` — verified against install.sh,
+    # which derives them from `uname -s`/`uname -m`). Renaming these would
+    # silently break the curl installer.
+    #
+    # Must spell out `needs.*.result == 'success'` because it carries an `if:` —
+    # GitHub drops the implicit all-needs-succeeded gate for conditional jobs
+    # (same reason `attach-desktop-assets` does it).
+    #
+    # NOT a gate on npm: if this fails, npm + the subpackages are already live and
+    # the binaries can be re-attached by hand. The npm channel already carries the
+    # same binaries inside the platform subpackages, so a missing Release asset
+    # only affects the curl/install.sh path.
+    if: github.event_name == 'push' && needs.bun-binaries.result == 'success' && needs.bun-binaries-musl.result == 'success' && needs.release.result == 'success'
+    needs: [bun-binaries, bun-binaries-musl, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download compiled binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bun-binaries-*
+          merge-multiple: true
+          path: dist-bin
+
+      - name: Attach Bun binaries to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist-bin
+          gh release upload "$RELEASE_TAG" dist-bin/botmux-* --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish-github-release:
+    # Flip the draft release public — the LAST step of the release, on purpose.
+    #
+    # WHY THIS JOB EXISTS: `releases/latest/download/…` resolves as soon as a release
+    # is published, but the binaries are attached by `attach-bun-binaries`, which
+    # cannot run before the release exists. Publishing immediately therefore opened a
+    # window where install.sh 404s — 72 seconds on v3.18.0, and a real user hit it.
+    # Creating the release as a draft and publishing HERE means `latest` never points
+    # at a release without binaries.
+    #
+    # WHY IT IS NOT PART OF `attach-bun-binaries`: keeping "upload" and "publish"
+    # separate means a partial upload cannot publish. If attach fails, this job is
+    # skipped and the release stays a DRAFT — invisible to `latest`, so users keep
+    # getting the previous version instead of a 404. That is the fail-closed
+    # direction: npm is already live either way.
+    #
+    # RECOVERY FROM A STUCK DRAFT (verified, because the obvious assumption is wrong):
+    # `workflow_dispatch` does NOT re-run this job — it carries
+    # `github.event_name == 'push'`, and the dispatch path only reaches
+    # `refresh-desktop-assets`. Re-running the failed RUN works only while the
+    # compiled-binary artifacts still exist (`retention-days: 7`). So:
+    #   • within 7 days → re-run the failed jobs of that run; or
+    #   • any time      → attach the assets and publish by hand:
+    #       gh release upload vX.Y.Z <binaries+sha256> --clobber
+    #       gh release edit   vX.Y.Z --draft=false
+    # A draft blocks only the curl/install.sh path; npm already serves the same
+    # binaries inside the platform subpackages, so this is never a total outage.
+    #
+    # `--draft=false` is idempotent: publishing an already-public release is a no-op.
+    if: github.event_name == 'push' && needs.attach-bun-binaries.result == 'success'
+    needs: [attach-bun-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify every install.sh asset is present BEFORE publishing
+        # The gate this whole change exists for. install.sh derives asset names from
+        # `uname -s`/`uname -m` (+ a `-musl` suffix when the libc is musl), so a
+        # missing or misnamed asset is a 404 for exactly the platforms it covers —
+        # and nothing else in the pipeline checks the NAMES at all. Refusing to
+        # publish leaves the release a draft, which is strictly better than a public
+        # release that 404s.
+        run: |
+          missing=""
+          for a in botmux-linux-x64 botmux-linux-arm64 botmux-linux-x64-musl \
+                   botmux-linux-arm64-musl botmux-darwin-x64 botmux-darwin-arm64; do
+            for f in "$a" "$a.sha256"; do
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+                --json assets --jq '[.assets[].name]|index("'"$f"'")' | grep -q '^[0-9]' \
+                || missing="$missing $f"
+            done
+          done
+          if [ -n "$missing" ]; then
+            echo "REFUSING to publish: missing release assets:$missing"
+            echo "The release stays a DRAFT, so releases/latest/download keeps serving the"
+            echo "previous version instead of 404ing. Fix the assets, then re-run."
+            exit 1
+          fi
+          echo "ok: all 12 install.sh assets present"
+
+      - name: Publish the release
+        run: |
+          gh release edit "$RELEASE_TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,isPrerelease,assets \
+            --jq '"published: isDraft=\(.isDraft) prerelease=\(.isPrerelease) assets=\(.assets|length)"'
+
+  attach-desktop-assets:
+    # npm-first tail: once the parallel `desktop` job has signed+notarized the
+    # macOS build AND the `release` job has created the GitHub Release, upload
+    # the .dmg/.zip onto that Release. Runs on the tag-push path (the
+    # workflow_dispatch refresh path is handled by `refresh-desktop-assets`).
+    # `needs: [desktop, release]` both must succeed: desktop for the artifact,
+    # release so the GitHub Release exists to upload onto.
+    #
+    # FAILURE MODE (accepted trade-off of npm-first): the `desktop` job sits
+    # behind the macos-signing environment approval, which can wait up to 30
+    # days and may be rejected / the build may fail / the run may be cancelled.
+    # In any of those cases npm + the GitHub Release are already live but this
+    # job never runs, so the Release keeps npm-only (no .dmg/.zip). There is no
+    # auto-retry here on purpose — signing needs a human approval, so retrying
+    # would just re-block. Recovery is manual and idempotent: re-run this
+    # workflow via workflow_dispatch with release_tag=vX.Y.Z; that rebuilds+signs
+    # macOS (fresh artifact, so the 7-day retention is irrelevant) and
+    # `refresh-desktop-assets` --clobber-attaches to the existing Release.
+    if: github.event_name == 'push' && needs.desktop.result == 'success' && needs.release.result == 'success'
+    needs: [desktop, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download macOS build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: botmux-macos
+          path: release-assets
+
+      - name: Attach macOS assets to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done
+
+  refresh-desktop-assets:
+    if: github.event_name == 'workflow_dispatch'
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Download macOS build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: botmux-macos
+          path: release-assets
+
+      - name: Replace macOS assets on existing GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify uploaded release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir downloaded-assets
+          gh release download "$RELEASE_TAG" \
+            --pattern 'Botmux-*.dmg' \
+            --pattern 'Botmux-*.zip' \
+            --dir downloaded-assets \
+            --repo "$GITHUB_REPOSITORY"
+          for file in release-assets/*; do
+            cmp "$file" "downloaded-assets/$(basename "$file")"
+          done

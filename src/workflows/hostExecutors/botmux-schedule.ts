@@ -1,32 +1,52 @@
 import { z } from 'zod';
 
+import { computeNextRun, normalizeTopicTitle, parseSchedule } from '../../core/scheduler.js';
 import {
+  canonicalScheduleInput,
   createTask,
   getTask,
   IdempotencyConflictError,
 } from '../../services/schedule-store.js';
-import type { ParsedSchedule } from '../../types.js';
-import type { ProviderReconciler } from '../resume.js';
+import { computeInputHash } from '../../utils/canonical-input-hash.js';
+import type { ParsedSchedule, ScheduleExecutionPosition } from '../../types.js';
+import type { ProviderReconciler } from '../shared/provider-reconciler.js';
+import { PROVIDER_TTL_MS } from '../shared/provider-reconciler.js';
 import type { SideEffectingExecutor } from './types.js';
 
 export type ScheduleInput = {
   name: string;
   schedule: string;
-  /** Pre-resolved schedule (parser output).  Required for relative
-   *  schedules (`30m`, `2h`, `明天9:00`) to keep canonical input frozen
-   *  against re-parse drift (codex round 4 finding 4). */
+  /** Pre-resolved schedule (parser output). Host preparation derives it when
+   *  omitted; the frozen sidecar always contains it so recovery never reparses
+   *  relative schedules (`30m`, `2h`, `明天9:00`). */
   parsed: ParsedSchedule;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatType: 'group' | 'p2p';
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
+  executionPosition?: ScheduleExecutionPosition;
+  /** First-message template for non-silent new-topic/task runs. Supports
+   * `{{date}}`, signed day offsets, and `{{owner}}`. */
+  topicTitle?: string;
   larkAppId?: string;
+  /** Run initiator's open_id, only materializable as the exact
+   *  `{ "$ref": "context.initiatorOpenId" }` binding (template-bindings
+   *  policy). Stamped onto the task so scheduled turns authenticate as the
+   *  workflow initiator; omitted for ownerless templates. */
+  ownerOpenId?: string;
   /** `repeat.completed` is intentionally absent — it's a runtime counter
    *  and must not be part of canonical input.  See schedule-store
    *  canonicalScheduleInput. */
   repeat?: { times: number | null };
-  deliver?: 'origin' | 'local';
+  deliver?: 'origin' | 'local' | 'new-topic';
+  /** Silent fires: no "task started" banner; the spawned turn suppresses
+   *  daemon-initiated group output and the model decides whether to send. */
+  silent?: boolean;
+  /** `--follow-active`: re-resolve the landing topic at every fire (see
+   *  ScheduledTask.followActive). Requires executionPosition 'topic'. */
+  followActive?: boolean;
 };
 
 export type ScheduleOutput = {
@@ -44,19 +64,54 @@ const ParsedScheduleSchema = z.object({
 const ScheduleInputSchema = z.object({
   name: z.string().min(1),
   schedule: z.string().min(1),
-  parsed: ParsedScheduleSchema,
-  prompt: z.string(),
+  parsed: ParsedScheduleSchema.optional(),
+  prompt: z.string().min(1),
   workingDir: z.string().min(1),
   chatId: z.string().min(1),
+  // Optional only for legacy v2 definitions; v3 DAG validation requires the
+  // exact context.chatType binding.
+  chatType: z.enum(['group', 'p2p']).optional(),
   rootMessageId: z.string().optional(),
   scope: z.enum(['thread', 'chat']).optional(),
+  executionPosition: z.enum(['top-level', 'topic', 'new-topic', 'task']).optional(),
+  topicTitle: z.string().max(200).optional(),
   larkAppId: z.string().optional(),
-  repeat: z.object({ times: z.number().int().nonnegative().nullable() }).optional(),
-  deliver: z.enum(['origin', 'local']).optional(),
+  ownerOpenId: z.string().optional(),
+  repeat: z.object({ times: z.number().int().positive().nullable() }).optional(),
+  deliver: z.enum(['origin', 'local', 'new-topic']).optional(),
+  silent: z.boolean().optional(),
+  followActive: z.boolean().optional(),
 });
 
 export function parseScheduleInput(input: unknown): ScheduleInput {
-  return ScheduleInputSchema.parse(input);
+  const parsed = ScheduleInputSchema.parse(input);
+  const value = {
+    ...parsed,
+    chatType: parsed.chatType ?? 'group',
+    executionPosition: parsed.executionPosition
+      ?? (parsed.deliver === 'new-topic'
+        ? 'new-topic' as const
+        : parsed.scope === 'chat' ? 'top-level' as const : parsed.rootMessageId ? 'topic' as const : undefined),
+    topicTitle: parsed.topicTitle?.trim() || undefined,
+    scope: parsed.scope ?? (parsed.deliver === 'new-topic' ? 'chat' as const : undefined),
+    deliver: parsed.deliver === 'local' ? 'local' as const : 'origin' as const,
+    // Raw authored/Saved Workflow input derives relative time exactly once at
+    // host preparation. Re-validation receives the already-frozen `parsed`
+    // sidecar value and therefore never reinterprets "30m" after a restart.
+    parsed: parsed.parsed ?? parseSchedule(parsed.schedule),
+  };
+  if (value.parsed.kind === 'once') {
+    if (!value.parsed.runAt || !Number.isFinite(Date.parse(value.parsed.runAt))) {
+      throw new Error('one-shot schedule must contain a valid runAt timestamp');
+    }
+  } else if (value.parsed.kind === 'interval') {
+    if (!Number.isSafeInteger(value.parsed.minutes) || (value.parsed.minutes ?? 0) < 1) {
+      throw new Error('interval schedule minutes must be a positive integer');
+    }
+  } else if (!value.parsed.expr || computeNextRun(value.parsed) === null) {
+    throw new Error('cron schedule must have a valid future occurrence');
+  }
+  return value;
 }
 
 /**
@@ -71,31 +126,75 @@ export function parseScheduleInput(input: unknown): ScheduleInput {
  */
 export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, ScheduleOutput> = {
   provider: 'botmux-schedule',
-  idempotencyTtlMs: Number.MAX_SAFE_INTEGER,
+  idempotencyTtlMs: PROVIDER_TTL_MS['botmux-schedule'],
 
   canonicalInput(input) {
-    // Mirrors schedule-store's `canonicalScheduleInput`.  Keeping them in
-    // sync is critical: if they diverge, two callers can produce the
-    // same idempotencyKey but disagree on canonicality and trip the
-    // IdempotencyConflict path on every retry.
-    return {
-      name: input.name,
-      schedule: input.schedule,
-      parsed: {
-        kind: input.parsed.kind,
-        runAt: input.parsed.runAt,
-        minutes: input.parsed.minutes,
-        expr: input.parsed.expr,
-      },
-      prompt: input.prompt,
-      workingDir: input.workingDir,
-      chatId: input.chatId,
-      rootMessageId: input.rootMessageId,
-      scope: input.scope,
-      larkAppId: input.larkAppId,
-      repeat: input.repeat ? { times: input.repeat.times } : undefined,
-      deliver: input.deliver ?? 'origin',
-    };
+    return canonicalScheduleInput(input);
+  },
+
+  validateBeforeIntent(input, nowMs) {
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_CLOCK_INVALID',
+        message: 'host clock evidence is invalid; freeze a fresh schedule attempt',
+      };
+    }
+    if (input.deliver === 'local') {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_LOCAL_DELIVERY_UNSUPPORTED',
+        message: 'v3 schedule host does not support deliver=local in P0',
+      };
+    }
+    if (input.executionPosition === 'topic' && !input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TOPIC_ROOT_REQUIRED',
+        message: 'topic execution requires rootMessageId',
+      };
+    }
+    if (input.executionPosition === 'task' && input.rootMessageId) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TASK_ROOT_FORBIDDEN',
+        message: 'task execution runs in its own session and must not carry rootMessageId',
+      };
+    }
+    if (input.followActive === true && input.executionPosition !== 'topic') {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_FOLLOW_ACTIVE_REQUIRES_TOPIC',
+        message: 'followActive requires executionPosition topic',
+      };
+    }
+    try {
+      normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_TOPIC_TITLE_INVALID',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+    if (input.parsed.kind !== 'once') return { ok: true };
+    const runAtMs = input.parsed.runAt ? Date.parse(input.parsed.runAt) : Number.NaN;
+    // Keep exactly the scheduler's two-minute one-shot catch-up window. Once
+    // this payload falls outside it, creating the task would report success
+    // while computeNextRun() can never schedule it.
+    if (!Number.isFinite(runAtMs) || runAtMs < nowMs - 120_000) {
+      return {
+        ok: false,
+        errorCode: 'HOST_SCHEDULE_APPROVAL_STALE',
+        message: 'approved one-shot schedule is stale; retry to freeze and approve a fresh runAt',
+      };
+    }
+    return { ok: true };
   },
 
   async invoke(input, idempotencyKey) {
@@ -107,11 +206,22 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
       prompt: input.prompt,
       workingDir: input.workingDir,
       chatId: input.chatId,
+      chatType: input.chatType,
       rootMessageId: input.rootMessageId,
       scope: input.scope,
+      executionPosition: input.executionPosition,
+      topicTitle: normalizeTopicTitle(input.topicTitle, {
+        executionPosition: input.executionPosition,
+        rootMessageId: input.rootMessageId,
+        silent: input.silent,
+        ownerOpenId: input.ownerOpenId,
+      }),
       larkAppId: input.larkAppId,
+      ownerOpenId: input.ownerOpenId,
       repeat: input.repeat ? { times: input.repeat.times, completed: 0 } : undefined,
       deliver: input.deliver,
+      silent: input.silent,
+      followActive: input.followActive === true ? true : undefined,
     });
     return {
       output: { taskId: task.id },
@@ -134,23 +244,39 @@ export const botmuxScheduleExecutor: SideEffectingExecutor<ScheduleInput, Schedu
 export const botmuxScheduleReconciler: ProviderReconciler = {
   provider: 'botmux-schedule',
 
-  // Schedule reconciler doesn't load effect input (idempotencyKey is
-  // self-sufficient), so the resume-side hash guard never fires.  We
-  // still expose `canonicalInput` for interface uniformity — anyone
-  // re-using the reconciler in a context that DOES load sidecars (e.g.
-  // future ScheduleStore variants requiring body verification) gets the
-  // same check for free.
+  // v3 supplies its verified frozen input and requires exact body matching.
   canonicalInput(input) {
     return botmuxScheduleExecutor.canonicalInput(input as ScheduleInput);
   },
 
-  async readOnlyLookup(idempotencyKey) {
-    const task = getTask(idempotencyKey);
+  async readOnlyLookup(idempotencyKey, input) {
+    // Per-bot stores: address the OWNING bot's file from the frozen input's
+    // larkAppId (same routing createTask used) — a zero-arg getTask would
+    // depend on a process-global scope that non-daemon v3 runs (cli-run /
+    // goal-cli resume & reconciliation) never bind. A malformed input falls
+    // through to the existing validation path below instead of failing here.
+    let inputAppId: string | undefined;
+    if (input !== undefined) {
+      try { inputAppId = parseScheduleInput(input).larkAppId; } catch { /* validated below */ }
+    }
+    const task = getTask(idempotencyKey, inputAppId);
     if (!task) {
       return {
         found: false,
         evidence: { source: 'getTask', returned: 'undefined' },
       };
+    }
+    if (input !== undefined) {
+      const parsedInput = parseScheduleInput(input);
+      const existingHash = computeInputHash(canonicalScheduleInput(task));
+      const incomingHash = computeInputHash(canonicalScheduleInput(parsedInput));
+      if (existingHash !== incomingHash) {
+        throw new IdempotencyConflictError({
+          taskId: idempotencyKey,
+          existingInputHash: existingHash,
+          incomingInputHash: incomingHash,
+        });
+      }
     }
     const externalRefs = { taskId: task.id };
     return {

@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -6,37 +7,201 @@
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
-import type { Session, StreamStatus } from '../types.js';
+import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
-import { getTerminalProxyPort } from './terminal-url.js';
+import { basename } from 'node:path';
+import { getTerminalAdvertisedPort } from './terminal-url.js';
+import { getBotBrand } from '../bot-registry.js';
+import { type Brand, chatAppLink, threadAppLink } from '../im/lark/lark-hosts.js';
+import { getSessionUsageWithContext, type SessionTokenUsage } from './cost-calculator.js';
+import { buildContextUsage } from './session-context-usage.js';
+import type { ObserveContext } from '../services/session-observe.js';
+import { readStatuslineSnapshot } from '../services/statusline-snapshot.js';
+import { config } from '../config.js';
+import { readSessionOpenTodos } from '../services/todo-state.js';
+import { getIdentity } from '../im/lark/identity-cache.js';
+import { safeSessionPreviewTarget, type SessionPreviewTarget } from './session-preview.js';
+import {
+  buildSessionMessagePreview,
+  type SessionMessagePreview,
+} from './session-message-preview.js';
+import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
+import { isNativeTopicId } from './native-topic-id.js';
 
-export interface SessionRow {
+export interface SessionRow extends SessionMessagePreview {
+  cliInstanceId?: string;
+  cliInstanceSource?: string;
+  creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
-  status: StreamStatus | 'closed';
+  requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  /** Only populated once the worker has actually observed the runtime (i.e. the
+   *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
+   *  "requested-as-effective" fallback: consumers that need pre-observation
+   *  intent must read requestedLaunch. */
+  effectiveRuntime?: {
+    model: string; reasoningEffort?: string;
+    workerGeneration?: number; observedAt?: string;
+  };
+  /** Concrete distribution identity frozen on the session. Older path-only
+   * sessions expose a basename-derived legacy identity. */
+  runtimeId?: string;
+  runtimeDisplayName?: string;
+  status: StreamStatus | 'closed' | 'dormant';
   adopt: boolean;
   spawnedAt: number;
   lastMessageAt: number;
   closedAt?: number;
   workingDir?: string;
   chatId: string;
+  chatType?: 'group' | 'p2p';
+  chatDisplayName?: string;
   rootMessageId: string;
   threadId?: string;
+  /** Whether the most recent inbound turn was authored by another Bot.
+   *  This is deliberately latest-turn provenance, not durable collaboration
+   *  ancestry: the persisted quote target is overwritten on every inbound
+   *  message. Dashboard labels derived from it must therefore say inferred. */
+  lastInputFromBot?: boolean;
+  /** Conversation unit ('thread' = topic-anchored, 'chat' = plain chat scope).
+   *  Drives the board's locate button: chat-scope sessions have no topic to
+   *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
+   *  Absent on rows from older daemons → callers keep the locate behavior. */
+  scope?: 'thread' | 'chat';
+  /** Explicit whiteboard binding; absent when the session is unbound. */
+  whiteboardId?: Session['whiteboardId'];
+  headless?: Session['headless'];
   title?: string;
+  titleUpdatedAt?: string;
+  /** Informational only; callers must not treat it as authenticated identity. */
+  titleSource?: Session['titleSource'];
+  /** Backend stamped at spawn time. Exposed so external surfaces can filter zmx/tmux/etc. */
+  backendType?: Session['backendType'];
+  /** Persisted backing multiplexer host name, not proof the target is currently live. */
+  backendSessionName?: string;
+  /** 看板视图的手动放置（列 id / 列内排序位置），用户拖拽后持久化在 Session 上。
+   *  未设置时前端按运行状态推导默认列。 */
+  kanbanColumn?: string;
+  kanbanPosition?: number;
+  /** Locked sessions are protected from dashboard idle cleanup. */
+  locked?: boolean;
   ownerOpenId?: string;
   webPort: number | null;
-  /** Owning daemon's reverse-proxy port (0/undefined if the proxy isn't up).
-   *  When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}. */
+  /** Owning daemon's advertised reverse-proxy port — WEB_EXTERNAL_PORT + botIndex
+   *  when configured, else the bound proxy port (0/undefined if the proxy isn't
+   *  up). When set, the terminal is reachable at {host}:{proxyPort}/s/{sessionId}.
+   *  Mirrors the port buildTerminalUrl puts in card links so both agree. */
   proxyPort?: number;
+  /** Internal daemon→dashboard routing data. The central browser projection
+   * removes it and emits only `preview: { path, registeredAt }`. */
+  previewTarget?: SessionPreviewTarget;
   cliVersion?: string;
   hasHistory?: boolean;
   feishuChatLink: string;
+  /** Direct AppLink to the session topic. It exists only when the native
+   *  `omt_...` id is known; the `om_...` routing root is not interchangeable. */
+  feishuThreadLink?: string;
+  /** Repo-selection card is waiting for a click — the CLI has not spawned yet.
+   *  Feeds the board view's needs-you column. */
+  pendingRepo?: boolean;
+  /** Dashboard「创建会话」入待办池：会话已建但 CLI 未起（parked），等激活才开跑。
+   *  前端据此在卡片上显示「待开始 / 开始」入口、并把卡片钉在待办池列。 */
+  queued?: boolean;
+  /** A TUI prompt card is open and waiting for the user's choice.
+   *  Feeds the board view's needs-you column. */
+  tuiPromptActive?: boolean;
+  /** The agent raised a hand (`botmux send --attention`) — it hit a blocker
+   *  needing human intervention. Carries the human-readable reason so the
+   *  board/overview can show *why* at a glance, plus `at` (epoch ms when it
+   *  was raised) so the UI shows a true "waiting since" time — NOT lastMessageAt,
+   *  which a silent raise never bumps. Feeds the needs-you column. */
+  agentAttention?: { kind: string; reason: string; at: number };
+  /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
+   *  与运行态正交——「运行态=空闲 + 有未完成 todo」正是要抓的「机器停了活没干完」。
+   *  仅 Claude / Codex 家族能提取；其它 CLI、无 transcript、从未建 todo 时为 undefined
+   *  （= 未知/不支持，前端不据此判「已交付」）。 */
+  openTodos?: { total: number; done: number; remaining: number; hasInProgress: boolean; items: Array<{ status: string; text: string }> };
+  /** Native Agent CLI token usage for this session. Null means unavailable. */
+  tokenUsage?: SessionTokenUsage | null;
+  /** How full the context is right now (latest request's prompt size, window,
+   *  compactions). Computed together with `tokenUsage` from the same transcript
+   *  read, so it is absent whenever token scans are skipped (bulk lists) or the
+   *  CLI/transcript cannot prove a measurement. Feeds `botmux observe`. */
+  contextUsage?: ObserveContext;
+  /** Worker process PID, active rows only. Used by dashboard resource attribution. */
+  workerPid?: number;
+  /** Persisted row intentionally kept active but detached from daemon routing
+   *  because exact backing teardown could not be proven. It is rendered as
+   *  dormant (never closed) and remains explicitly closeable for a retry. */
+  quarantined?: boolean;
+  /** Adopted external CLI PID, active rows only when the source backend exposed it. */
+  adoptCliPid?: number;
+  /** Riff AIO Sandbox web terminal link. When set, the dashboard "Web终端"
+   *  button opens this URL directly instead of building a local port link. */
+  riffAccessUrl?: string;
+  /** Presentation enrichment stamped by the central dashboard read-model:
+   *  bot avatar URL from the live daemon descriptor.
+   *  Absent on older daemons — consumers must fall back. */
+  botAvatarUrl?: string;
+  /** Repo top-level dir name of workingDir, when it is a git repo. */
+  repoName?: string;
+  /** Current branch of workingDir; absent for detached HEAD / non-repo. */
+  gitBranch?: string;
+  /** Per-turn reply anchors — `botmux send` prefers these over the topic root. */
+  replyTargets?: Record<string, ReplyTargetEntry>;
+  currentReplyTarget?: Session['currentReplyTarget'];
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
 }
 
-export function feishuChatLink(chatId: string): string {
-  return `https://applink.feishu.cn/client/chat/open?openChatId=${encodeURIComponent(chatId)}`;
+function composeSendRoutingFields(
+  s: Session,
+  runtimeCurrentReplyTarget?: Session['currentReplyTarget'],
+): Pick<
+  SessionRow,
+  'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
+> {
+  const currentReplyTarget = runtimeCurrentReplyTarget ?? s.currentReplyTarget;
+  return {
+    ...(s.replyTargets ? { replyTargets: s.replyTargets } : {}),
+    ...(currentReplyTarget ? { currentReplyTarget } : {}),
+    ...(s.quoteTargetId ? { quoteTargetId: s.quoteTargetId } : {}),
+    ...(s.quoteTargetSenderOpenId ? { quoteTargetSenderOpenId: s.quoteTargetSenderOpenId } : {}),
+    ...(s.codexAppDispatchLedger ? { codexAppDispatchLedger: s.codexAppDispatchLedger } : {}),
+  };
+}
+
+export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
+  return chatAppLink(chatId, brand);
+}
+
+function sessionThreadLink(
+  session: Pick<Session, 'chatId' | 'scope' | 'larkThreadId'>,
+  brand: Brand,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return threadAppLink(session.chatId, session.larkThreadId, brand);
+}
+
+// The native Lark topic id is a durable identity fact for thread-scope sessions.
+// Row producers publish it so downstream normalizers (including botmux observe)
+// can surface `identity.threadId` without re-deriving the validation rule.
+function sessionThreadId(
+  session: Pick<Session, 'scope' | 'larkThreadId'>,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return session.larkThreadId;
+}
+
+function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
+  if (session.headless && !session.headless.boundChatId) return '';
+  return session.headless?.boundChatId
+    ? feishuChatLink(session.headless.boundChatId, brand)
+    : feishuChatLink(session.chatId, brand);
 }
 
 let cachedBotName = '';
@@ -57,20 +222,156 @@ export function sessionLastActivityAtMs(s: Session): number {
   return parseSessionTime(s.lastMessageAt) ?? sessionCreatedAtMs(s);
 }
 
-export function composeRowFromActive(ds: DaemonSession): SessionRow {
+interface SessionRowUsage {
+  tokenUsage: SessionTokenUsage | null;
+  contextUsage?: ObserveContext;
+}
+
+/** One transcript read (via the shared stat/incremental cache) feeds both the
+ *  cumulative token totals and the context gauge — never two scans. */
+function readSessionRowUsage(s: Session, workingDir?: string): SessionRowUsage {
+  const cliId = s.cliId ?? 'unknown';
+  const { snapshot, contextObservation } = getSessionUsageWithContext({
+    cliId,
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+    larkAppId: s.larkAppId,
+  });
+  // A Remote Runner transcript lives behind the provider boundary; the
+  // daemon-host resolver would be reading the wrong filesystem.
+  if (s.backendType === 'remote-runner') return { tokenUsage: snapshot.tokens };
+  let statuslineWindowTokens: number | undefined;
+  if (cliId === 'claude-code') {
+    // Claude's transcript only names the model, never its window; the window is
+    // whatever the statusline last reported (undefined once that is stale).
+    try { statuslineWindowTokens = readStatuslineSnapshot(config.session.dataDir, s.sessionId)?.contextWindowTokens; }
+    catch { /* best-effort: the window is optional */ }
+  }
+  const contextUsage = buildContextUsage({ snapshot, contextObservation, statuslineWindowTokens });
+  return { tokenUsage: snapshot.tokens, ...(contextUsage ? { contextUsage } : {}) };
+}
+
+function sessionOpenTodos(s: Session, workingDir?: string, fresh?: boolean): SessionRow['openTodos'] {
+  return readSessionOpenTodos({
+    cliId: s.cliId ?? 'unknown',
+    sessionId: s.sessionId,
+    cliSessionId: s.cliSessionId,
+    cwd: workingDir ?? s.workingDir,
+    larkAppId: s.larkAppId,
+    fresh,
+  }) ?? undefined;
+}
+
+function directChatDisplayName(s: Session, larkAppId?: string): string | undefined {
+  if (s.chatType !== 'p2p') return undefined;
+  const persisted = String(s.chatDisplayName ?? '').trim();
+  if (persisted) return persisted;
+  const appId = larkAppId ?? s.larkAppId;
+  if (!appId) return undefined;
+  for (const openId of [s.ownerOpenId, s.creatorOpenId, s.lastCallerOpenId]) {
+    if (!openId) continue;
+    const name = String(getIdentity(appId, openId)?.name ?? '').trim();
+    if (name) return name;
+  }
+  return undefined;
+}
+
+function backendSessionNameForRow(s: Session): string | undefined {
+  const backendType = s.backendType;
+  if (s.adoptedFrom || !isSuspendableBackendType(backendType)) return undefined;
+  return resolvePersistentBackendTarget(
+    backendType,
+    s.sessionId,
+    s.persistentBackendTarget,
+  ).sessionName;
+}
+
+function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runtimeDisplayName'> {
+  if (s.cliRuntime) {
+    return { runtimeId: s.cliRuntime.id, runtimeDisplayName: s.cliRuntime.displayName };
+  }
+  if (s.cliPathOverride) {
+    const legacyName = basename(s.cliPathOverride.replace(/\\/g, '/'));
+    if (legacyName) return { runtimeId: legacyName, runtimeDisplayName: legacyName };
+  }
+  return {};
+}
+
+export interface DashboardRowOptions {
+  fresh?: boolean;
+  /**
+   * Expensive native transcript/token scan. Dashboard list snapshots can contain
+   * thousands of historical rows, so callers that only need routing/status
+   * metadata should leave this off and use the per-session detail endpoint for
+   * on-demand usage.
+   */
+  includeTokenUsage?: boolean;
+}
+
+function maybeSessionRowUsage(
+  s: Session,
+  workingDir: string | undefined,
+  opts?: DashboardRowOptions,
+  opts2?: { usePersistedSnapshot?: boolean },
+): SessionRowUsage {
+  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return { tokenUsage: s.tokenUsage };
+  return opts?.includeTokenUsage === false ? { tokenUsage: null } : readSessionRowUsage(s, workingDir);
+}
+
+export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
+  const brand = getBotBrand(ds.larkAppId);
+  const topicLink = sessionThreadLink(ds.session, brand);
+  const topicId = sessionThreadId(ds.session);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
-    status: ds.lastScreenStatus ?? 'starting',
+    ...(ds.session.dispatchLaunchSpec ? {
+      requestedLaunch: ds.session.dispatchLaunchSpec.requested,
+      ...(ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
+    cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: ds.session.cliInstanceBinding?.source,
+    creationSource: ds.session.creationSource,
+    ...sessionRuntimeFields(ds.session),
+    // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
+    // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
+    // For every other session, process residency is authoritative: suspension
+    // clears ds.worker but intentionally preserves the logical active session.
+    // Never let a stale pre-suspend status make it look resident after hydrate.
+    // No screen status yet + worker init complete = the CLI is executing its
+    // first turn (screen updates are suppressed until the first idle prompt).
+    // Long first turns — e.g. meeting agents fed a transcript delivery right at
+    // spawn — previously sat in「启动中」for minutes; project them as working.
+    status: ds.session.queued
+      ? 'idle'
+      : (!ds.worker || ds.worker.killed
+          ? 'dormant'
+          : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
     lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
     workingDir: ds.workingDir,
     chatId: ds.chatId,
+    chatType: ds.chatType,
+    chatDisplayName: directChatDisplayName(ds.session, ds.larkAppId),
     rootMessageId: ds.session.rootMessageId,
+    lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
+    scope: ds.session.scope,
+    whiteboardId: ds.session.whiteboardId,
+    headless: ds.session.headless,
     title: ds.session.title,
+    titleUpdatedAt: ds.session.titleUpdatedAt,
+    titleSource: ds.session.titleSource,
+    backendType: ds.session.backendType,
+    backendSessionName: backendSessionNameForRow(ds.session),
+    kanbanColumn: ds.session.kanbanColumn,
+    kanbanPosition: ds.session.kanbanPosition,
+    locked: !!ds.session.locked,
     // Read from the persisted Session — single source of truth.
     // ds.ownerOpenId is a parallel in-memory copy that gets cleared on
     // restoreActiveSessions (which builds a fresh DaemonSession from disk
@@ -78,19 +379,48 @@ export function composeRowFromActive(ds: DaemonSession): SessionRow {
     // both fresh and restored sessions.
     ownerOpenId: ds.session.ownerOpenId,
     webPort: ds.workerPort ?? null,
-    proxyPort: getTerminalProxyPort() || undefined,
+    proxyPort: getTerminalAdvertisedPort() || undefined,
+    previewTarget: safeSessionPreviewTarget(ds.session.previewTarget),
+    riffAccessUrl: ds.riffAccessUrl,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId),
+    feishuChatLink: sessionFeishuChatLink(ds.session, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
+    pendingRepo: !!ds.pendingRepo,
+    queued: !!ds.session.queued,
+    tuiPromptActive: !!ds.tuiPromptCardId,
+    agentAttention: ds.agentAttention
+      ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+      : undefined,
+    ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
+    openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
+    ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+    ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
+    ...buildSessionMessagePreview(ds.session),
+    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
   };
 }
 
-export function composeRowFromClosed(s: Session): SessionRow {
+export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
+  const brand = getBotBrand(s.larkAppId ?? '');
+  const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
+    ...sessionRuntimeFields(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(s),
@@ -98,10 +428,91 @@ export function composeRowFromClosed(s: Session): SessionRow {
     closedAt: s.closedAt ? Date.parse(s.closedAt) : undefined,
     workingDir: s.workingDir,
     chatId: s.chatId,
+    chatType: s.chatType,
+    chatDisplayName: directChatDisplayName(s, s.larkAppId),
     rootMessageId: s.rootMessageId,
+    lastInputFromBot: s.quoteTargetSenderIsBot === true,
+    scope: s.scope,
+    whiteboardId: s.whiteboardId,
+    headless: s.headless,
     title: s.title,
+    titleUpdatedAt: s.titleUpdatedAt,
+    titleSource: s.titleSource,
+    backendType: s.backendType,
+    backendSessionName: backendSessionNameForRow(s),
+    kanbanColumn: s.kanbanColumn,
+    kanbanPosition: s.kanbanPosition,
+    locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
-    feishuChatLink: feishuChatLink(s.chatId),
+    previewTarget: safeSessionPreviewTarget(s.previewTarget),
+    feishuChatLink: sessionFeishuChatLink(s, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
+    ...maybeSessionRowUsage(s, undefined, opts, { usePersistedSnapshot: true }),
+    ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
+  };
+}
+
+/**
+ * Project a persisted active row that currently has no DaemonSession runtime.
+ *
+ * This is deliberately not composeRowFromClosed(): `status='active'` remains
+ * the ownership truth when a persistent-backend kill was inconclusive. The
+ * dashboard presents it as dormant, with no terminal port, so operators can
+ * see and explicitly retry closing it without an unsafe resume affordance.
+ */
+export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
+  const brand = getBotBrand(s.larkAppId ?? '');
+  const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
+  return {
+    sessionId: s.sessionId,
+    larkAppId: s.larkAppId ?? '',
+    botName: cachedBotName,
+    cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
+    ...sessionRuntimeFields(s),
+    status: s.queued ? 'idle' : 'dormant',
+    adopt: !!s.adoptedFrom,
+    spawnedAt: sessionCreatedAtMs(s),
+    lastMessageAt: sessionLastActivityAtMs(s),
+    workingDir: s.workingDir,
+    chatId: s.chatId,
+    chatType: s.chatType,
+    chatDisplayName: directChatDisplayName(s, s.larkAppId),
+    rootMessageId: s.rootMessageId,
+    lastInputFromBot: s.quoteTargetSenderIsBot === true,
+    scope: s.scope,
+    whiteboardId: s.whiteboardId,
+    headless: s.headless,
+    title: s.title,
+    titleUpdatedAt: s.titleUpdatedAt,
+    titleSource: s.titleSource,
+    backendType: s.backendType,
+    backendSessionName: backendSessionNameForRow(s),
+    kanbanColumn: s.kanbanColumn,
+    kanbanPosition: s.kanbanPosition,
+    locked: !!s.locked,
+    ownerOpenId: s.ownerOpenId,
+    webPort: null,
+    feishuChatLink: sessionFeishuChatLink(s, brand),
+    ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
+    queued: !!s.queued,
+    hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
+    quarantined: !!s.restoreQuarantinedAt,
+    ...maybeSessionRowUsage(s, undefined, opts),
+    ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }

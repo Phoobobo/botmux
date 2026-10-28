@@ -14,14 +14,24 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+const archiveRpc = vi.hoisted(() => vi.fn());
+vi.mock('../src/services/codex-app-threads.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/services/codex-app-threads.js')>(),
+  setCodexAppThreadArchived: archiveRpc,
+}));
 let tempDir: string;
+const daemonConfig = vi.hoisted(() => ({ backendType: 'pty' as 'pty' | 'tmux' }));
 
 vi.mock('../src/config.js', () => ({
   config: {
     session: {
       get dataDir() { return tempDir; },
     },
-    daemon: { backendType: 'pty', workingDir: '~', workingDirs: ['~'] },
+    daemon: {
+      get backendType() { return daemonConfig.backendType; },
+      workingDir: '~',
+      workingDirs: ['~'],
+    },
   },
 }));
 
@@ -44,22 +54,60 @@ const wp = vi.hoisted(() => ({ registry: null as Map<string, any> | null }));
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: vi.fn(),
   forkAdoptWorker: vi.fn(),
+  adoptSandboxBlocked: vi.fn((botCfg: any, session?: any) =>
+    botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   killStalePids: vi.fn(),
+  sweepDeadPidMarkers: vi.fn(),
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
-  // Faithful: mirror the real setActiveSessionSafe — if a DIFFERENT entry
-  // already holds the key, evict it (close) before setting, instead of a
-  // bare overwrite that would mask a lingering occupant.
+  ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  ensureReadonlyTaskContinuationAttached: vi.fn(),
+  // Default: promotion succeeds. A specific test overrides this to false to
+  // exercise the restore-time transient-failure quarantine path.
+  promoteQueuedActivationTail: vi.fn(() => true),
+  withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
+  // Faithful compare-and-set registration: a newer/different occupant wins.
+  // Mirrors the real setActiveSessionSafe — a DIFFERENT entry already holding
+  // the key blocks the set, instead of a bare overwrite that would mask a
+  // lingering occupant. Returns the production SetActiveSessionResult shape
+  // ({ accepted: true } | { accepted: false }).
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
-    if (prev && prev !== ds) {
-      for (const [k, v] of map) { if (v === prev) { map.delete(k); break; } }
-    }
+    if (prev && prev !== ds) return { accepted: false, reason: 'collision', keptSessionId: prev?.session?.sessionId };
     map.set(key, ds);
+    return { accepted: true };
+  }),
+  // Faithful SYNCHRONOUS compare-and-set (mirrors production setActiveSessionIfActive):
+  // resumeSession / executeScheduledTask call this INSIDE withActiveSessionKeyLock,
+  // so it must not re-lock. Contract: (1) an inactive incoming row drops its own
+  // stale entry and returns false; (2) a DIFFERENT live occupant at the key wins
+  // (return false, first-wins); (3) otherwise set + return true. Quarantine-reserve
+  // conflicts are exercised via the setActiveSessionSafe restore path in these
+  // tests, not here, so the map-level CAS is sufficient (parity with the
+  // setActiveSessionSafe mock above, which likewise omits the quarantine branch).
+  setActiveSessionIfActive: vi.fn((map: Map<string, any>, key: string, ds: any) => {
+    if (ds?.session?.status !== 'active') {
+      if (map.get(key) === ds) map.delete(key);
+      return false;
+    }
+    const current = map.get(key);
+    if (current && current !== ds) return false;
+    map.set(key, ds);
+    return true;
   }),
   // Real predicate (same logic as production): worker OR persisted CLI markers.
   isRelayableRealSession: (ds: any) =>
     !!ds?.worker || !!ds?.session?.cliId || !!ds?.session?.lastCliInput,
+  isDisposableCommandScratch: (ds: any) =>
+    !ds?.worker
+    && !ds?.pendingRepo
+    && ds?.pendingPrompt === undefined
+    && ds?.pendingRawInput === undefined
+    && !ds?.adoptedFrom
+    && !ds?.session?.adoptedFrom
+    && !ds?.session?.queued
+    && !ds?.session?.cliId
+    && !ds?.session?.lastCliInput,
   // Faithful closeSession: actually evict the entry from the live Map (by
   // sessionId, as the real one does via activeSessionsRegistry) AND mark the
   // persisted row closed — so tests verify the eviction MECHANISM, not just
@@ -74,13 +122,32 @@ vi.mock('../src/core/worker-pool.js', () => ({
     const store = await import('../src/services/session-store.js');
     const s = store.getSession(sid);
     if (s && s.status !== 'closed') store.closeSession(sid);
-    return { ok: true, alreadyClosed: false };
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
+  }),
+  closeSessionForBackgroundCleanup: vi.fn(async (sid: string) => {
+    const reg = wp.registry;
+    if (reg) {
+      for (const [k, v] of reg) {
+        if (v?.session?.sessionId === sid) { reg.delete(k); break; }
+      }
+    }
+    const store = await import('../src/services/session-store.js');
+    const s = store.getSession(sid);
+    if (s && s.status !== 'closed') store.closeSession(sid);
+    return { ok: true, outcome: 'closed', alreadyClosed: false };
   }),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', cliId: 'claude-code', workingDir: '~', workingDirs: ['~'] },
+    config: {
+      larkAppId: 'app_test',
+      cliId: 'claude-code',
+      workingDir: '~',
+      workingDirs: ['~'],
+      remoteRunner: { requiredCapabilities: ['turn_recovery'] },
+      get backendType() { return daemonConfig.backendType === 'tmux' ? 'tmux' : undefined; },
+    },
     botName: 'TestBot',
     botOpenId: 'ou_test',
     resolvedAllowedUsers: [],
@@ -107,28 +174,61 @@ vi.mock('../src/adapters/cli/registry.js', () => ({
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
-  TmuxBackend: { sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`), hasSession: vi.fn(() => false) },
+  TmuxBackend: {
+    sessionName: vi.fn((id: string) => `bmx-${id.slice(0, 8)}`),
+    hasSession: vi.fn(() => false),
+    probeSession: vi.fn(() => 'missing'),
+  },
 }));
 
 vi.mock('../src/core/session-discovery.js', () => ({
   validateAdoptTarget: vi.fn(() => true),
+  validateAdoptTargetState: vi.fn(() => 'alive'),
+  adoptTargetLabel: vi.fn(() => 'test-pane'),
 }));
 
 vi.mock('../src/core/session-activity.js', () => ({
+  announceSessionRow: vi.fn(),
   markSessionActivity: vi.fn(),
 }));
 
-import { restoreActiveSessions, resumeSession } from '../src/core/session-manager.js';
-import { restoreUsageLimitRuntimeState, closeSession } from '../src/core/worker-pool.js';
+import {
+  restoreActiveSessions,
+  resumeSession,
+  takeOverDurableActiveRemoteSession,
+} from '../src/core/session-manager.js';
+import {
+  closeSession,
+  closeSessionForBackgroundCleanup,
+  ensureOrdinaryTurnRecoveryAttached,
+  forkWorker,
+  forkAdoptWorker,
+  killStalePids,
+  promoteQueuedActivationTail,
+  restoreUsageLimitRuntimeState,
+  setActiveSessionSafe,
+  setActiveSessionIfActive,
+  withActiveSessionKeyLock,
+} from '../src/core/worker-pool.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { writeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-resume-test-'));
-  sessionStore.init();
+  archiveRpc.mockReset();
+  archiveRpc.mockResolvedValue(undefined);
+  daemonConfig.backendType = 'pty';
+  sessionStore.init('app_test');
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(closeSessionForBackgroundCleanup).mockClear();
+  vi.mocked(forkWorker).mockReset();
+  vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
+  vi.mocked(promoteQueuedActivationTail).mockReset();
+  vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -136,7 +236,7 @@ afterEach(() => {
 });
 
 function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.createSession>[0]> & {
-  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any;
+  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any; backendType?: any;
 } = {}): ReturnType<typeof sessionStore.createSession> {
   const s = sessionStore.createSession(
     overrides.chatId ?? 'oc_chat1',
@@ -147,13 +247,137 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
   s.larkAppId = overrides.larkAppId ?? 'app_test';
   s.workingDir = overrides.workingDir ?? '/tmp/proj';
   s.cliId = overrides.cliId ?? 'claude-code';
+  s.backendType = overrides.backendType;
   s.scope = overrides.scope ?? 'thread';
   sessionStore.updateSession(s);
   sessionStore.closeSession(s.sessionId);
   return s;
 }
 
+function activeRemoteCanonical(overrides: Record<string, unknown> = {}) {
+  return {
+    sessionId: 'session-remote-takeover',
+    chatId: 'oc_remote',
+    chatType: 'group' as const,
+    rootMessageId: 'om_remote_root',
+    title: 'Remote takeover',
+    status: 'active' as const,
+    scope: 'thread' as const,
+    createdAt: '2026-10-16T00:00:00.000Z',
+    lastMessageAt: '2026-10-16T00:01:00.000Z',
+    larkAppId: 'app_test',
+    cliId: 'remote-runner' as const,
+    backendType: 'remote-runner' as const,
+    pid: 777,
+    webPort: 6789,
+    workerGeneration: 4,
+    remoteBackendState: {
+      version: 1 as const,
+      provider: 'takeover-provider',
+      generation: 7,
+      remoteSessionId: 'remote-session-7',
+      agentThreadId: 'remote-thread',
+    },
+    ...overrides,
+  };
+}
+
+describe('takeOverDurableActiveRemoteSession', () => {
+  it('materializes only the claimed canonical snapshot and reattaches before routing', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+      expect(prompt).toBe('');
+      expect(resume).toEqual({ resume: true, remoteResumeMode: 'reattach' });
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await takeOverDurableActiveRemoteSession(canonical, map);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.ds.session).toMatchObject({
+        sessionId: canonical.sessionId,
+        status: 'active',
+        workerGeneration: 4,
+        remoteBackendState: { generation: 7, remoteSessionId: 'remote-session-7' },
+      });
+      expect(result.ds.session.pid).toBeUndefined();
+      expect(result.ds.session.webPort).toBeUndefined();
+      expect(result.ds.suppressRecoveryCard).toBe(true);
+    }
+    expect(forkWorker).toHaveBeenCalledOnce();
+    expect(map.get(sessionKey('om_remote_root', 'app_test'))?.session.sessionId)
+      .toBe(canonical.sessionId);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.status).toBe('active');
+  });
+
+  it('rejects non-remote or incomplete canonical state before materialization', async () => {
+    await expect(takeOverDurableActiveRemoteSession(
+      activeRemoteCanonical({ remoteBackendState: undefined }),
+      new Map(),
+    )).resolves.toMatchObject({ ok: false, error: 'unsupported_session' });
+    expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('fails closed and unregisters when no takeover worker is admitted', async () => {
+    const canonical = activeRemoteCanonical();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      map,
+    )).resolves.toMatchObject({ ok: false, error: 'worker_start_failed' });
+    expect(map.size).toBe(0);
+    expect(sessionStore.getOwnedSession(canonical.sessionId)).toMatchObject({
+      status: 'active',
+      restoreQuarantinedAt: expect.any(String),
+    });
+  });
+
+  it('does not overwrite an unregistered active local row', async () => {
+    const canonical = activeRemoteCanonical();
+    sessionStore.updateSession({
+      ...canonical,
+      pid: 123,
+      remoteBackendState: {
+        ...canonical.remoteBackendState,
+        remoteSessionId: 'possibly-live-local-remote',
+      },
+    });
+    await expect(takeOverDurableActiveRemoteSession(
+      canonical,
+      new Map(),
+    )).resolves.toMatchObject({
+      ok: false,
+      error: 'materialization_failed',
+      detail: expect.stringContaining('unregistered active local Session'),
+    });
+    expect(forkWorker).not.toHaveBeenCalled();
+    expect(sessionStore.getOwnedSession(canonical.sessionId)?.pid).toBe(123);
+  });
+});
+
 describe('resumeSession', () => {
+  it('rechecks retirement after waiting for the active-session lock', async () => {
+    const closed = makeClosedSession();
+    const map = new Map<string, DaemonSession>();
+    vi.mocked(withActiveSessionKeyLock).mockImplementationOnce(async (_map, _key, action) => {
+      sessionStore.closeSession(closed.sessionId, {
+        workspaceRetirement: { operationId: 'recycle-lock', workspacePath: '/removed', retiredAt: new Date().toISOString() },
+      });
+      return action();
+    });
+    expect(await resumeSession(closed.sessionId, map)).toEqual({ ok: false, error: 'workspace_retired' });
+    expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    expect(map.size).toBe(0);
+  });
   describe('error branches', () => {
     it('returns not_found for an unknown session id', async () => {
       const r = await resumeSession('no-such-id', new Map());
@@ -184,6 +408,246 @@ describe('resumeSession', () => {
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it('returns adopt_unsupported for a disconnected existing App Server adopt', async () => {
+      const s = sessionStore.createSession('oc_chat', 'om_root', 'Codex App: shared thread');
+      s.cliId = 'codex';
+      s.cliSessionId = '019e-existing-app-server-thread';
+      s.existingAppServerEndpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
+      sessionStore.updateSession(s);
+      sessionStore.closeSession(s.sessionId);
+
+      const r = await resumeSession(s.sessionId, new Map());
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it.each([
+      ['remote CLI id', { cliId: 'remote-runner' }],
+      ['remote backend stamp', { cliId: 'codex', backendType: 'remote-runner' }],
+    ])('starts provider recovery immediately for a closed %s', async (_name, identity) => {
+      const closed = makeClosedSession(identity);
+      const map = new Map<string, DaemonSession>();
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        expect(prompt).toBe('');
+        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.recoveryPending).toBe(true);
+        expect(result.ds.suppressRecoveryCard).toBe(true);
+      }
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('rolls a remote resume back to closed when no provider process is admitted', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_start_failed',
+      });
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+    });
+
+    it('returns an admitted remote resume to closed when the worker exits before ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onPreReadyExit: (() => void) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onPreReadyExit = opts?.onPreReadyExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onPreReadyExit).toBeTypeOf('function');
+      onPreReadyExit?.();
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('returns an admitted remote resume to closed when the backend exits after worker ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onRemoteBackendStartupExit: (() => boolean | Promise<boolean>) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onRemoteBackendStartupExit).toBeTypeOf('function');
+      await expect(onRemoteBackendStartupExit?.()).resolves.toBe(true);
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('authoritatively closes an advanced replacement generation that exits before canonical commit', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        remoteBackendState: {
+          version: 1,
+          provider: 'test-runner',
+          generation: 2,
+          remoteSessionId: 'compute-old',
+        },
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      let onRemoteBackendStartupExit: (() => boolean | Promise<boolean>) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'test-runner',
+          generation: 3,
+          remoteSessionId: 'compute-new',
+        };
+        sessionStore.updateSession(ds.session);
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      await expect(onRemoteBackendStartupExit?.()).resolves.toBe(true);
+
+      expect(closeSessionForBackgroundCleanup).toHaveBeenCalledWith(
+        closed.sessionId,
+        'remote resume provider-exit rollback',
+      );
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+    });
+
+    it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'replacement',
+        };
+        sessionStore.updateSession(ds.session);
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_reconciliation_required',
+      });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
+    });
+
+    it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {
+      // Under Plan B a meeting agent is an ordinary chat-scope session, so a
+      // closed one is resumable like any chat session — the vc_receiver_managed
+      // refusal is gone. Here the chat anchor is already held by a live ordinary
+      // chat, so the resume correctly falls through to the ordinary
+      // anchor-occupancy guard instead of a VC-specific refusal.
+      const receiver = makeClosedSession({
+        chatId: 'oc_listener',
+        rootMessageId: 'oc_listener',
+        scope: 'chat',
+      });
+      receiver.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-42',
+        memberId: 'member-agent',
+        memberEpoch: 7,
+      };
+      sessionStore.updateSession(receiver);
+      sessionStore.closeSession(receiver.sessionId);
+      const map = new Map<string, DaemonSession>();
+      const ordinaryChatKey = sessionKey('oc_listener', 'app_test');
+      const ordinaryChat = {
+        session: { sessionId: 'ordinary-chat-session', cliId: 'claude-code' },
+        worker: {},
+        chatId: 'oc_listener',
+        scope: 'chat',
+        larkAppId: 'app_test',
+      } as unknown as DaemonSession;
+      map.set(ordinaryChatKey, ordinaryChat);
+      wp.registry = map;
+
+      const r = await resumeSession(receiver.sessionId, map);
+
+      // No VC-specific refusal — the ordinary anchor-occupancy guard wins because
+      // a live chat session already owns this chat's slot.
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toBe('anchor_occupied');
+      expect(sessionStore.getSession(receiver.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(1);
+      expect(map.get(ordinaryChatKey)).toBe(ordinaryChat);
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('keeps an unmaterialized auto-closed schedule run audit-only', async () => {
+      const hidden = makeClosedSession({
+        rootMessageId: 'schedule-run:task-1:run-1',
+        scope: 'chat',
+      });
+      hidden.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-1',
+        routingAnchor: 'schedule-run:task-1:run-1',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(hidden);
+      sessionStore.closeSession(hidden.sessionId);
+
+      expect(await resumeSession(hidden.sessionId, new Map())).toEqual({
+        ok: false,
+        error: 'deferred_unmaterialized',
+      });
+      expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('closed');
     });
 
     it('returns anchor_occupied when a REAL in-memory session owns the anchor', async () => {
@@ -240,6 +704,21 @@ describe('resumeSession', () => {
       expect(r.ok).toBe(true);
     });
 
+    it('rotates the terminal card epoch when a closed session is resumed', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_terminal_epoch' });
+      closed.terminalCardEpoch = 'previous-lifecycle';
+      sessionStore.updateSession(closed);
+
+      const r = await resumeSession(closed.sessionId, new Map());
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.ds.session.terminalCardEpoch).toBeTruthy();
+        expect(r.ds.session.terminalCardEpoch).not.toBe('previous-lifecycle');
+        expect(sessionStore.getSession(closed.sessionId)?.terminalCardEpoch)
+          .toBe(r.ds.session.terminalCardEpoch);
+      }
+    });
+
     // ── Scratch carve-out (王皓's resume-after-/relay bug) ────────────────────
 
     it('does NOT block on an in-memory daemon-command scratch — evicts it and resumes', async () => {
@@ -289,6 +768,39 @@ describe('resumeSession', () => {
       }
     });
 
+    it.each(['queued', 'dormant-real', 'deferred-prompt'] as const)(
+      'blocks on a worker-less %s occupant instead of treating it as scratch',
+      async (kind) => {
+        const chatId = `oc_${kind}`;
+        const closed = makeClosedSession({ chatId, scope: 'chat' });
+        const map = new Map<string, DaemonSession>();
+        const occupant: any = {
+          session: {
+            sessionId: `occupant-${kind}`,
+            cliId: kind === 'dormant-real' ? 'claude-code' : undefined,
+            lastCliInput: undefined,
+            queued: kind === 'queued',
+          },
+          worker: null,
+          pendingRepo: false,
+          pendingPrompt: kind === 'deferred-prompt' ? '' : undefined,
+          chatId,
+          scope: 'chat',
+          larkAppId: 'app_test',
+        };
+        map.set(sessionKey(chatId, 'app_test'), occupant);
+
+        const r = await resumeSession(closed.sessionId, map);
+        expect(r).toEqual({
+          ok: false,
+          error: 'anchor_occupied',
+          activeSessionId: `occupant-${kind}`,
+        });
+        expect(closeSession).not.toHaveBeenCalled();
+        expect(map.get(sessionKey(chatId, 'app_test'))).toBe(occupant);
+      },
+    );
+
     it('does NOT block on a persisted scratch sibling (no cliId / lastCliInput) — closes it and resumes', async () => {
       const closed = makeClosedSession({ rootMessageId: 'om_scratch_thread' });
       // Store-only scratch sibling: active, same anchor, but never ran a CLI.
@@ -304,9 +816,457 @@ describe('resumeSession', () => {
       // Scratch store row should now be closed.
       expect(sessionStore.getSession(scratch.sessionId)!.status).toBe('closed');
     });
+
+    it('keeps a fresh first owner that appears while resume awaits scratch cleanup', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_resume_race' });
+      const scratch = sessionStore.createSession('oc_chat1', 'om_resume_race', '/relay');
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined as any;
+      scratch.lastCliInput = undefined as any;
+      sessionStore.updateSession(scratch);
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      let releaseCleanup!: () => void;
+      let cleanupStarted!: () => void;
+      const paused = new Promise<void>(resolve => { releaseCleanup = resolve; });
+      const started = new Promise<void>(resolve => { cleanupStarted = resolve; });
+      vi.mocked(closeSession).mockImplementationOnce(async (sid: string) => {
+        cleanupStarted();
+        await paused;
+        sessionStore.closeSession(sid);
+        return { ok: true, outcome: 'closed', alreadyClosed: false } as any;
+      });
+
+      const resuming = resumeSession(closed.sessionId, map);
+      await started;
+      const key = sessionKey('om_resume_race', 'app_test');
+      const fresh = {
+        session: { sessionId: 'fresh-first-owner', status: 'active', queued: false },
+        worker: null,
+        initialStartPending: true,
+        larkAppId: 'app_test',
+        chatId: 'oc_chat1',
+        scope: 'thread',
+      } as any;
+      map.set(key, fresh);
+      releaseCleanup();
+
+      const result = await resuming;
+      expect(result).toEqual({
+        ok: false,
+        error: 'anchor_occupied',
+        activeSessionId: 'fresh-first-owner',
+      });
+      expect(map.get(key)).toBe(fresh);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    });
   });
 
   describe('success path', () => {
+    it('closes an unmaterialized hidden schedule run during daemon restore', async () => {
+      const hidden = sessionStore.createSession(
+        'oc_target',
+        'schedule-run:task-1:run-1',
+        'hidden schedule',
+        'group',
+      );
+      hidden.larkAppId = 'app_test';
+      hidden.scope = 'chat';
+      hidden.cliId = 'claude-code';
+      hidden.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-1',
+        routingAnchor: 'schedule-run:task-1:run-1',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(hidden);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      expect(map.size).toBe(0);
+      expect(sessionStore.getSession(hidden.sessionId)?.status).toBe('closed');
+    });
+
+    it('restores a materialized lazy topic at its isolated virtual anchor', async () => {
+      const materialized = sessionStore.createSession(
+        'oc_target',
+        'schedule-run:task-1:run-2',
+        'published schedule',
+        'group',
+      );
+      materialized.larkAppId = 'app_test';
+      materialized.scope = 'chat';
+      materialized.cliId = 'claude-code';
+      materialized.deferredScheduleRun = {
+        taskId: 'task-1',
+        turnId: 'schedule:task-1:run-2',
+        routingAnchor: 'schedule-run:task-1:run-2',
+        createdAt: '2026-07-21T00:00:00.000Z',
+      };
+      sessionStore.updateSession(materialized);
+      writeDeferredTopicBinding(tempDir, {
+        sessionId: materialized.sessionId,
+        turnId: materialized.deferredScheduleRun.turnId,
+        chatId: 'oc_target',
+        larkAppId: 'app_test',
+        routingAnchor: materialized.deferredScheduleRun.routingAnchor,
+        rootMessageId: 'om_materialized_root',
+        createdAt: '2026-07-21T00:01:00.000Z',
+      });
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('schedule-run:task-1:run-2', 'app_test'));
+      expect(restored?.session.sessionId).toBe(materialized.sessionId);
+      expect(restored?.session.rootMessageId).toBe('om_materialized_root');
+      expect(restored?.session.replyThreadAliases?.om_materialized_root).toBeDefined();
+    });
+
+    it('re-attaches persisted ordinary-turn recovery only after the winning owner is restored', async () => {
+      const recovering = sessionStore.createSession(
+        'oc_recovery',
+        'om_recovery',
+        'recovering turn',
+        'group',
+      );
+      recovering.larkAppId = 'app_test';
+      recovering.scope = 'thread';
+      recovering.cliId = 'claude-code';
+      recovering.workingDir = '/tmp/proj';
+      recovering.ordinaryTurnRecovery = {
+        logicalTurnId: 'om_original',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        status: 'backoff',
+        nextAttemptAt: Date.now() + 2_000,
+        lastErrorCode: 'provider_unexpected_eof',
+      };
+      sessionStore.updateSession(recovering);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_recovery', 'app_test'));
+      expect(restored?.session.sessionId).toBe(recovering.sessionId);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledTimes(1);
+      expect(ensureOrdinaryTurnRecoveryAttached).toHaveBeenCalledWith(restored);
+    });
+
+    it.each([
+      ['pending repo setup', (session: any) => {
+        session.queued = true;
+        session.queuedPrompt = 'abandoned picker prompt';
+        session.pendingRepoSetup = { mode: 'picker', prompt: 'abandoned picker prompt', repoCardMessageId: 'om_old_picker' };
+      }],
+      ['tokened activation head', (session: any) => {
+        session.queuedActivationPending = true;
+        session.queuedActivationToken = 'abandoned-token';
+        session.queuedActivationInput = { content: 'abandoned head' };
+        session.queuedActivationTurnId = 'abandoned-turn';
+        session.queuedActivationDispatchAttempt = 3;
+      }],
+      ['activation tail', (session: any) => {
+        session.queuedActivationTail = [{
+          id: 'abandoned-tail', order: 1, userPrompt: 'tail', cliInput: { content: 'abandoned tail' }, turnId: 'tail-turn',
+        }];
+        session.queuedActivationTailNextOrder = 2;
+      }],
+      ['principal lane FIFO', (session: any) => {
+        session.principalLaneQueuedTurns = [{
+          version: 1,
+          turnId: 'abandoned-lane-turn',
+          caller: { requestUserOpenId: 'ou_b', senderType: 'user' },
+          userPrompt: 'abandoned lane turn',
+          title: 'abandoned lane turn',
+          cliInput: { content: 'abandoned lane turn' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          resume: true,
+          dispatchState: 'attempting',
+        }];
+      }],
+    ] as const)('never revives legacy %s when a closed row is resumed', async (_label, injectLegacyState) => {
+      const closed = makeClosedSession({ rootMessageId: `om_legacy_${_label.replaceAll(' ', '_')}` });
+      injectLegacyState(closed);
+      // Simulate a row written by an older release: closed status plus queued
+      // ownership that the historical close path did not remove.
+      sessionStore.updateSession(closed);
+      const map = new Map<string, DaemonSession>();
+
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const persisted = sessionStore.getSession(closed.sessionId)!;
+      expect(persisted.status).toBe('active');
+      expect(persisted.queued).toBeUndefined();
+      expect(persisted.queuedPrompt).toBeUndefined();
+      expect(persisted.pendingRepoSetup).toBeUndefined();
+      expect(persisted.queuedActivationPending).toBeUndefined();
+      expect(persisted.queuedActivationToken).toBeUndefined();
+      expect(persisted.queuedActivationInput).toBeUndefined();
+      expect(persisted.queuedActivationTail).toBeUndefined();
+      expect(persisted.queuedActivationTailNextOrder).toBeUndefined();
+      expect(persisted.principalLaneQueuedTurns).toBeUndefined();
+      expect(result.ds.principalLaneRunningTurn).toBeUndefined();
+      expect(result.ds.initialStartPending).toBeFalsy();
+      expect(result.ds.pendingRepo).toBeFalsy();
+    });
+
+    it('Plan B: collapses legacy dedicated VC receiver rows into the ordinary chat slot on restore', async () => {
+      const make = (title: string, receiver?: { meetingId: string; memberId: string }) => {
+        const s = sessionStore.createSession('oc_listener', 'oc_listener', title, 'group');
+        s.larkAppId = 'app_test';
+        s.scope = 'chat';
+        s.cliId = 'claude-code';
+        s.workingDir = '/tmp/proj';
+        if (receiver) {
+          s.vcMeetingReceiver = {
+            listenerAppId: 'listener_app',
+            meetingId: receiver.meetingId,
+            memberId: receiver.memberId,
+            memberEpoch: 1,
+          };
+        }
+        sessionStore.updateSession(s);
+        return s;
+      };
+      // A plain IM session and two legacy dedicated-receiver rows, all for the
+      // same listener chat. Under the old model these lived at three distinct
+      // `vc-receiver:` keys; under Plan B a meeting agent is an ordinary
+      // chat-scope session, so all three resolve to the SAME (chatId, appId)
+      // slot. The restore CAS keeps the first-priority winner and closes the
+      // duplicate losers — the authoritative meeting lifecycle later re-ensures a
+      // fresh binding at that same ordinary slot.
+      const ordinary = make('ordinary chat');
+      const meetingA = make('meeting A', { meetingId: 'meeting-a', memberId: 'member-a' });
+      const meetingB = make('meeting B', { meetingId: 'meeting-b', memberId: 'member-b' });
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      // Exactly one active-map entry, at the ordinary chat key — no `vc-receiver:`
+      // isolated keys survive.
+      expect(map.size).toBe(1);
+      const winner = map.get(sessionKey('oc_listener', 'app_test'));
+      expect(winner).toBeDefined();
+      expect([...map.keys()].some(k => k.includes('vc-receiver:'))).toBe(false);
+      // The first same-priority row (the plain IM session) wins; the two
+      // duplicate meeting rows are closed as collision losers.
+      expect(winner?.session.sessionId).toBe(ordinary.sessionId);
+      expect(sessionStore.getSession(meetingA.sessionId)?.status).toBe('closed');
+      expect(sessionStore.getSession(meetingB.sessionId)?.status).toBe('closed');
+    });
+
+    it('Plan B: a lone legacy meeting row restores at the ordinary chat key with its marker intact', async () => {
+      // Migration compat: a legacy dedicated-receiver row with no competing chat
+      // session at its listener chat must restore cleanly into the ordinary
+      // (chatId, appId) slot (no vc-receiver: key), keeping vcMeetingReceiver as
+      // delivery metadata so the meeting lifecycle + ledger still resolve it by
+      // sessionId. No hard hash migration is needed — the sessionId is stable
+      // across the key change.
+      const s = sessionStore.createSession('oc_solo_listener', 'oc_solo_listener', 'meeting solo', 'group');
+      s.larkAppId = 'app_test';
+      s.scope = 'chat';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/proj';
+      s.vcMeetingReceiver = {
+        listenerAppId: 'listener_app',
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      };
+      sessionStore.updateSession(s);
+      const map = new Map<string, DaemonSession>();
+
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('oc_solo_listener', 'app_test'));
+      expect(restored?.session.sessionId).toBe(s.sessionId);
+      expect([...map.keys()].some(k => k.includes('vc-receiver:'))).toBe(false);
+      // Marker retained as delivery metadata (not stripped) so meeting delivery
+      // still targets this exact session by id.
+      expect(restored?.session.vcMeetingReceiver).toMatchObject({
+        meetingId: 'meeting-solo',
+        memberId: 'member-solo',
+        memberEpoch: 3,
+      });
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+    });
+
+    it('keeps the row closed when a concurrent close cancels resume registration', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_cancel_resume' });
+      // resumeSession registers via the synchronous setActiveSessionIfActive
+      // (it is already inside withActiveSessionKeyLock). Simulate a concurrent
+      // close winning the race: the row flips back to closed and the CAS
+      // refuses to register the now-inactive incoming row.
+      vi.mocked(setActiveSessionIfActive).mockImplementationOnce((_map, _key, ds) => {
+        sessionStore.closeSession(ds.session.sessionId);
+        return false;
+      });
+
+      const r = await resumeSession(closed.sessionId, new Map());
+      expect(r).toEqual({ ok: false, error: 'resume_cancelled' });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+    });
+
+    it('restores a real session ahead of an older same-anchor command scratch', async () => {
+      const scratch = sessionStore.createSession('oc_collision', 'om_collision', '/help');
+      scratch.larkAppId = 'app_test';
+      scratch.scope = 'thread';
+      scratch.cliId = undefined;
+      scratch.lastCliInput = undefined;
+      sessionStore.updateSession(scratch);
+
+      const real = sessionStore.createSession('oc_collision', 'om_collision', 'real work');
+      real.larkAppId = 'app_test';
+      real.scope = 'thread';
+      real.cliId = 'claude-code';
+      real.lastCliInput = 'continue';
+      sessionStore.updateSession(real);
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_collision', 'app_test'))?.session.sessionId).toBe(real.sessionId);
+      expect(sessionStore.getSession(scratch.sessionId)?.status).toBe('closed');
+      expect(sessionStore.getSession(real.sessionId)?.status).toBe('active');
+    });
+
+    it('never lets startup restore overwrite a fresh runtime occupant', async () => {
+      const persisted = sessionStore.createSession('oc_runtime', 'om_runtime', 'persisted work');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      sessionStore.updateSession(persisted);
+
+      const fresh: any = {
+        session: { sessionId: 'fresh-runtime', status: 'active', cliId: 'claude-code' },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: 'oc_runtime',
+        scope: 'thread',
+      };
+      const map = new Map<string, DaemonSession>([
+        [sessionKey('om_runtime', 'app_test'), fresh],
+      ]);
+      wp.registry = map;
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_runtime', 'app_test'))).toBe(fresh);
+      expect(sessionStore.getSession(persisted.sessionId)?.status).toBe('closed');
+    });
+
+    it('preserves a different live object for the same session id before stale-PID cleanup', async () => {
+      const persisted = sessionStore.createSession('oc_runtime_same', 'om_runtime_same', 'persisted work');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      persisted.pid = 54_321;
+      sessionStore.updateSession(persisted);
+
+      const live: any = {
+        session: { ...persisted },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: persisted.chatId,
+        chatType: 'group',
+        scope: 'thread',
+      };
+      const map = new Map<string, DaemonSession>([
+        [sessionKey('om_runtime_same', 'app_test'), live],
+      ]);
+      wp.registry = map;
+      const processKill = vi.spyOn(process, 'kill').mockImplementation((() => true) as typeof process.kill);
+      vi.mocked(killStalePids).mockImplementationOnce((rows: any[], runtime?: ReadonlyMap<string, any>) => {
+        const runtimeIds = new Set([...(runtime?.values() ?? [])].map(ds => ds.session.sessionId));
+        for (const row of rows) {
+          if (row.pid && !runtimeIds.has(row.sessionId)) process.kill(row.pid, 0);
+        }
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(killStalePids).toHaveBeenCalledWith(expect.any(Array), map);
+      expect(processKill).not.toHaveBeenCalled();
+      expect(map.get(sessionKey('om_runtime_same', 'app_test'))).toBe(live);
+      expect(closeSession).not.toHaveBeenCalledWith(persisted.sessionId);
+      processKill.mockRestore();
+    });
+
+    it('does not probe-close a fresh persistent runtime session registered during restore', async () => {
+      const persisted = sessionStore.createSession('oc_restore_seed', 'om_restore_seed', 'restore seed');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      sessionStore.updateSession(persisted);
+
+      const fresh: any = {
+        session: {
+          sessionId: 'fresh-live-persistent',
+          status: 'active',
+          backendType: 'tmux',
+          cliId: 'claude-code',
+        },
+        worker: { killed: false },
+        larkAppId: 'app_test',
+        chatId: 'oc_fresh_runtime',
+        chatType: 'group',
+        scope: 'thread',
+      };
+      const freshKey = sessionKey('om_fresh_runtime', 'app_test');
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+
+      // Inject the dispatcher-created session at the exact await boundary of
+      // startup CAS registration. It is not part of the disk snapshot and
+      // therefore must not enter restore's backing probe/zombie-close pass.
+      vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (target, key, ds) => {
+        target.set(freshKey, fresh);
+        target.set(key, ds);
+        return { accepted: true };
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(freshKey)).toBe(fresh);
+      expect(fresh.session.status).toBe('active');
+      expect(closeSession).not.toHaveBeenCalledWith(fresh.session.sessionId);
+    });
+
+    it('does not probe-close a restored persistent session woken during registration', async () => {
+      const persisted = sessionStore.createSession('oc_woken_restore', 'om_woken_restore', 'woken restore');
+      persisted.larkAppId = 'app_test';
+      persisted.scope = 'thread';
+      persisted.cliId = 'claude-code';
+      persisted.backendType = 'tmux';
+      sessionStore.updateSession(persisted);
+
+      const key = sessionKey('om_woken_restore', 'app_test');
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+
+      // The CAS publishes ds synchronously, then its Promise yields. A real
+      // inbound message can fork this exact object before restore resumes; its
+      // tmux pane may not exist yet and must not be classified as a zombie.
+      vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (target, restoreKey, ds) => {
+        target.set(restoreKey, ds);
+        ds.worker = { killed: false };
+        return { accepted: true };
+      });
+
+      await restoreActiveSessions(map);
+
+      expect(map.get(key)?.session.sessionId).toBe(persisted.sessionId);
+      expect(map.get(key)?.worker).toBeTruthy();
+      expect(sessionStore.getSession(persisted.sessionId)?.status).toBe('active');
+      expect(closeSession).not.toHaveBeenCalledWith(persisted.sessionId);
+    });
+
     it('restores usage-limit runtime state for active sessions after daemon restart', async () => {
       const s = sessionStore.createSession('oc_chat_limit', 'om_limit', 'Limited topic');
       s.larkAppId = 'app_test';
@@ -329,6 +1289,137 @@ describe('resumeSession', () => {
       const ds = map.get(sessionKey('om_limit', 'app_test'));
       expect(ds).toBeDefined();
       expect(restoreUsageLimitRuntimeState).toHaveBeenCalledWith(ds);
+    });
+
+    it('restores ownerOpenId for a regular active session after daemon restart', async () => {
+      const s = sessionStore.createSession('oc_owner', 'om_owner', 'Owned topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.workingDir = '/tmp/owned';
+      s.ownerOpenId = 'ou_persisted_owner';
+      sessionStore.updateSession(s);
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      expect(map.get(sessionKey('om_owner', 'app_test'))?.ownerOpenId).toBe('ou_persisted_owner');
+    });
+
+    it('restores ownerOpenId before re-forking an adopt session', async () => {
+      const s = sessionStore.createSession('oc_adopt_owner', 'om_adopt_owner', 'Adopt: test-pane');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.ownerOpenId = 'ou_adopt_owner';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'test:0.0',
+        originalCliPid: 12345,
+        cliId: 'claude-code',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+      vi.mocked(forkAdoptWorker).mockClear();
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      const restored = map.get(sessionKey('om_adopt_owner', 'app_test'));
+      expect(restored?.ownerOpenId).toBe('ou_adopt_owner');
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ ownerOpenId: 'ou_adopt_owner' }),
+        { restoredFromMetadata: true },
+      );
+    });
+
+    it('does not zombie-close a restored external adopt session when the daemon backend is tmux', async () => {
+      daemonConfig.backendType = 'tmux';
+      const s = sessionStore.createSession('oc_adopt_tmux', 'om_adopt_tmux', 'Adopt: test-pane');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'codex';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'external:0.0',
+        originalCliPid: 12345,
+        cliId: 'codex',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      expect(map.get(sessionKey('om_adopt_tmux', 'app_test'))?.session.sessionId).toBe(s.sessionId);
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ adoptedFrom: s.adoptedFrom }),
+        { restoredFromMetadata: true },
+      );
+      expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    });
+
+    it('restores a renamed adopt session from metadata without probing a bmx backing session', async () => {
+      daemonConfig.backendType = 'tmux';
+      const s = sessionStore.createSession('oc_adopt_renamed', 'om_adopt_renamed', 'Renamed topic');
+      s.larkAppId = 'app_test';
+      s.scope = 'thread';
+      s.cliId = 'claude-code';
+      s.adoptedFrom = {
+        source: 'tmux',
+        tmuxTarget: 'external:0.0',
+        originalCliPid: 12345,
+        cliId: 'claude-code',
+        cwd: '/tmp/adopted',
+      };
+      sessionStore.updateSession(s);
+      vi.mocked(forkAdoptWorker).mockClear();
+      vi.mocked(TmuxBackend.probeSession).mockClear();
+
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      await restoreActiveSessions(map);
+
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      expect(map.get(sessionKey('om_adopt_renamed', 'app_test'))?.session.sessionId).toBe(s.sessionId);
+      expect(forkAdoptWorker).toHaveBeenCalledWith(
+        expect.objectContaining({ adoptedFrom: s.adoptedFrom }),
+        { restoredFromMetadata: true },
+      );
+      expect(TmuxBackend.probeSession).not.toHaveBeenCalled();
+      expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    });
+
+    it('restores the persisted clean sidecar for a long-running Codex App session', async () => {
+      const closed = makeClosedSession({
+        chatId: 'oc_codex_restore',
+        rootMessageId: 'om_codex_restore',
+        cliId: 'codex-app',
+      });
+      closed.lastUserPrompt = '第 27 轮继续分析';
+      closed.lastCliInput = '<user_message>第 27 轮继续分析</user_message>';
+      closed.lastCodexAppInput = {
+        text: '第 27 轮继续分析',
+        clientUserMessageId: 'om_round_27',
+        additionalContext: {
+          botmux_sender: { kind: 'untrusted', value: '<sender name="晓雪" />' },
+          botmux_role: { kind: 'application', value: '<role>reviewer</role>' },
+        },
+      };
+      sessionStore.updateSession(closed);
+      sessionStore.closeSession(closed.sessionId);
+
+      const map = new Map<string, DaemonSession>();
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      const restored = map.get(sessionKey('om_codex_restore', 'app_test'))!;
+      expect(restored.lastUserPrompt).toBe('第 27 轮继续分析');
+      expect(restored.lastCliInput).toContain('<user_message>');
+      expect(restored.lastCodexAppInput).toEqual(closed.lastCodexAppInput);
+      expect(restored.session.lastCodexAppInput).toEqual(closed.lastCodexAppInput);
     });
 
     it('flips status back to active, clears closedAt, and registers in the Map (thread-scope)', async () => {
@@ -386,5 +1477,127 @@ describe('resumeSession', () => {
       expect(r.ds.workingDir).toBe('/srv/app');
       expect(r.ds.ownerOpenId).toBe('ou_owner');
     });
+
+    it('registers a visible quarantined owner (not an invisible orphan) when restore-time activation-tail promotion fails transiently', async () => {
+      // Regression for the P2 fix: a transient durable-write failure during
+      // restore must NOT throw the row into the isolation catch unregistered.
+      // Before the fix, the row stayed active-on-disk but absent from the Map,
+      // so IM `/close` could not reach it and a later inbound to the same anchor
+      // minted a second active row while this one's tail dangled.
+      const s = sessionStore.createSession('oc_chatQ', 'om_quarantine', 'Quarantine Topic', 'group');
+      s.larkAppId = 'app_test';
+      s.workingDir = '/tmp/proj';
+      s.cliId = 'codex-app';
+      s.scope = 'thread';
+      s.status = 'active';
+      s.hasHistory = true;
+      s.queuedActivationTail = [{
+        id: 'tail-1',
+        order: 1,
+        userPrompt: 'held follow-up',
+        cliInput: { content: 'held follow-up' },
+        turnId: 'turn-held',
+      }] as any;
+      s.queuedActivationTailNextOrder = 1;
+      sessionStore.updateSession(s);
+
+      // Simulate the transient persistence failure inside promotion.
+      vi.mocked(promoteQueuedActivationTail).mockReturnValue(false);
+
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      // The row is registered (visible + anchor-occupied + closeable), NOT dropped.
+      const ds = map.get(sessionKey('om_quarantine', 'app_test'));
+      expect(ds).toBeDefined();
+      expect(ds!.session.sessionId).toBe(s.sessionId);
+      // Its unpromoted tail is retained for a later retry.
+      expect(ds!.session.queuedActivationTail?.length).toBe(1);
+      // Promotion was attempted (send:false, worker-null restore path).
+      expect(vi.mocked(promoteQueuedActivationTail)).toHaveBeenCalled();
+      // On-disk row stays active (retained for inspection/retry, not closed away).
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+      // Gate MUST stay up (initialStartPending true) — the old tail head must not
+      // be overtaken by a later turn. The retry happens at the next fork boundary
+      // (toReattach blank fork / daemon inbound refork), not by clearing the gate.
+      expect(ds!.initialStartPending).toBe(true);
+      // Marked for fork-boundary retry so a blank fork retries promotion first
+      // and skips forking if it still fails (never live-worker + unpromoted tail).
+      expect(ds!.quarantinedActivationTailPromotion).toBe(true);
+    });
+
+    it('leaves initialStartPending TRUE for a normal (non-quarantine) tail promotion at restore', async () => {
+      // Guard against the self-heal fix over-reaching: when promotion SUCCEEDS,
+      // the tokened activation is genuinely in flight, so the gate must stay up.
+      const s = sessionStore.createSession('oc_chatOk', 'om_ok', 'OK Topic', 'group');
+      s.larkAppId = 'app_test';
+      s.workingDir = '/tmp/proj';
+      s.cliId = 'codex-app';
+      s.scope = 'thread';
+      s.status = 'active';
+      s.hasHistory = true;
+      s.queuedActivationTail = [{
+        id: 'tail-ok',
+        order: 1,
+        userPrompt: 'held',
+        cliInput: { content: 'held' },
+        turnId: 'turn-ok',
+      }] as any;
+      s.queuedActivationTailNextOrder = 1;
+      sessionStore.updateSession(s);
+
+      // Promotion succeeds (default mock returns true).
+      const map = new Map<string, DaemonSession>();
+      await restoreActiveSessions(map);
+
+      const ds = map.get(sessionKey('om_ok', 'app_test'));
+      expect(ds).toBeDefined();
+      // Gate stays up: a real tokened activation is in flight.
+      expect(ds!.initialStartPending).toBe(true);
+    });
+  });
+});
+
+// NOTE: the fork-boundary quarantine recovery (retry-then-refuse-or-recover) is
+// now enforced by the CENTRAL guard inside forkWorker (resolveQuarantinedForkPlan),
+// not a separate per-site helper. Because this suite fully mocks worker-pool, the
+// real guard cannot run here; its end-to-end behavior (refuse non-empty, retry
+// fail → 0 forks, retry success → fork the promoted old head for Codex App and
+// non-Codex, FIFO preserved) is covered against the REAL forkWorker in
+// test/session-lifecycle-start.test.ts → 'quarantined tail-only owner recovery at
+// the fork boundary'. What this suite owns is the RESTORE side: a transient
+// promotion failure registers a visible quarantined owner and sets the
+// `quarantinedActivationTailPromotion` flag the guard keys on (see the
+// 'registers a visible quarantined owner …' test above).
+
+
+describe('resuming cleanup-archived Codex rows', () => {
+  function archivedRow() {
+    const row = makeClosedSession({ cliId: 'codex', backendType: 'pty' });
+    const stored = sessionStore.getSession(row.sessionId)!;
+    stored.cliSessionId = 'native';
+    stored.codexCleanupTarget = { threadId: 'native', codexHome: '/tmp/codex-home', codexBin: '/tmp/fake-codex' };
+    stored.codexCleanupArchive = { threadId: 'native', state: 'archived' };
+    sessionStore.updateSession(stored);
+    return stored;
+  }
+  it('unarchives before reactivating the durable row', async () => {
+    const row = archivedRow();
+    archiveRpc.mockImplementation(async () => {
+      expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    });
+    const result = await resumeSession(row.sessionId, new Map());
+    expect(result.ok).toBe(true);
+    expect(archiveRpc).toHaveBeenCalledWith(expect.objectContaining({ archived: false, threadId: 'native' }));
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive).toBeUndefined();
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('active');
+  });
+  it('keeps the row closed and recoverable if unarchive fails', async () => {
+    const row = archivedRow(); const map = new Map<string, DaemonSession>();
+    archiveRpc.mockRejectedValue(new Error('RPC failed'));
+    expect(await resumeSession(row.sessionId, map)).toEqual({ ok: false, error: 'codex_unarchive_failed' });
+    expect(sessionStore.getSession(row.sessionId)?.status).toBe('closed');
+    expect(sessionStore.getSession(row.sessionId)?.codexCleanupArchive?.state).toBe('archived');
+    expect(map.size).toBe(0);
   });
 });

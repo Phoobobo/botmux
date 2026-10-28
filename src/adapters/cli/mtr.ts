@@ -1,13 +1,11 @@
 import { createHash } from 'node:crypto';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { writeTextThenEnter } from './tui-input.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter } from './types.js';
 
 const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 
 function isMtrSessionId(value: string | undefined): value is string {
   return typeof value === 'string' && /^ses_[0-9A-Za-z]+$/.test(value);
@@ -28,10 +26,19 @@ function nativeSessionId(sessionId: string, cliSessionId?: string): string {
 }
 
 export function createMtrAdapter(pathOverride?: string): CliAdapter {
-  const bin = resolveCommand(pathOverride ?? 'mtr');
+  // resolvedBin is lazy: setup constructs adapters only to read static
+  // modelChoices and must not shell out (see resolveCommand); the binary path
+  // is a spawn-time concern.
+  const rawBin = pathOverride ?? 'mtr';
+  let cachedBin: string | undefined;
   return {
     id: 'mtr',
-    resolvedBin: bin,
+    // Whole dir kept REAL: mtr shares opencode's data dir and keeps its own SQLite
+    // DB there (mtr.db, WAL mode) — under the deny-by-default file sandbox a path
+    // not in authPaths doesn't exist, so the DB is unreachable / lacks the fcntl
+    // locks SQLite needs (same failure as codex, see codex.ts).
+    authPaths: ['~/.local/share/opencode'],
+    get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt }) {
       const mtrSessionId = nativeSessionId(sessionId, resumeSessionId);
@@ -50,18 +57,11 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // `--prompt` bakes the full first prompt into argv. Same tmux ceiling as
+    // OpenCode/Cursor; over-limit prompts defer to the post-start queue.
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
-    async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
-        await delay(200);
-        pty.sendSpecialKeys('Enter');
-      } else {
-        pty.write(content);
-        await delay(1000);
-        pty.write('\r');
-      }
-    },
+    writeInput: writeTextThenEnter,
 
     completionPattern: undefined,
     readyPattern: undefined,
@@ -70,5 +70,3 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/.config/opencode/skills',
   };
 }
-
-export const create = createMtrAdapter;

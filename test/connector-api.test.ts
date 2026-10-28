@@ -29,6 +29,42 @@ async function json(res: Response): Promise<any> {
   return res.json();
 }
 
+async function seedLegacyWorkflowConnector(): Promise<any> {
+  const { createWebhookSecret } = await import('../src/services/webhook-key.js');
+  const { upsertConnector } = await import('../src/services/connector-store.js');
+  const secret = createWebhookSecret('legacy-workflow-secret');
+  return upsertConnector({
+    id: 'conn_legacy_workflow',
+    name: 'Legacy report',
+    enabled: true,
+    verify: {
+      type: 'token',
+      secretRef: secret.ref,
+      signatureHeader: 'x-botmux-signature',
+      timestampHeader: 'x-botmux-timestamp',
+      nonceHeader: 'x-botmux-nonce',
+      toleranceSeconds: 300,
+    },
+    target: {
+      mode: 'fixed',
+      kind: 'workflow',
+      botId: 'app1',
+      chatId: 'oc_legacy',
+      workflowId: 'weekly-report',
+    },
+    promptEnvelope: {
+      sourceName: 'legacy-report',
+      headerAllowlist: [],
+      includeRawText: false,
+      maxBodyBytes: 1024,
+    },
+    loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+    lifecycleExtractors: null,
+    createdAt: '2026-07-01T00:00:00.000Z',
+    updatedAt: '2026-07-01T00:00:00.000Z',
+  });
+}
+
 beforeEach(async () => {
   dataDir = mkdtempSync(join(tmpdir(), 'botmux-connector-api-'));
   prevDataDir = process.env.SESSION_DATA_DIR;
@@ -45,6 +81,95 @@ afterEach(async () => {
 });
 
 describe('connector-api write routes', () => {
+  it('rejects new workflow connectors without retaining a connector or generated secret', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Retired workflow target',
+        target: {
+          mode: 'fixed',
+          kind: 'workflow',
+          botId: 'app1',
+          chatId: 'oc_1',
+          workflowId: 'weekly-report',
+        },
+      }),
+    });
+
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_creation_disabled',
+    });
+    expect((await json(await fetch(`${baseUrl}/api/connectors`))).connectors).toEqual([]);
+    expect((await json(await fetch(`${baseUrl}/api/webhook-secrets`))).secrets).toEqual([]);
+  });
+
+  it('does not allow an existing turn connector to become a workflow connector', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Turn target',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+
+    const update = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { kind: 'workflow', workflowId: 'weekly-report' } }),
+    });
+    expect(update.status).toBe(400);
+    expect(await json(update)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_creation_disabled',
+    });
+    const stored = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`));
+    expect(stored.connector.target.kind).toBe('turn');
+  });
+
+  it('allows non-target maintenance on legacy workflow connectors but keeps their target immutable', async () => {
+    const legacy = await seedLegacyWorkflowConnector();
+    const maintained = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Legacy report (maintained)',
+        rotateSecret: true,
+        promptEnvelope: { sourceName: 'legacy-report', instruction: 'Keep this alive during migration.' },
+      }),
+    });
+    expect(maintained.status).toBe(200);
+    expect(await json(maintained)).toMatchObject({
+      ok: true,
+      connector: {
+        name: 'Legacy report (maintained)',
+        target: legacy.target,
+      },
+    });
+
+    const targetChange = await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ target: { mode: 'fixed', chatId: 'oc_other' } }),
+    });
+    expect(targetChange.status).toBe(400);
+    expect(await json(targetChange)).toMatchObject({
+      ok: false,
+      error: 'legacy_workflow_connector_target_immutable',
+    });
+
+    const toggled = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(legacy.id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: false }),
+    }));
+    expect(toggled.connector.enabled).toBe(false);
+    expect(toggled.connector.target).toEqual(legacy.target);
+  });
+
   it('creates a connector with a generated one-time secret, then lists it without plaintext', async () => {
     const res = await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
@@ -61,6 +186,7 @@ describe('connector-api write routes', () => {
     expect(created.secret).toMatch(/^[A-Za-z0-9_-]+$/);
     expect(created.connector.verify.secretRef).toMatch(/^whsec_/);
     expect(created.connector.verify.signatureHeader).toBe('x-botmux-signature');
+    expect(created.connector.loggingPolicy).toMatchObject({ storePayload: true, storeHeaders: true, retentionDays: 14 });
 
     const list = await json(await fetch(`${baseUrl}/api/connectors`));
     expect(list.connectors).toHaveLength(1);
@@ -69,6 +195,182 @@ describe('connector-api write routes', () => {
     const raw = readFileSync(join(dataDir, 'connectors.json'), 'utf-8');
     expect(raw).not.toContain(created.secret);
     expect(raw).toContain(created.connector.verify.secretRef);
+  });
+
+  it('defaults to token mode and bakes the secret into the webhook URL path', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Easy alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('token');
+    expect(created.webhookUrl).toContain(`/webhook/${created.connector.id}/${created.secret}`);
+  });
+
+  it('round-trips a trusted promptEnvelope.instruction and clears it on empty', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Alert handler',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        promptEnvelope: { sourceName: 'alerts', instruction: '  总结告警并 @ oncall  ' },
+      }),
+    }));
+    expect(created.connector.promptEnvelope.instruction).toBe('总结告警并 @ oncall');
+
+    const id = created.connector.id;
+    const cleared = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ promptEnvelope: { sourceName: 'alerts', instruction: '' } }),
+    }));
+    expect(cleared.connector.promptEnvelope.instruction).toBeUndefined();
+  });
+
+  it('supports default, custom, and disabled topic messages as a product setting', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Deploy alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        topicMessage: { mode: 'custom', text: '  发布异常：{source}  ' },
+      }),
+    }));
+    expect(created.connector.topicMessage).toEqual({ mode: 'custom', text: '发布异常：{source}' });
+
+    const disabled = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topicMessage: { mode: 'none', text: 'must be discarded' } }),
+    }));
+    expect(disabled.connector.topicMessage).toEqual({ mode: 'none' });
+
+    const defaulted = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topicMessage: { mode: 'default' } }),
+    }));
+    expect(defaulted.connector.topicMessage).toEqual({ mode: 'default' });
+  });
+
+  it('round-trips a trusted topic template and its allowlisted field extractors', async () => {
+    const topicMessage = {
+      mode: 'template',
+      text: 'Meego启动开发：{{title}} {{mention owners}}负责人 {{mention trigger}}触发人',
+      extractors: {
+        title: { path: '$.issue.title', kind: 'text' },
+        owners: { path: '$.meego.owners', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+        trigger: { path: '$.meego.trigger', kind: 'mention', identityPath: '$.email', namePath: '$.name' },
+      },
+    };
+
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Meego development',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        topicMessage,
+      }),
+    }));
+
+    expect(created.connector.topicMessage).toEqual(topicMessage);
+  });
+
+  it('rejects unsafe or inconsistent trusted topic template definitions', async () => {
+    const invalidTopicMessages = [
+      {
+        mode: 'template',
+        text: '{{missing}}',
+        extractors: { title: { path: '$.issue.title', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{mention title}}',
+        extractors: { title: { path: '$.issue.title', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{title}}',
+        extractors: { title: { path: '$.issue.*', kind: 'text' } },
+      },
+      {
+        mode: 'template',
+        text: '{{title}}',
+        extractors: { title: { path: '$.issue.title', kind: 'script' } },
+      },
+    ];
+
+    for (const topicMessage of invalidTopicMessages) {
+      const res = await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Invalid template',
+          target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+          topicMessage,
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toMatch(/^topic_message_template_/);
+    }
+  });
+
+  it('round-trips the suppressFinalOutput toggle via POST and PUT', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Quiet alerts',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        suppressFinalOutput: true,
+      }),
+    }));
+    expect(created.connector.suppressFinalOutput).toBe(true);
+
+    const id = created.connector.id;
+    const cleared = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ suppressFinalOutput: false }),
+    }));
+    expect(cleared.connector.suppressFinalOutput).toBeUndefined();
+  });
+
+  it('rejects empty and overlong custom topic messages', async () => {
+    for (const text of ['   ', 'x'.repeat(201)]) {
+      const res = await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Invalid notice',
+          target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+          topicMessage: { mode: 'custom', text },
+        }),
+      });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toMatch(/^topic_message_(required|too_long)$/);
+    }
+  });
+
+  it('keeps HMAC mode when explicitly requested and omits the token from the URL', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Signed alerts',
+        verify: { type: 'hmac-sha256' },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(created.connector.verify.type).toBe('hmac-sha256');
+    expect(created.webhookUrl).toMatch(new RegExp(`/webhook/${created.connector.id}$`));
+    expect(created.webhookUrl).not.toContain(created.secret);
   });
 
   it('updates enabled state and rotates an existing connector secret', async () => {
@@ -103,29 +405,117 @@ describe('connector-api write routes', () => {
     expect(JSON.stringify(await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`)))).not.toContain(rotated.secret);
   });
 
-  it('requires lifecycle extractors for new-group connectors and preserves botIds', async () => {
-    const bad = await fetch(`${baseUrl}/api/connectors`, {
+  it('allows a new-group connector with NO dedup (every event → fresh group) and preserves botIds', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        name: 'Auto war-room',
+        name: 'Per-event rooms',
         target: { mode: 'new-group', kind: 'turn', botId: 'app1', botIds: ['app2'] },
       }),
-    });
-    expect(bad.status).toBe(400);
-    expect((await json(bad)).error).toBe('lifecycle_extractors_required');
+    }));
+    expect(created.connector.target.botIds).toEqual(['app1', 'app2']);
+    expect(created.connector.lifecycleExtractors).toBeNull();
+  });
 
+  it('round-trips new-group lifecycle group names and drops them outside new-group mode', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Per-event rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'fixed', text: '  固定处理群  ' },
+      }),
+    }));
+    expect(created.connector.lifecycleGroupName).toEqual({ mode: 'fixed', text: '固定处理群' });
+
+    const templated = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.name}} {{dedupKey}}' },
+      }),
+    }));
+    expect(templated.connector.lifecycleGroupName).toEqual({
+      mode: 'template',
+      text: '告警 {{alert.name}} {{dedupKey}}',
+    });
+
+    const fixedTarget = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+      }),
+    }));
+    expect(fixedTarget.connector.lifecycleGroupName).toBeUndefined();
+  });
+
+  it('rejects invalid lifecycle group name templates', async () => {
+    const res = await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Bad rooms',
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
+        lifecycleGroupName: { mode: 'template', text: '告警 {{alert.*}}' },
+      }),
+    });
+    expect(res.status).toBe(400);
+    expect(await json(res)).toMatchObject({
+      ok: false,
+      error: 'lifecycle_group_name_template_invalid',
+    });
+  });
+
+  it('stores a dedup-only lifecycleExtractors (status dropped) for new-group', async () => {
     const created = await json(await fetch(`${baseUrl}/api/connectors`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         name: 'Auto war-room',
-        target: { mode: 'new-group', kind: 'turn', botId: 'app1', botIds: ['app2'] },
+        target: { mode: 'new-group', kind: 'turn', botId: 'app1' },
         lifecycleExtractors: { dedupKey: '$.alert.id', status: '$.alert.state' },
       }),
     }));
-    expect(created.connector.target.botIds).toEqual(['app1', 'app2']);
-    expect(created.connector.lifecycleExtractors).toEqual({ dedupKey: '$.alert.id', status: '$.alert.state' });
+    expect(created.connector.lifecycleExtractors).toEqual({ dedupKey: '$.alert.id' });
+  });
+
+  it('updates the complete webhook configuration and drops fields that do not belong to the new mode', async () => {
+    const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Fixed turn',
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_old' },
+        lifecycleExtractors: { dedupKey: '$.alert.id' },
+      }),
+    }));
+
+    const updated = await json(await fetch(`${baseUrl}/api/connectors/${encodeURIComponent(created.connector.id)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Dynamic turn',
+        target: { mode: 'dynamic', kind: 'turn', botId: 'app2', allowChats: ['oc_a', 'oc_b'] },
+        promptEnvelope: { sourceName: 'Dynamic turn', instruction: 'summarize' },
+        verify: { type: 'hmac-sha256' },
+        loggingPolicy: { storePayload: false, storeHeaders: true, retentionDays: 14 },
+        lifecycleExtractors: null,
+      }),
+    }));
+
+    expect(updated.connector).toMatchObject({
+      name: 'Dynamic turn',
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app2', allowChats: ['oc_a', 'oc_b'] },
+      promptEnvelope: { sourceName: 'Dynamic turn', instruction: 'summarize' },
+      verify: { type: 'hmac-sha256' },
+      loggingPolicy: { storePayload: false },
+      lifecycleExtractors: null,
+    });
+    expect(updated.connector.target.chatId).toBeUndefined();
+    expect(updated.connector.target.workflowId).toBeUndefined();
   });
 
   it('manages standalone webhook secrets as metadata-only reads', async () => {
@@ -162,8 +552,8 @@ describe('connector-api write routes', () => {
       }),
     }));
     const id = created.connector.id;
-    appendTriggerLog({ triggerId: 'old', connectorId: id, action: 'queued', status: 'ok', createdAt: '2026-05-20T00:00:00.000Z' }, dataDir);
-    appendTriggerLog({ triggerId: 'rate', connectorId: id, action: 'failed', status: 'error', errorCode: 'rate_limited', createdAt: '2026-05-24T00:01:00.000Z' }, dataDir);
+    appendTriggerLog({ triggerId: 'old', connectorId: id, action: 'queued', status: 'ok', createdAt: '2026-05-20T00:00:00.000Z', response: { httpStatus: 200, durationMs: 10 } }, dataDir);
+    appendTriggerLog({ triggerId: 'rate', connectorId: id, action: 'failed', status: 'error', errorCode: 'rate_limited', createdAt: '2026-05-24T00:01:00.000Z', response: { httpStatus: 429, durationMs: 30 } }, dataDir);
     appendTriggerLog({ triggerId: 'sig', connectorId: 'missing', action: 'failed', status: 'error', errorCode: 'invalid_signature', createdAt: '2026-05-24T00:02:00.000Z' }, dataDir);
 
     const filtered = await json(await fetch(`${baseUrl}/api/trigger-logs?status=error&errorCode=rate_limited`));
@@ -178,6 +568,11 @@ describe('connector-api write routes', () => {
       lastErrorCode: 'rate_limited',
     });
     expect(stats.stats.find((s: any) => s.connectorId === 'missing')).toMatchObject({ total: 1, error: 1 });
+
+    const summary = await json(await fetch(`${baseUrl}/api/trigger-logs/summary?connectorId=${encodeURIComponent(id)}`));
+    expect(summary.summary).toMatchObject({ total: 2, ok: 1, error: 1, successRate: 50, avgDurationMs: 20, p95DurationMs: 30 });
+    const page = await json(await fetch(`${baseUrl}/api/trigger-logs?connectorId=${encodeURIComponent(id)}&limit=1&offset=1`));
+    expect(page).toMatchObject({ total: 2, limit: 1, offset: 1, hasMore: false, logs: [{ triggerId: 'old' }] });
 
     const pruned = await json(await fetch(`${baseUrl}/api/trigger-logs/prune`, {
       method: 'POST',

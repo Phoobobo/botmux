@@ -1,0 +1,272 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
+/**
+ * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
+ *
+ * The daemon-driven run path (`daemon-run.ts`) and the standalone CLI path
+ * (`cli-run.ts`) both turn a `--bot`/node.bot selector into the `BotSnapshot`
+ * the runtime freezes per node.  This module is the single source of that
+ * matching + working-dir fallback so the two entries can't drift.
+ *
+ * (cli-run.ts currently keeps equivalent local copies — codex's runtime file,
+ * which this feature doesn't touch; dedupe it to this module next time that
+ * file is edited.)
+ */
+
+import { normalizeEnvPolicy } from '../../core/env-policy.js';
+import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
+import { newSessionCodexInstanceState, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
+import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
+import {
+  V3_SUPPORTED_CLIS,
+  isV3SupportedCli,
+  type BotSnapshot,
+} from './contract.js';
+
+export function resolveBotConfig(selector: string | undefined, bots: BotConfig[]): BotConfig {
+  if (!selector) {
+    if (bots.length === 0) throw new Error('v3: bots.json has no bots — run `botmux setup` first');
+    return bots[0]!;
+  }
+  // Stable identity always wins over a display-name collision. Saved Workflow
+  // templates persist larkAppId; a bot named like another bot's app id must
+  // never hijack that selector.
+  const match = bots.find((b) => b.larkAppId === selector)
+    ?? bots.find((b) => b.name === selector);
+  if (!match) {
+    const known = bots.map((b) => b.name ?? b.larkAppId).join(', ') || '(none)';
+    throw new Error(`v3: no bot matches "${selector}" (known: ${known})`);
+  }
+  return match;
+}
+
+/** The configured working dir for a bot, before `~` expansion (the pool
+ *  expands).  An explicit override wins over the bot's configured value. */
+export function botWorkingDir(bot: BotConfig, override?: string): string {
+  return override
+    ?? effectiveDefaultWorkingDir(bot)
+    ?? bot.workingDir
+    ?? bot.workingDirs?.[0]
+    ?? '~';
+}
+
+/** Freeze the three-tier sandboxPaths into a snapshot-safe copy, or undefined
+ *  when the bot has no non-empty tier (so the field is omitted from the frozen
+ *  snapshot and the worker's legacy fallback stays intact). */
+function sandboxPathsSnapshot(
+  sp: { readWrite?: string[]; readOnly?: string[]; deny?: string[] } | undefined,
+): { readWrite?: string[]; readOnly?: string[]; deny?: string[] } | undefined {
+  if (!sp) return undefined;
+  const out: { readWrite?: string[]; readOnly?: string[]; deny?: string[] } = {};
+  if (sp.readWrite?.length) out.readWrite = [...sp.readWrite];
+  if (sp.readOnly?.length) out.readOnly = [...sp.readOnly];
+  if (sp.deny?.length) out.deny = [...sp.deny];
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** BotConfig → BotSnapshot (the runtime-frozen, secret-free per-node identity). */
+export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotSnapshot {
+  if (bot.codexProfile) throw new Error('Codex profile is not supported by v3 workflow; choose a Bot without a profile');
+  if (bot.disableCliBypass === true) {
+    throw new Error(
+      `v3 workflow requires CLI bypass permissions, but bot "${bot.name ?? bot.larkAppId}" ` +
+      'has disableCliBypass=true. Use a workflow bot with bypass enabled, or remove/set this bot option to false',
+    );
+  }
+  const instance = newSessionCodexInstanceState(bot, 'workflow');
+  return {
+    ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
+    larkAppId: bot.larkAppId,
+    ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
+    cliId: bot.cliId,
+    ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
+    ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.sandbox === true || bot.sandbox === 'oncall'
+      ? { sandbox: true }
+      : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
+    ...(bot.sandbox === 'scratch' ? {
+      ...(bot.scratchStorage ? { scratchStorage: bot.scratchStorage } : {}),
+      ...(bot.scratchTmpfsSizeMb ? { scratchTmpfsSizeMb: bot.scratchTmpfsSizeMb } : {}),
+      ...(bot.scratchDenyPaths?.length ? { scratchDenyPaths: [...bot.scratchDenyPaths] } : {}),
+    } : {}),
+    ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
+    ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
+    ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
+    ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
+    workingDir: botWorkingDir(bot, workingDirOverride),
+  };
+}
+
+/**
+ * Resolve every selector used by a DAG exactly once. Keys intentionally mirror
+ * the runtime contract (`''` means the DAG's default bot); loop-body nodes use
+ * their own selector or inherit the loop selector.
+ */
+export function freezeDagBotSnapshots(
+  dag: V3Dag,
+  bots: BotConfig[],
+  opts: { defaultSelector?: string; workingDirOverride?: string } = {},
+): Map<string, BotSnapshot> {
+  const snapshots = new Map<string, BotSnapshot>();
+  const freeze = (selector: string | undefined): void => {
+    const key = selector ?? '';
+    if (snapshots.has(key)) return;
+    const bot = resolveBotConfig(selector ?? opts.defaultSelector, bots);
+    const snapshot = botToSnapshot(bot, opts.workingDirOverride);
+    if (!isV3SupportedCli(snapshot.cliId)) {
+      throw new Error(
+        `v3 workflow bot "${bot.name ?? bot.larkAppId}" uses unsupported CLI "${snapshot.cliId}" ` +
+        `(supported: ${V3_SUPPORTED_CLIS.join(', ')})`,
+      );
+    }
+    snapshots.set(key, snapshot);
+  };
+
+  for (const node of dag.nodes) {
+    if (isGoalNode(node)) freeze(node.bot);
+    if (isLoopNode(node)) {
+      for (const bodyNode of node.body.nodes) freeze(bodyNode.bot ?? node.bot);
+    }
+  }
+  return snapshots;
+}
+
+/** JSON-safe persisted shape used by `bots.snapshot.json`. */
+export function serializeFrozenBotSnapshots(
+  snapshots: ReadonlyMap<string, BotSnapshot>,
+): Record<string, BotSnapshot> {
+  return Object.fromEntries(snapshots);
+}
+
+/**
+ * Validate the secret-free pinned bot snapshot artifact before a retry/resume
+ * can hand it to the runtime. Unknown keys fail closed so credentials or
+ * mutable permission flags cannot quietly creep into this run contract.
+ */
+export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, BotSnapshot> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('bots.snapshot.json must be an object keyed by DAG bot selector');
+  }
+  const allowed = new Set([
+    'larkAppId',
+    'cliInstanceBinding',
+    'cliRuntime',
+    'cliId',
+    'cliPathOverride',
+    'wrapperCli',
+    'model',
+    'envPolicy',
+    'sandbox',
+    'sandboxPaths',
+    'sandboxHidePaths',
+    'sandboxReadonlyPaths',
+    'sandboxNetwork',
+    'sandboxNetworkPolicy',
+    'workingDir',
+  ]);
+  const snapshots = new Map<string, BotSnapshot>();
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] must be an object`);
+    }
+    const obj = value as Record<string, unknown>;
+    if (obj.envPolicy !== undefined) normalizeEnvPolicy(obj.envPolicy);
+    const extra = Object.keys(obj).filter((field) => !allowed.has(field));
+    if (extra.length > 0) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] has unsupported key(s): ${extra.join(', ')}`);
+    }
+    if (typeof obj.larkAppId !== 'string' || obj.larkAppId.length === 0) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].larkAppId must be a non-empty string`);
+    }
+    if (typeof obj.cliId !== 'string' || !isV3SupportedCli(obj.cliId as BotSnapshot['cliId'])) {
+      throw new Error(
+        `bots.snapshot.json[${JSON.stringify(key)}].cliId must be one of ${V3_SUPPORTED_CLIS.join(', ')}`,
+      );
+    }
+    if (typeof obj.workingDir !== 'string' || obj.workingDir.length === 0) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].workingDir must be a non-empty string`);
+    }
+    for (const field of ['cliPathOverride', 'wrapperCli', 'model'] as const) {
+      if (obj[field] !== undefined && typeof obj[field] !== 'string') {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
+      }
+    }
+    for (const field of ['sandbox', 'sandboxNetwork'] as const) {
+      if (obj[field] !== undefined && typeof obj[field] !== 'boolean') {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a boolean`);
+      }
+    }
+    for (const field of ['sandboxHidePaths', 'sandboxReadonlyPaths'] as const) {
+      if (
+        obj[field] !== undefined &&
+        (!Array.isArray(obj[field]) || !(obj[field] as unknown[]).every((item) => typeof item === 'string'))
+      ) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string array`);
+      }
+    }
+    if (obj.sandboxPaths !== undefined) {
+      const sp = obj.sandboxPaths;
+      if (!sp || typeof sp !== 'object' || Array.isArray(sp)) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].sandboxPaths must be an object`);
+      }
+      const spObj = sp as Record<string, unknown>;
+      const spExtra = Object.keys(spObj).filter((f) => !['readWrite', 'readOnly', 'deny'].includes(f));
+      if (spExtra.length > 0) {
+        throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].sandboxPaths has unsupported key(s): ${spExtra.join(', ')}`);
+      }
+      for (const tier of ['readWrite', 'readOnly', 'deny'] as const) {
+        if (
+          spObj[tier] !== undefined &&
+          (!Array.isArray(spObj[tier]) || !(spObj[tier] as unknown[]).every((item) => typeof item === 'string'))
+        ) {
+          throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].sandboxPaths.${tier} must be a string array`);
+        }
+      }
+    }
+    const parsedSandboxPaths = sandboxPathsSnapshot(obj.sandboxPaths as BotSnapshot['sandboxPaths']);
+    if (obj.cliInstanceBinding !== undefined) {
+      const b = obj.cliInstanceBinding as SessionCliInstanceBindingV1;
+      if (!b || b.version !== 1 || b.source !== 'default' || b.cliId !== 'codex' || obj.cliId !== 'codex'
+          || b.authMode !== 'isolated' || typeof b.instanceId !== 'string' || typeof b.codexHome !== 'string'
+          || !b.codexHome.startsWith('/')) throw new Error('invalid frozen workflow Codex instance binding');
+    }
+    snapshots.set(key, {
+      ...(obj.cliInstanceBinding ? { cliInstanceBinding: obj.cliInstanceBinding as SessionCliInstanceBindingV1,
+        cliRuntime: obj.cliRuntime as BotSnapshot['cliRuntime'] } : {}),
+      larkAppId: obj.larkAppId,
+      ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
+      cliId: obj.cliId as BotSnapshot['cliId'],
+      ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
+      ...(obj.model !== undefined ? { model: obj.model as string } : {}),
+      ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
+        : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),
+      ...(obj.scratchStorage !== undefined ? { scratchStorage: obj.scratchStorage as 'tmpfs' | 'disk' } : {}),
+      ...(obj.scratchTmpfsSizeMb !== undefined ? { scratchTmpfsSizeMb: obj.scratchTmpfsSizeMb as number } : {}),
+      ...(Array.isArray(obj.scratchDenyPaths) ? { scratchDenyPaths: [...obj.scratchDenyPaths as string[]] } : {}),
+      ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
+      ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),
+      ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
+      ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
+      ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
+      workingDir: obj.workingDir,
+    });
+  }
+
+  if (dag) {
+    const required = new Set<string>();
+    for (const node of dag.nodes) {
+      if (isGoalNode(node)) required.add(node.bot ?? '');
+      if (isLoopNode(node)) {
+        for (const bodyNode of node.body.nodes) required.add(bodyNode.bot ?? node.bot ?? '');
+      }
+    }
+    for (const key of required) {
+      if (!snapshots.has(key)) {
+        throw new Error(`bots.snapshot.json is missing selector ${JSON.stringify(key || '<default>')}`);
+      }
+    }
+  }
+  return snapshots;
+}

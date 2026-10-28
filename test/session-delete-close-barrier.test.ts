@@ -1,0 +1,757 @@
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../src/config.js';
+import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import * as larkClient from '../src/im/lark/client.js';
+import * as botRegistry from '../src/bot-registry.js';
+import * as closedCard from '../src/core/closed-session-card.js';
+import * as docComment from '../src/im/lark/doc-comment.js';
+import * as workerPool from '../src/core/worker-pool.js';
+import { activeSessionKey } from '../src/core/types.js';
+import * as docSubsStore from '../src/services/doc-subs-store.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { ensureSessionTempDir } from '../src/core/session-temp.js';
+import { pinSessionMcpGatewaySocketRoot, sessionMcpGatewaySocketDir } from '../src/core/plugins/mcp/socket-dir.js';
+import { readMcpGatewayLaunchRecord, writeMcpGatewayLaunchRecord } from '../src/core/plugins/mcp/launch-record.js';
+
+// The daemon names Gateway dirs under its tmpdir(); pin a private short root
+// so these tests never create or remove anything in the shared one.
+const gatewayRoot = mkdtempSync(join(existsSync('/tmp') ? '/tmp' : tmpdir(), 'bmcp-close-'));
+pinSessionMcpGatewaySocketRoot(gatewayRoot);
+
+const tempDirs: string[] = [];
+
+afterAll(() => rmSync(gatewayRoot, { recursive: true, force: true }));
+
+afterEach(() => {
+  workerPool.setActiveSessionsRegistry(new Map());
+  sessionStore.init('test-app');
+  vi.restoreAllMocks();
+  for (const dir of tempDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+describe('daemon close barrier used by botmux delete', () => {
+  it.each(['workerless', 'active', 'retiring'] as const)('preserves resumed scratch when the old worker exits (replacement: %s)', async replacementState => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-resume-scratch-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-scratch-race');
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+    });
+    let replacementWorker: EventEmitter | undefined;
+    try {
+      const session = sessionStore.createSession('oc_scratch', 'om_scratch', 'scratch race', 'group');
+      session.larkAppId = 'app-scratch-race';
+      sessionStore.updateSession(session);
+      const scratch = ensureSessionTempDir(dataDir, session.sessionId);
+      tempDirs.push(dirname(scratch));
+      const ds = { session, worker: oldWorker, workerGeneration: 1,
+        larkAppId: session.larkAppId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), lastMessageAt: Date.now(), hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await workerPool.closeSession(session.sessionId, { awaitWorkerExit: false });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(existsSync(scratch)).toBe(true);
+      const replacement = { ...ds, workerGeneration: 2,
+        worker: replacementState !== 'workerless' ? Object.assign(new EventEmitter(), {
+          killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+        }) : null,
+      } as any;
+      replacementWorker = replacement.worker ?? undefined;
+      active.set(activeSessionKey(replacement), replacement);
+      if (replacementState === 'retiring') {
+        workerPool.killWorker(replacement);
+        active.delete(activeSessionKey(replacement));
+      }
+      // Leave the persistent row closed: the active owner alone must fence deletion.
+      writeFileSync(join(scratch, 'live'), 'replacement');
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(existsSync(join(scratch, 'live'))).toBe(true);
+    } finally {
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      replacementWorker?.emit('exit', 0, null);
+      config.session.dataDir = previousDataDir;
+    }
+  });
+  it.each(['closed', 'resumed'] as const)('removes the Gateway dir only once a durably closed session’s worker exits (%s)', async outcome => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-gateway-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-gateway-close');
+    const oldWorker = Object.assign(new EventEmitter(), {
+      killed: false, exitCode: null, signalCode: null, send: vi.fn(), kill: vi.fn(),
+    });
+    try {
+      const session = sessionStore.createSession('oc_gw', 'om_gw', 'gateway close', 'group');
+      session.larkAppId = 'app-gateway-close';
+      sessionStore.updateSession(session);
+      tempDirs.push(dirname(ensureSessionTempDir(dataDir, session.sessionId)));
+      const gatewayDir = sessionMcpGatewaySocketDir(session.sessionId, dataDir);
+      mkdirSync(gatewayDir, { mode: 0o700 });
+      writeFileSync(join(gatewayDir, 'auth'), 'token\n');
+      writeMcpGatewayLaunchRecord(dataDir, session.sessionId, join(gatewayDir, 'g.sock'));
+      const ds = { session, worker: oldWorker, workerGeneration: 1,
+        larkAppId: session.larkAppId, chatId: session.chatId, chatType: 'group', scope: 'thread',
+        spawnedAt: Date.now(), lastMessageAt: Date.now(), hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await workerPool.closeSession(session.sessionId, { awaitWorkerExit: false });
+      // The worker has not exited yet: a pane it still serves keeps its directory.
+      expect(existsSync(gatewayDir)).toBe(true);
+      if (outcome === 'resumed') {
+        const replacement = { ...ds, workerGeneration: 2, worker: null } as any;
+        active.set(activeSessionKey(replacement), replacement);
+      }
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      expect(existsSync(gatewayDir)).toBe(outcome === 'resumed');
+      expect(readMcpGatewayLaunchRecord(dataDir, session.sessionId) !== null).toBe(outcome === 'resumed');
+    } finally {
+      oldWorker.exitCode = 0 as any;
+      oldWorker.emit('exit', 0, null);
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('evicts activeSessions and persists closed before awaited doc cleanup', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-delete-barrier-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-delete-barrier');
+
+    let releaseCleanup!: () => void;
+    const cleanupGate = new Promise<void>(resolve => { releaseCleanup = resolve; });
+    vi.spyOn(docSubsStore, 'listDocSubscriptionsForSession').mockReturnValue([{
+      fileToken: 'doc-delete-barrier',
+      fileType: 'docx',
+      managedBy: 'subscribe-lark-doc',
+    }] as any);
+    vi.spyOn(docSubsStore, 'removeDocSubscription').mockImplementation(() => true);
+    vi.spyOn(docComment, 'unsubscribeDocFile').mockImplementation(() => cleanupGate);
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_delete_barrier',
+        'om_delete_barrier',
+        'delete barrier',
+        'group',
+      );
+      session.larkAppId = 'app-delete-barrier';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'private closed reply',
+      })}\n`);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        larkAppId: 'app-delete-barrier',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      const dashboardEvents: DashboardEvent[] = [];
+      const stopDashboardEvents = dashboardEventBus.subscribe(event => dashboardEvents.push(event));
+
+      const pending = workerPool.closeSession(session.sessionId);
+
+      // closeSession has reached the first await (unsubscribeDocFile), but the
+      // logical close barrier must already be fully visible.
+      expect(active.has(activeSessionKey(ds))).toBe(false);
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(existsSync(markerPath)).toBe(false);
+
+      releaseCleanup();
+      await expect(pending).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
+      stopDashboardEvents();
+      const closePatch = dashboardEvents.find(event =>
+        event.type === 'session.update'
+        && event.body.sessionId === session.sessionId
+        && event.body.patch.status === 'closed'
+      );
+      expect(closePatch).toEqual({
+        type: 'session.update',
+        body: {
+          sessionId: session.sessionId,
+          patch: expect.objectContaining({
+            status: 'closed',
+            previewUserText: null,
+            previewBotText: null,
+            previewUserFullText: null,
+            previewBotFullText: null,
+            previewUserAt: null,
+            previewBotAt: null,
+            previewBotState: null,
+          }),
+        },
+      });
+      expect(docSubsStore.removeDocSubscription).toHaveBeenCalledWith(
+        dataDir,
+        'app-delete-barrier',
+        'doc-delete-barrier',
+      );
+    } finally {
+      releaseCleanup();
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('keeps a document watch when one comment-thread session closes', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-doc-thread-close-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-doc-thread-close');
+    const fileToken = 'doc-thread-close';
+    const watchAnchor = docSubsStore.docWatchAnchor(fileToken);
+    docSubsStore.putDocSubscription(dataDir, 'app-doc-thread-close', {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: watchAnchor,
+      scope: 'chat',
+      chatId: watchAnchor,
+      commentTriggerMode: 'mention-only',
+      managedBy: 'watch-comment',
+      createdAt: Date.now(),
+    });
+    const unsubscribe = vi.spyOn(docComment, 'unsubscribeDocFile');
+
+    try {
+      const commentAnchor = docSubsStore.docCommentThreadAnchor(fileToken, 'comment-1');
+      const session = sessionStore.createSession(commentAnchor, commentAnchor, 'doc comment thread', 'group');
+      session.larkAppId = 'app-doc-thread-close';
+      session.scope = 'chat';
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        larkAppId: 'app-doc-thread-close',
+        chatId: commentAnchor,
+        chatType: 'group',
+        scope: 'chat',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await expect(workerPool.closeSession(session.sessionId)).resolves.toMatchObject({ ok: true });
+
+      expect(docSubsStore.getDocSubscription(dataDir, 'app-doc-thread-close', fileToken)).toMatchObject({
+        sessionAnchor: watchAnchor,
+        managedBy: 'watch-comment',
+      });
+      expect(unsubscribe).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('keeps bridge send markers until the live worker acknowledges close', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_close_fence',
+        'om_close_fence',
+        'close fence',
+        'group',
+      );
+      session.larkAppId = 'app-close-fence';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'already sent answer',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'tmux' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+
+      const pending = workerPool.closeSession(session.sessionId);
+
+      expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+      expect(active.has(activeSessionKey(ds))).toBe(false);
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(existsSync(markerPath)).toBe(true);
+
+      worker.emit('exit');
+      await expect(pending).resolves.toEqual({ ok: true, outcome: 'closed', alreadyClosed: false, known: true });
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('defers default session-store marker cleanup after killWorker already nulled the live worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-kill-then-close-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-kill-then-close');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_kill_then_close',
+        'om_kill_then_close',
+        'kill then close',
+        'group',
+      );
+      session.larkAppId = 'app-kill-then-close';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'sent before slash close',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-kill-then-close',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'tmux' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      expect(ds.worker).toBeNull();
+
+      sessionStore.closeSession(session.sessionId);
+      expect(existsSync(markerPath)).toBe(true);
+
+      worker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('runs coordinator close migration only after the exact live worker exit fence resolves', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-xpi-close-lifecycle-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-xpi-close-lifecycle');
+    const onSessionClosed = vi.fn(async () => undefined);
+    workerPool.initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(async () => true),
+      onSessionClosed,
+    });
+
+    try {
+      const session = sessionStore.createSession('oc_xpi_close', 'om_xpi_close', 'XPI close', 'group');
+      session.larkAppId = 'app-xpi-close-lifecycle';
+      session.workerGeneration = 8;
+      session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:synthetic';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = session.sessionId;
+      sessionStore.updateSession(session);
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+        kill: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerGeneration: 8,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-xpi-close-lifecycle',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+
+      const pending = workerPool.closeSession(session.sessionId);
+      await Promise.resolve();
+      expect(onSessionClosed).not.toHaveBeenCalled();
+
+      worker.emit('exit', 0, null);
+      await pending;
+      expect(onSessionClosed).toHaveBeenCalledTimes(1);
+      expect(onSessionClosed).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: session.sessionId, status: 'closed' }),
+        { workerGeneration: 8, workerExitProven: true },
+      );
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('marks close migration unproven when only a killed worker reference remains', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-xpi-close-unproven-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-xpi-close-unproven');
+    const onSessionClosed = vi.fn(async () => undefined);
+    workerPool.initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(async () => true),
+      onSessionClosed,
+    });
+
+    try {
+      const session = sessionStore.createSession('oc_xpi_close', 'om_xpi_close', 'XPI close', 'group');
+      session.larkAppId = 'app-xpi-close-unproven';
+      session.workerGeneration = 9;
+      session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:synthetic';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = session.sessionId;
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: { killed: true, send: vi.fn(), kill: vi.fn() },
+        workerGeneration: 9,
+        larkAppId: 'app-xpi-close-unproven',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await workerPool.closeSession(session.sessionId);
+
+      expect(onSessionClosed).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: session.sessionId, status: 'closed' }),
+        { workerGeneration: 9, workerExitProven: false },
+      );
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('does not clean markers on the close-fence warning timer while the worker is still alive', async () => {
+    vi.useFakeTimers();
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-timeout-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence-timeout');
+
+    try {
+      const session = sessionStore.createSession(
+        'oc_close_fence_timeout',
+        'om_close_fence_timeout',
+        'close fence timeout',
+        'group',
+      );
+      session.larkAppId = 'app-close-fence-timeout';
+      sessionStore.updateSession(session);
+      const markerDir = join(dataDir, 'turn-sends');
+      const markerPath = join(markerDir, `${session.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(markerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'sent before slow close',
+      })}\n`);
+
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence-timeout',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      sessionStore.closeSession(session.sessionId);
+      expect(existsSync(markerPath)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(8_000);
+      expect(existsSync(markerPath)).toBe(true);
+
+      worker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('creates an independent fence when a repo switch reuses the DaemonSession for a new session generation', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-generation-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-fence-generation');
+
+    try {
+      const oldSession = sessionStore.createSession(
+        'oc_generation',
+        'om_generation_old',
+        'old generation',
+        'group',
+      );
+      oldSession.larkAppId = 'app-close-fence-generation';
+      oldSession.workerGeneration = 1;
+      sessionStore.updateSession(oldSession);
+      const newSession = sessionStore.createSession(
+        'oc_generation',
+        'om_generation_new',
+        'new generation',
+        'group',
+      );
+      newSession.larkAppId = 'app-close-fence-generation';
+      newSession.workerGeneration = 2;
+      sessionStore.updateSession(newSession);
+
+      const markerDir = join(dataDir, 'turn-sends');
+      const oldMarkerPath = join(markerDir, `${oldSession.sessionId}.jsonl`);
+      const newMarkerPath = join(markerDir, `${newSession.sessionId}.jsonl`);
+      mkdirSync(markerDir, { recursive: true });
+      writeFileSync(oldMarkerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'old generation send',
+      })}\n`);
+      writeFileSync(newMarkerPath, `${JSON.stringify({
+        sentAtMs: Date.now(),
+        previewText: 'new generation send',
+      })}\n`);
+
+      const oldWorker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const newWorker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+      });
+      const ds = {
+        session: oldSession,
+        worker: oldWorker,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-close-fence-generation',
+        chatId: oldSession.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        workerGeneration: 1,
+        initConfig: { backendType: 'pty' },
+      } as any;
+
+      workerPool.killWorker(ds);
+      expect(ds.worker).toBeNull();
+      sessionStore.closeSession(oldSession.sessionId);
+      expect(existsSync(oldMarkerPath)).toBe(true);
+
+      // Repo/card switch reuses the same DaemonSession object for a new
+      // Session + worker generation while the old worker close fence is still
+      // unresolved. The new close must NOT reuse the old fence: it needs a
+      // fence registered under newSession.sessionId, otherwise default
+      // sessionStore.closeSession() would unlink the new marker immediately.
+      ds.session = newSession;
+      ds.worker = newWorker;
+      ds.workerPort = 23456;
+      ds.workerGeneration = 2;
+
+      workerPool.killWorker(ds);
+      sessionStore.closeSession(newSession.sessionId);
+      expect(existsSync(oldMarkerPath)).toBe(true);
+      expect(existsSync(newMarkerPath)).toBe(true);
+
+      oldWorker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(oldMarkerPath)).toBe(false);
+      expect(existsSync(newMarkerPath)).toBe(true);
+
+      newWorker.emit('exit');
+      await Promise.resolve();
+      expect(existsSync(newMarkerPath)).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+});
+
+
+describe('closed live card lifecycle', () => {
+  it.each([
+    { name: 'tmux adopt', adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' } },
+    { name: 'zellij adopt', adoptedFrom: { source: 'zellij', cwd: '/repo' } },
+    { name: 'persisted adopt', persistedAdopt: true },
+    { name: 'Codex App adopt', existingAppServerEndpoint: 'ws://127.0.0.1:4500' },
+    { name: 'private bot config', privateCard: true },
+    { name: 'private clicked card', cardVisibility: 'private' as const },
+  ])('does not publish a closed card for $name', async scenario => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-card-boundary-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'app-close-card', privateCard: scenario.privateCard },
+    } as any);
+    const patch = vi.spyOn(larkClient, 'updateMessage').mockResolvedValue(undefined as any);
+    vi.spyOn(docSubsStore, 'listDocSubscriptionsForSession').mockReturnValue([]);
+    try {
+      const session = sessionStore.createSession('oc_card', 'om_root', 'card', 'group');
+      session.larkAppId = 'app-close-card';
+      session.workingDir = '/private/repo';
+      session.cliSessionId = 'private-cli-session';
+      session.existingAppServerEndpoint = scenario.existingAppServerEndpoint;
+      if (scenario.persistedAdopt) {
+        session.adoptedFrom = { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' } as any;
+      }
+      sessionStore.updateSession(session);
+      const ds = {
+        session, worker: null, larkAppId: 'app-close-card', chatId: 'oc_card',
+        chatType: 'group', scope: 'thread', streamCardId: 'om_live', hasHistory: true,
+        adoptedFrom: scenario.adoptedFrom,
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await expect(workerPool.closeSession(session.sessionId, {
+        cardVisibility: scenario.cardVisibility,
+      })).resolves.toMatchObject({ ok: true, outcome: 'closed' });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(active.has(activeSessionKey(ds))).toBe(false);
+      expect(patch).not.toHaveBeenCalled();
+      expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it.each(['claude-code', 'codex'])('serializes the closed card after in-flight output for %s', async cliId => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-card-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId, larkAppId: 'app-close-card' } } as any);
+    vi.spyOn(closedCard, 'buildClosedSessionCard').mockReturnValue('closed-card');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const patch = vi.spyOn(larkClient, 'updateMessage').mockImplementationOnce(() => gate as any).mockResolvedValue(undefined as any);
+    vi.spyOn(docSubsStore, 'listDocSubscriptionsForSession').mockReturnValue([]);
+    try {
+      const session = sessionStore.createSession('oc_card', 'om_root', 'card', 'group');
+      session.larkAppId = 'app-close-card'; session.cliId = cliId as any;
+      sessionStore.updateSession(session);
+      const ds = { session, worker: null, larkAppId: 'app-close-card', chatId: 'oc_card',
+        chatType: 'group', scope: 'thread', streamCardId: 'om_live', hasHistory: true } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+      expect(workerPool.scheduleCardPatch(ds, 'working-card')).toBe(true);
+      await workerPool.closeSession(session.sessionId);
+      expect(patch).toHaveBeenCalledTimes(1);
+      expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
+      release();
+      await vi.waitFor(() => expect(patch).toHaveBeenCalledTimes(2));
+      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card', { beforeWrite: expect.any(Function) });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+    } finally { release(); config.session.dataDir = previousDataDir; }
+  });
+});

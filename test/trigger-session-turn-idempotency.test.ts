@@ -1,0 +1,788 @@
+/**
+ * End-to-end tests for TURN-LEVEL idempotency (契約①, PR #71): a follow-up async
+ * turn on an EXISTING session, keyed by options.turnIdempotencyKey. Drives the
+ * REAL triggerSessionTurn deliverToExisting path against the REAL idempotency- +
+ * async-trigger-store (temp SESSION_DATA_DIR). Boundaries (lark / session-store /
+ * worker-pool) mocked so we can drive the worker-live (sendWorkerInput) and
+ * dormant (forkWorker) dispatch branches and assert the at-most-once lease.
+ *
+ * The turn lease is stored under the unforgeable `turn` store kind (codex #818
+ * P1-2 — a domain separator baked into the key digest, NOT a user-constructable
+ * string prefix) and reuses the same reserved→attempting barrier + per-triggerId
+ * worker-exit convergence as the fresh-session key.
+ *
+ * Run:  pnpm vitest run test/trigger-session-turn-idempotency.test.ts
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
+import { buildOrchestratorReportTrigger, deliverReportSessionRelay, retryAutomaticDispatchReport } from '../src/core/report-session-relay.js';
+import type { DaemonSession } from '../src/core/types.js';
+
+let tempDir: string;
+let prevDataDir: string | undefined;
+
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+vi.mock('../src/im/lark/client.js', () => ({
+  getMessageChatId: vi.fn(),
+  getChatMode: vi.fn(async () => 'group'),
+  sendMessage: vi.fn(async () => 'om_x'),
+  replyMessage: vi.fn(async () => 'om_x'),
+  listChatBotMembers: vi.fn(async () => []),
+}));
+
+const mockGetBot = vi.fn(() => ({ config: { cliId: 'codex-app', apiOnly: true } }));
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: (...a: any[]) => mockGetBot(...a),
+  effectiveDefaultWorkingDir: vi.fn(() => '/tmp'),
+}));
+
+vi.mock('../src/services/groups-store.js', () => ({ isInChat: vi.fn(async () => true) }));
+vi.mock('../src/services/oncall-store.js', () => ({ getOncallStatus: vi.fn(() => undefined) }));
+
+const existingRows: any[] = [];
+vi.mock('../src/services/session-store.js', () => ({
+  createSession: vi.fn(),
+  updateSession: vi.fn(),
+  getSession: vi.fn((id: string) => existingRows.find(s => s.sessionId === id)),
+  getOwnedSession: vi.fn((id: string) => existingRows.find(s => s.sessionId === id)),
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+}));
+
+vi.mock('../src/services/message-queue.js', () => ({ ensureQueue: vi.fn() }));
+vi.mock('../src/core/session-manager.js', () => ({
+  buildFollowUpContent: vi.fn((p: string) => p),
+  buildFollowUpCliInput: vi.fn((p: string) => ({ content: p })),
+  buildNewTopicPrompt: vi.fn((p: string) => p),
+  buildNewTopicCliInput: vi.fn((p: string) => ({ content: p })),
+  ensureSessionWhiteboard: vi.fn(),
+  getAvailableBots: vi.fn(async () => []),
+  rememberLastCliInput: vi.fn(),
+}));
+vi.mock('../src/services/default-worktree.js', () => ({ botAutoWorktreeEnabled: vi.fn(() => false) }));
+vi.mock('../src/im/lark/card-handler.js', () => ({ runAutoWorktreeCommit: vi.fn(async () => {}) }));
+
+// worker-pool: sendWorkerInput (worker-live) + forkWorker (dormant) are the two
+// dispatch side effects. Either can be made to throw/refuse on demand.
+let forkShouldThrow = false;
+let sendShouldRefuse = false;
+let queuedActivationGateActive = false;
+const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injected fork failure'); });
+const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
+const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
+vi.mock('../src/core/worker-pool.js', () => ({
+  forkWorker: (...a: any[]) => mockForkWorker(...a),
+  sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
+  getCurrentCliVersion: vi.fn(() => 'test'),
+  setActiveSessionIfActive: (map: Map<string, any>, key: string, ds: any) => { map.set(key, ds); return true; },
+  closeSession: (...a: any[]) => mockCloseSession(...a),
+  getDaemonBootId: () => 'boot-CURRENT',
+  withActiveSessionKeyLock: (_map: any, _key: string, action: () => any) => action(),
+  hasQueuedActivationAdmissionGate: () => queuedActivationGateActive,
+}));
+
+import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit } from '../src/core/trigger-session.js';
+import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
+import * as idempotencyStore from '../src/services/idempotency-store.js';
+import { sessionKey } from '../src/core/types.js';
+import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { config } from '../src/config.js';
+import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+
+const APP = 'local_riff';
+const SID = 'sess_existing';
+const CHAT = `http_async_${'0'.repeat(8)}-0000-0000-0000-000000000000`;
+
+function followUpReq(turnIdempotencyKey: string | undefined, instruction = 'follow up please'): TriggerRequest {
+  return {
+    source: { type: 'webhook', sourceName: 'riff' } as any,
+    target: { kind: 'turn', botId: APP, sessionId: SID },
+    envelope: { format: 'text', sourceName: 'riff', trusted: false },
+    instruction,
+    options: { asyncReturnSessionId: true, ...(turnIdempotencyKey ? { turnIdempotencyKey } : {}) },
+  };
+}
+
+function existingDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
+  const s = { sessionId: SID, chatId: CHAT, rootMessageId: '', scope: 'chat', status: 'active', createdAt: '2026-06-01T00:00:00.000Z' };
+  return {
+    session: s,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    larkAppId: APP,
+    chatId: CHAT,
+    chatType: 'group',
+    scope: 'chat',
+    spawnedAt: 1,
+    cliVersion: 'test',
+    lastMessageAt: 1,
+    hasHistory: true,
+    ...overrides,
+  } as DaemonSession;
+}
+
+/** activeSessions map holding one existing session keyed canonically. */
+function activeWith(ds: DaemonSession): Map<string, DaemonSession> {
+  return new Map<string, DaemonSession>([[sessionKey(CHAT, APP), ds]]);
+}
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), 'trig-turn-idem-'));
+  prevDataDir = process.env.SESSION_DATA_DIR;
+  process.env.SESSION_DATA_DIR = tempDir;
+  existingRows.length = 0;
+  existingRows.push({ sessionId: SID, chatId: CHAT, scope: 'chat', status: 'active' });
+  mockGetBot.mockImplementation(() => ({ config: { cliId: 'codex-app', apiOnly: true } }));
+  forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
+  mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
+  mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: true } });
+});
+afterEach(() => {
+  if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = prevDataDir;
+  rmSync(tempDir, { recursive: true, force: true });
+});
+
+describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () => {
+  it('first follow-up: sends once, writes a turn:<sid>:<key> attempting lease, echoes turnIdempotencyKey', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq('tk-1'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.idempotent).toBeFalsy();
+    expect(res.turnIdempotencyKey).toBe('tk-1');
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    // At-most-once: the keyed live-delivery MUST carry atMostOnce so a CLI crash
+    // never replays it onto the auto-restarted CLI after terminalization (the
+    // live-branch replay defect — the fresh-session/dormant paths use the fork
+    // init's atMostOnce, the live path needs it threaded through the message IPC).
+    expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
+    // Turn lease lives under the unforgeable `turn` store kind (codex #818 P1-2:
+    // NOT a user-constructable string prefix); key embeds sessionId.
+    const lease = idempotencyStore.lookup(APP, `${SID}\u0000tk-1`, 'turn');
+    expect(lease?.state).toBe('attempting'); // barrier crossed before send
+    expect(lease?.sessionId).toBe(SID);
+    // The idempotent-async-turn convergence entry is set per-triggerId (Map, not a
+    // single slot — codex #818 P1-1).
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)?.key).toBe(`${SID}\u0000tk-1`);
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)?.kind).toBe('turn');
+  });
+
+  it('same key + same payload retry: reuses in-flight turn, does NOT send again', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const first = await triggerSessionTurn(followUpReq('tk-2'), { larkAppId: APP, activeSessions: active });
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    // Retry while the worker is still live → resolveIdempotencyHit sees an
+    // attempting lease + liveWorker → reuse.
+    const second = await triggerSessionTurn(followUpReq('tk-2'), { larkAppId: APP, activeSessions: active });
+    expect(second.idempotent).toBe(true);
+    expect(second.triggerId).toBe(first.triggerId);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); // still ONE send
+  });
+
+  it('automatic report retries a lost HTTP response without dispatching a second lead turn', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    mockGetBot.mockReturnValue({ config: { cliId: 'claude-code', apiOnly: false } });
+    ds.chatId = ds.session.chatId = 'oc_lead';
+    ds.session.rootMessageId = 'om_lead';
+    existingRows[0].chatId = 'oc_lead';
+    ds.latestAsyncTriggerId = 'real-http-request';
+    const activeSessions = activeWith(ds);
+    const decision = { ok: true as const, source: { sessionId: 'sub', larkAppId: 'cli_sub' },
+      target: { sessionId: SID, larkAppId: APP }, dispatchRoot: 'om_dispatch',
+      sourceName: 'review', content: 'review result', projectUpdate: {} };
+    const key = 'zero-prompt:sub:turn-1';
+    const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
+    const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
+    expect(shape.ok).toBe(true);
+    let lost = true;
+    const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
+      const req = JSON.parse(init.body as string) as TriggerRequest;
+      const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+      expect(result.ok).toBe(true);
+      if (lost) { lost = false; throw new Error('response lost after acceptance'); }
+      expect(result.idempotent).toBe(true);
+      return { ok: true, status: 200, json: async () => result };
+    });
+    const work = retryAutomaticDispatchReport(async () => {
+      const response = await deliverReportSessionRelay({ decision, triggerMeta, fetchTarget,
+        postProjectUpdate: async () => ({ projectSynced: false }) });
+      expect(response.status).toBe(200);
+    });
+    await work;
+    expect(fetchTarget).toHaveBeenCalledTimes(2);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(ds.asyncTriggerResults).toBeUndefined();
+    expect(ds.latestAsyncTriggerId).toBe('real-http-request');
+    expect(asyncTriggerStore.lookup(SID)).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBe(true);
+  });
+
+  it('keeps explicit final suppression turn-scoped on an idempotent Lark follow-up', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    mockGetBot.mockReturnValue({ config: { cliId: 'claude-code', apiOnly: false } });
+    ds.chatId = ds.session.chatId = 'oc_lead';
+    existingRows[0].chatId = 'oc_lead';
+    const req = followUpReq('lark-suppressed');
+    req.options = { turnIdempotencyKey: 'lark-suppressed', suppressFinalOutput: true };
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(result.ok).toBe(true);
+    expect(ds.suppressedTriggerFinalTurns?.has(result.triggerId!)).toBe(true);
+    expect(ds.asyncTriggerResults).toBeUndefined();
+  });
+
+  it('same key + DIFFERENT payload → 409 idempotency_conflict, no second send', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    await triggerSessionTurn(followUpReq('tk-3', 'payload A'), { larkAppId: APP, activeSessions: active });
+    const conflict = await triggerSessionTurn(followUpReq('tk-3', 'payload B'), { larkAppId: APP, activeSessions: active });
+    expect(conflict.ok).toBe(false);
+    expect(conflict.errorCode).toBe('idempotency_conflict');
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('completed turn: same-key retry reuses (async-store completed wins over lease)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const first = await triggerSessionTurn(followUpReq('tk-done'), { larkAppId: APP, activeSessions: active });
+    // Simulate the turn completing (final_output path records completed).
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'the answer', Date.now(), APP);
+    const retry = await triggerSessionTurn(followUpReq('tk-done'), { larkAppId: APP, activeSessions: active });
+    expect(retry.idempotent).toBe(true);
+    expect(retry.triggerId).toBe(first.triggerId);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); // no re-dispatch
+  });
+
+  it('send REFUSED after barrier → durable failed(dispatch_unknown); same-key retry resolves terminal, no re-send', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    sendShouldRefuse = true;
+    const res = await triggerSessionTurn(followUpReq('tk-refuse'), { larkAppId: APP, activeSessions: active });
+    expect(res.ok).toBe(false);
+    expect(res.errorCode).toBe('trigger_failed');
+    // Authoritative durable failed so trigger-result converges (not stuck running).
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.status).toBe('failed');
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined(); // entry dropped after durable failed
+    // Retry: at-most-once — resolves the terminal, never re-sends.
+    sendShouldRefuse = false;
+    const sendsBefore = mockSendWorkerInput.mock.calls.length;
+    const retry = await triggerSessionTurn(followUpReq('tk-refuse'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockSendWorkerInput.mock.calls.length).toBe(sendsBefore); // no new send
+  });
+});
+
+describe('turn-level idempotency — worker DORMANT (forkWorker) branch', () => {
+  it('first follow-up on a dormant worker: forks once with atMostOnce+resume, attempting lease', async () => {
+    const ds = existingDs({ worker: null, hasHistory: true }); // dormant
+    const res = await triggerSessionTurn(followUpReq('tk-fork'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.turnIdempotencyKey).toBe('tk-fork');
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    const forkArg = mockForkWorker.mock.calls[0][2];
+    expect(forkArg.atMostOnce).toBe(true);   // at-most-once rides the fork init
+    expect(forkArg.resume).toBe(true);       // existing session resumes context
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-fork`, 'turn')?.state).toBe('attempting');
+  });
+
+  it('fork throw AFTER the barrier → durable failed(dispatch_unknown); retry does NOT re-fork', async () => {
+    const ds = existingDs({ worker: null, hasHistory: true });
+    const active = activeWith(ds);
+    forkShouldThrow = true;
+    const res = await triggerSessionTurn(followUpReq('tk-fthrow'), { larkAppId: APP, activeSessions: active });
+    expect(res.state).toBe('failed');
+    expect(res.errorCode).toBe('no_output');
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
+    forkShouldThrow = false;
+    const forksBefore = mockForkWorker.mock.calls.length;
+    const retry = await triggerSessionTurn(followUpReq('tk-fthrow'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(mockForkWorker.mock.calls.length).toBe(forksBefore); // no new fork
+  });
+});
+
+describe('turn-level idempotency — no key (unchanged behavior)', () => {
+  it('a follow-up WITHOUT turnIdempotencyKey dispatches normally and writes no lease', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq(undefined), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.turnIdempotencyKey).toBeUndefined();
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    // No key → a plain replayable input (atMostOnce must NOT be set, else an
+    // ordinary follow-up would be wrongly dropped on a CLI restart).
+    expect(mockSendWorkerInput.mock.calls[0][3]?.atMostOnce).toBeUndefined();
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // no lease, no convergence entry
+  });
+});
+
+describe('options.steer — HTTP native turn/steer authorization plumbing', () => {
+  function steerReq(): TriggerRequest {
+    const req = followUpReq(undefined, 'also handle X');
+    req.options = { asyncReturnSessionId: true, steer: true };
+    return req;
+  }
+
+  it('LIVE follow-up with steer=true forwards codexAppSteerable on sendWorkerInput and echoes steer', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBe(true);
+  });
+
+  it('follow-up WITHOUT steer never marks the input steerable (serial queue unchanged)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq(undefined, 'ordinary follow-up'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('DORMANT follow-up with steer=true marks the cold-resume root steerable on the fork payload', async () => {
+    // A follow-up that cold-resumes a dead worker becomes the new root turn; it
+    // must itself be steerable so a later steer can merge into IT.
+    const ds = existingDs({ worker: null, hasHistory: true });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    // The HTTP virtual prompt wrapper enriches the content; assert the payload
+    // SHAPE (object, not a bare string) + the flag + the instruction carried.
+    expect(typeof mockForkWorker.mock.calls[0][1]).toBe('object');
+    expect(mockForkWorker.mock.calls[0][1]).toMatchObject({ codexAppSteerable: true });
+    expect(mockForkWorker.mock.calls[0][1].content).toContain('also handle X');
+  });
+});
+
+// ── codex #818 review regressions: the structural at-most-once defects the
+//    first round missed, each pinned with the deterministic scenario codex gave.
+describe('turn-level idempotency — codex #818 P1 regressions', () => {
+  it('P1-1: two concurrent keyed turns on ONE session BOTH converge on worker exit (no lost stamp)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const a = await triggerSessionTurn(followUpReq('tk-A'), { larkAppId: APP, activeSessions: active });
+    const b = await triggerSessionTurn(followUpReq('tk-B'), { larkAppId: APP, activeSessions: active });
+    // Both stamps coexist (a single slot would have let B clobber A).
+    expect(ds.idempotentAsyncTurns?.size).toBe(2);
+    expect(ds.idempotentAsyncTurns?.get(a.triggerId!)).toBeDefined();
+    expect(ds.idempotentAsyncTurns?.get(b.triggerId!)).toBeDefined();
+    const gen = ds.idempotentAsyncTurns!.get(a.triggerId!)!.workerGeneration;
+    // Worker dies with neither completed → BOTH must converge to dispatch_unknown.
+    ds.worker = null;
+    const outcome = convergeIdempotentAsyncTurnOnWorkerExit(ds, gen);
+    expect(outcome).toBe('converged');
+    expect(asyncTriggerStore.lookup(SID, a.triggerId!)?.result.status).toBe('failed');
+    expect(asyncTriggerStore.lookup(SID, b.triggerId!)?.result.status).toBe('failed'); // NOT stranded pending
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0);
+  });
+
+  it('P1-2: a fresh idempotencyKey cannot collide with a turn key of the same string', async () => {
+    // Claim a turn lease under key "sess_existing<NUL>tk-collide".
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    await triggerSessionTurn(followUpReq('tk-collide'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    const turnLease = idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`, 'turn');
+    expect(turnLease?.state).toBe('attempting');
+    // The SAME string under the fresh (default) kind is a DIFFERENT file → absent.
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`)).toBeUndefined();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-collide`, 'fresh')).toBeUndefined();
+  });
+
+  it('P1-3: boot reconcile terminalizes a turn lease but NEVER closes the shared session', async () => {
+    // Seed an attempting TURN lease from a PREVIOUS boot (ownerBootId differs from
+    // the reconcile's currentBootId) on a still-live shared session.
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_prev',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-recon`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-recon`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-recon`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    mockCloseSession.mockClear();
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+    // The exact turn is terminalized (caller polls failed at-most-once)…
+    expect(asyncTriggerStore.lookup(SID, 'trg_prev')?.result.reason).toBe('dispatch_unknown');
+    // …but the SHARED session is NEVER closed or quarantined (fresh-session-only teardown).
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
+  it('P1-3b: boot reconcile preserves an interrupted turn lease and shared session', async () => {
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_interrupted',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-interrupted`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-interrupted`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-interrupted`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    asyncTriggerStore.recordInterruptedStrict(SID, 'trg_interrupted', 3, APP);
+    mockCloseSession.mockClear();
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+
+    expect(asyncTriggerStore.lookup(SID, 'trg_interrupted')?.result.status).toBe('interrupted');
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
+  it('P1-4: a keyed follow-up is refused RETRYABLY (no claim, no dispatch) while an activation gate is active', async () => {
+    queuedActivationGateActive = true; // opening activation still owns submission order
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq('tk-gated'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(false);
+    expect(res.errorCode).toBe('trigger_failed');
+    expect(res.error).toMatch(/activation in progress/i);
+    // Nothing claimed, nothing dispatched — the caller retries once the gate drains.
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-gated`, 'turn')).toBeUndefined();
+  });
+
+  it('P1-7 (live): a post-barrier beginAsyncTrigger throw terminalizes the lease; retry resolves failed, no reuse-forever', async () => {
+    // Inject a throw in beginAsyncTrigger (via its recordPending call) AFTER the
+    // reserved->attempting barrier. Without the unified post-barrier try this
+    // leaves lease=attempting + no convergence entry + no async record -> a
+    // same-key retry reuses it forever. The fix must durably terminalize here.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const res = await triggerSessionTurn(followUpReq('tk-pb'), { larkAppId: APP, activeSessions: active });
+    pSpy.mockRestore();
+    // Observable terminal (not a hang): the caller polls failed at-most-once.
+    expect(res.ok).toBe(false);
+    expect(res.state).toBe('failed');
+    expect(res.errorCode).toBe('no_output');
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); // nothing dispatched
+    // Durable terminal written; convergence entry dropped after the successful write.
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
+    // Same-key retry must NOT reuse-forever - it resolves the terminal, no dispatch.
+    const retry = await triggerSessionTurn(followUpReq('tk-pb'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('P1-7 (dormant): a post-barrier beginAsyncTrigger throw on the fork path terminalizes the lease too', async () => {
+    const ds = existingDs({ worker: null, hasHistory: true }); // dormant -> fork path
+    const active = activeWith(ds);
+    const pSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const res = await triggerSessionTurn(followUpReq('tk-pbd'), { larkAppId: APP, activeSessions: active });
+    pSpy.mockRestore();
+    expect(res.ok).toBe(false);
+    expect(res.state).toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled(); // fork never reached
+    expect(asyncTriggerStore.lookup(SID, res.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.get(res.triggerId!)).toBeUndefined();
+    const retry = await triggerSessionTurn(followUpReq('tk-pbd'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('P1-8 (double fault): post-barrier throw + terminalize throw → 5xx + flagged; retry re-terminalizes (no reuse-forever)', async () => {
+    // recordPending throws (post-barrier) AND recordFailedStrict throws in the SAME
+    // request → nothing dispatched, lease attempting, no durable result. For a LIVE
+    // shared worker the exit handler never fires, so without the postBarrierFault
+    // flag + retry re-terminalize, a same-key retry would `reuse` and hang forever.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-df'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore();
+    failSpy.mockRestore();
+    // Honest 5xx (no phantom terminal), lease kept attempting, entry flagged.
+    expect(first.ok).toBe(false);
+    expect(first.errorCode).toBe('trigger_failed');
+    expect(first.state).not.toBe('failed');
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    const entry = [...(ds.idempotentAsyncTurns?.values() ?? [])][0];
+    expect(entry?.postBarrierFault).toBe(true);
+    expect(idempotencyStore.lookup(APP, `${SID}\u0000tk-df`, 'turn')?.state).toBe('attempting');
+    // Store recovers → same-key retry re-attempts the strict terminalize and
+    // resolves an observable terminal, WITHOUT reusing/hanging or re-dispatching.
+    const retry = await triggerSessionTurn(followUpReq('tk-df'), { larkAppId: APP, activeSessions: active });
+    expect(retry.state).toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    // Durable terminal now exists; the fault entry is cleared.
+    expect(asyncTriggerStore.lookup(SID, retry.triggerId!)?.result.reason).toBe('dispatch_unknown');
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0);
+  });
+
+  it('P1-8 completed-wins race: a postBarrierFault turn that actually completed → retry REUSES completed, never terminalizes over it', async () => {
+    // First request double-faults → lease attempting + entry flagged, no dispatch.
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-race'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore(); failSpy.mockRestore();
+    const flagged = [...(ds.idempotentAsyncTurns?.values() ?? [])][0];
+    expect(flagged?.postBarrierFault).toBe(true);
+    // The turn ACTUALLY completed in the race window (a real durable owned completed
+    // lands on disk for this triggerId).
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'the real answer', Date.now(), APP);
+    // Same-key retry must REUSE the completed result — NOT terminalize over it as failed.
+    const retry = await triggerSessionTurn(followUpReq('tk-race'), { larkAppId: APP, activeSessions: active });
+    expect(retry.idempotent).toBe(true);
+    expect(retry.state).not.toBe('failed');           // completed wins over the fault
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result.status).toBe('completed'); // untouched
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // fault entry cleared
+    expect(mockSendWorkerInput).not.toHaveBeenCalled(); // never re-dispatched
+  });
+
+  it('P1-8 TOCTOU: completion landing AFTER pre-read but seen IN-LOCK → reuse completed, not failed', async () => {
+    // The tighter window codex flagged: the retry pre-read sees NOT-completed, but a
+    // completion lands before recordFailedStrict takes the lock. recordFailedStrict
+    // then returns `already_completed` (no-op, completed-wins) — the caller must
+    // resolve completed, NOT unconditionally return failed. We simulate the in-lock
+    // race by having recordFailedStrict itself write the completion then report
+    // already_completed (its real completed-wins behavior).
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const active = activeWith(ds);
+    const pendSpy = vi.spyOn(asyncTriggerStore, 'recordPending').mockImplementationOnce(() => { throw new Error('injected recordPending fault'); });
+    const failSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce(() => { throw new Error('injected recordFailedStrict fault'); });
+    const first = await triggerSessionTurn(followUpReq('tk-toctou'), { larkAppId: APP, activeSessions: active });
+    pendSpy.mockRestore(); failSpy.mockRestore();
+    expect([...(ds.idempotentAsyncTurns?.values() ?? [])][0]?.postBarrierFault).toBe(true);
+    // Pre-read will see NOT completed; but the NEXT recordFailedStrict call lands the
+    // completion under the lock and returns already_completed (real completed-wins).
+    const realRFS = asyncTriggerStore.recordFailedStrict;
+    const rfsSpy = vi.spyOn(asyncTriggerStore, 'recordFailedStrict').mockImplementationOnce((sid: any, tid: any) => {
+      asyncTriggerStore.recordCompleted(sid, tid, 'raced-in answer', Date.now(), APP);
+      return 'already_completed' as any; // mirrors the in-lock completed-wins no-op
+    });
+    const retry = await triggerSessionTurn(followUpReq('tk-toctou'), { larkAppId: APP, activeSessions: active });
+    rfsSpy.mockRestore();
+    // Completed wins: response must NOT be failed, and durable stays completed.
+    expect(retry.state).not.toBe('failed');
+    expect(retry.idempotent).toBe(true);
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result.status).toBe('completed');
+    expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    void realRFS;
+  });
+});
+
+
+describe('visible handoff dispatch to a reused session', () => {
+  it.each(['ordinary', 'async', 'suppressed', 'dormant'] as const)(
+    '%s dispatch commits the card using the actual worker input id', async mode => {
+      mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+      const chatId = 'oc_handoff';
+      const ds = existingDs({ chatId, worker: mode === 'dormant' ? null : { killed: false, send: vi.fn() } as any });
+      ds.session.chatId = chatId;
+      const req = followUpReq(undefined);
+      req.options = mode === 'async' ? { asyncReturnSessionId: true }
+        : mode === 'suppressed' ? { suppressFinalOutput: true } : undefined;
+      req.presentation = { liveCard: 'on-start', title: '接手任务' };
+      const res = await triggerSessionTurn(req, { larkAppId: APP,
+        activeSessions: new Map([[sessionKey(chatId, APP), ds]]) });
+      expect(res.ok).toBe(true);
+      const turnId = mode === 'dormant' ? mockForkWorker.mock.calls[0][2].turnId
+        : mockSendWorkerInput.mock.calls[0][2];
+      expect(turnId).toBe(res.triggerId);
+      const start = vi.fn();
+      expect(start).not.toHaveBeenCalled();
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(true);
+      expect(start).toHaveBeenCalledExactlyOnceWith(ds, '接手任务', turnId);
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(false);
+    });
+
+  it('gives an ordinary input a turn identity without enabling handoff presentation', async () => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_handoff', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_handoff';
+    const req = followUpReq(undefined); req.options = undefined;
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+    expect(res.ok).toBe(true);
+    expect(mockSendWorkerInput.mock.calls[0][2]).toBe(res.triggerId);
+    expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
+  });
+});
+
+describe('recovery thinking presentation', () => {
+  it('validates the explicit thinking option and retains normal requests', () => {
+    const req = followUpReq('presentation');
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: true } }).ok).toBe(false);
+  });
+
+  it('bounds restored hidden turns while recording the exact new worker input', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    ds.session.hiddenThinkingTurns = Array.from({ length: 256 }, (_, i) => `old_${i}`);
+    const req = followUpReq(undefined);
+    req.presentation = { thinking: 'hidden' };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toHaveLength(256);
+    expect(ds.session.hiddenThinkingTurns).not.toContain('old_0');
+    expect(ds.session.hiddenThinkingTurns.at(-1)).toBe(res.triggerId);
+    expect(mockSendWorkerInput.mock.calls.at(-1)?.[2]).toBe(res.triggerId);
+  });
+
+  it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
+    const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
+    const active = activeWith(ds);
+    const req = followUpReq('hidden-recovery'); req.presentation = { thinking: 'hidden' };
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    expect(ds.asyncTriggerResults?.has(first.triggerId!)).toBe(true);
+    const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(repeated.triggerId).toBe(first.triggerId);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    const normal = await triggerSessionTurn(followUpReq('normal'), { larkAppId: APP, activeSessions: active });
+    expect(normal.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
+    expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
+  });
+});
+
+
+describe('exact trigger presentation keeps the persisted reply destination', () => {
+  const cases = [true, false].flatMap(live => ['ordinary', 'wait', 'async'].flatMap(mode =>
+    ['live', 'hidden', 'both', 'suppressed', 'plain', 'default'].map(presentation => ({ live, mode, presentation }))));
+  it.each(cases)('$mode / $presentation / live=$live', async ({ live, mode, presentation }) => {
+    const nativeStore = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = tempDir;
+    nativeStore.init(APP);
+    vi.mocked(sessionStore.updateSession).mockImplementation(nativeStore.updateSession);
+    const ds = existingDs({ chatId: 'oc_shared', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = ds.chatId;
+    if (presentation !== 'plain') ds.session.currentReplyTarget = ds.currentReplyTarget = {
+      turnId: 'om_origin', rootMessageId: 'om_shared', updatedAt: new Date().toISOString(),
+    };
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const req = followUpReq(undefined);
+    req.options = mode === 'wait' ? { waitForFinalOutput: true } : mode === 'async' ? { asyncReturnSessionId: true } : {};
+    if (presentation !== 'default') req.presentation = presentation === 'hidden' ? { thinking: 'hidden' }
+      : presentation === 'both' ? { thinking: 'hidden', liveCard: 'on-start' } : { liveCard: 'on-start' };
+    if (presentation === 'suppressed') req.options.suppressFinalOutput = true;
+    try {
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+      if (mode === 'wait') {
+        await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+        for (const waiter of ds.pendingWaitPromises!.values()) waiter.resolve('HTTP result');
+      }
+      const result = await pending;
+      expect(result.ok).toBe(true);
+      const input = live ? mockSendWorkerInput.mock.calls[0][2] : mockForkWorker.mock.calls[0][2];
+      const turnId = typeof input === 'string' ? input : input?.turnId;
+      expect(turnId).toBe(result.triggerId);
+      const expected = presentation === 'plain' ? { mode: 'plain', chatId: ds.chatId }
+        : { mode: 'thread', rootMessageId: 'om_shared' };
+      expect(resolveSessionReplyTarget(ds, turnId)).toEqual(expected);
+      // Reopen SQLite to prove the standalone sender sees the same exact-turn anchor.
+      nativeStore.init(APP);
+      const persisted = nativeStore.getOwnedSession(ds.session.sessionId)!;
+      expect(persisted).toBeDefined();
+      expect(resolveSessionReplyTarget({ ...ds, currentReplyTarget: undefined, session: persisted }, turnId)).toEqual(expected);
+      expect(persisted.hiddenThinkingTurns?.includes(turnId)).toBe(['hidden', 'both'].includes(presentation) ? true : undefined);
+      expect(ds.suppressedTriggerFinalTurns?.has(turnId) === true).toBe(presentation === 'suppressed' && mode === 'ordinary');
+      if (mode === 'wait') expect(result.output?.content).toBe('HTTP result');
+      if (mode === 'async') expect(ds.asyncTriggerResults?.has(turnId)).toBe(true);
+    } finally {
+      vi.mocked(sessionStore.updateSession).mockReset();
+      nativeStore.init(APP, { owner: false });
+      config.session.dataDir = previousDir;
+    }
+  });
+});
+
+
+describe('async opt-in group messages', () => {
+  it.each(['codex-app', 'claude-code'].flatMap(cliId => [true, false].map(live => ({ cliId, live }))))('scopes permission to one $cliId turn with live=$live, retaining idempotency', async ({ cliId, live }) => {
+    mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('chat-on'); req.options!.allowChatMessages = true;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    if (!live) asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    const second = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(second.ok).toBe(true);
+    expect(second.idempotent).toBe(true);
+    expect(second.triggerId).toBe(first.triggerId);
+    const dispatch = live ? mockSendWorkerInput : mockForkWorker;
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(dispatch.mock.calls[0])).toContain('may call botmux send');
+    const normal = followUpReq('chat-default');
+    await triggerSessionTurn(normal, { larkAppId: APP, activeSessions: active });
+    expect(JSON.stringify(dispatch.mock.calls[1])).toContain('Do not call botmux send; do not post');
+    req.options!.allowChatMessages = false;
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+  });
+  it.each(['group', 'p2p', 'missing'])('revalidates a reserved takeover for %s', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', chatType: kind === 'p2p' ? 'p2p' : 'group' });
+    ds.session.chatId = 'oc_real';
+    const req = followUpReq('takeover'); req.options!.allowChatMessages = true;
+    const { turnIdempotencyKey: _key, ...options } = req.options!;
+    const requestHash = computeInputHash({ seam: 'turn', sessionId: SID, instruction: req.instruction,
+      envelope: req.envelope, source: req.source, presentation: null, options });
+    idempotencyStore.claim({ ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_old', requestHash,
+      ownerBootId: 'boot-OLD', key: `${SID}\u0000takeover`, now: 1, kind: 'turn' });
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(kind === 'group');
+    expect(mockForkWorker).toHaveBeenCalledTimes(kind === 'group' ? 1 : 0);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    if (kind !== 'group') expect(idempotencyStore.lookup(APP, `${SID}\u0000takeover`, 'turn')?.ownerBootId).toBe('boot-OLD');
+  });
+  it.each(['virtual', 'headless', 'apiOnly', 'p2p', 'missing', 'mismatched-chat', 'wrong-bot', 'steer', 'wait', 'non-async', 'wrong-kind', 'source-headless'])('rejects %s before dispatch', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : kind === 'headless' ? 'headless_test' : 'oc_real',
+      chatType: kind === 'p2p' ? 'p2p' : 'group', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('invalid'); req.options!.allowChatMessages = true;
+    if (kind === 'steer') req.options!.steer = true;
+    if (kind === 'wait') req.options!.waitForFinalOutput = true;
+    if (kind === 'non-async') req.options!.asyncReturnSessionId = false;
+    if (kind === 'wrong-kind') req.target.kind = 'card';
+    if (kind === 'source-headless') req.source.type = 'headless';
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});
+
+describe('completed turn retry after session leaves active map', () => {
+  it.each([false, true])('allowChatMessages=%s retains completed receipt', async allowChatMessages => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_real'; existingRows[0].chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('completed-retry'); req.options!.allowChatMessages = allowChatMessages;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    asyncTriggerStore.recordCompleted(SID, first.triggerId!, 'completed result', Date.now(), APP);
+    active.clear();
+    const retry = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(retry.ok).toBe(true);
+    expect(retry.idempotent).toBe(true);
+    expect(retry.triggerId).toBe(first.triggerId);
+    expect(asyncTriggerStore.lookup(SID, first.triggerId!)?.result).toMatchObject({ status: 'completed', content: 'completed result' });
+    const changed = { ...req, instruction: 'changed payload' };
+    expect((await triggerSessionTurn(changed, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+    const fresh = { ...req, options: { ...req.options, turnIdempotencyKey: 'new-key' } };
+    expect((await triggerSessionTurn(fresh, { larkAppId: APP, activeSessions: active })).ok).toBe(false);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});

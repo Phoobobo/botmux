@@ -19,56 +19,134 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Codex/Gemini/OpenCode): use plain sendText + Enter
+ * - Other adapters (Aiden/Gemini): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ * - Hermes: single pasteText with the whole content + delayed Enter. Its
+ *   prompt_toolkit composer handles a bracketed paste in one event, while the
+ *   old sendText burst's trailing Enter is swallowed by the 50ms anti-paste
+ *   guard on a cold start (opening prompt stranded until manual Enter).
+ * - OpenCode: short single-line prompts use sendText + Enter; multiline or
+ *   large prompts use pasteText + Enter so OpenTUI receives bracketed paste.
  *
  * Run:  pnpm vitest run test/write-input.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(() => ''),
-  execFileSync: vi.fn(),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execSync: vi.fn(() => ''),
+    // Bounded pid → open-file probes (utils/process-open-files) run lsof via
+    // execFileSync; mirror execSync's "ran fine, nothing open" stub.
+    execFileSync: vi.fn(() => ''),
+    // writeInput's coco/codex paths call execFile. Spreading the real builtin
+    // without stubbing it would spawn live CLIs and hang the file (measured).
+    execFile: vi.fn((...args: unknown[]) => {
+      const cb = args.find(a => typeof a === 'function') as ((...a: unknown[]) => void) | undefined;
+      if (cb) queueMicrotask(() => cb(null, '', ''));
+      return {};
+    }),
+    spawn: vi.fn(),
+    spawnSync: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+  };
+});
 
-vi.mock('node:fs', async () => {
-  const memfs = await import('memfs');
+// A synchronous `require`, NOT `await import()`. An `await import()` inside a mock
+// factory HANGS under `bun test`: the file emits no output at all and is eventually
+// killed, which looks like "0 tests collected" rather than an error — the most
+// dangerous shape of failure, since it reads as success. `require` resolves at the
+// same moment for both runners and does not deadlock.
+vi.mock('node:fs', () => {
+  const memfs = require('memfs') as typeof import('memfs');
   return memfs.fs;
 });
 
-import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
+import {
+  CLAUDE_INPUT_CHUNK_BYTES,
+  CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN,
+  chunkTextByUtf8Bytes,
+  createClaudeCodeAdapter,
+  extractMessageContentForFingerprint,
+  makeSubmitFingerprint,
+  sanitizeClaudeInput,
+} from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
+import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
+import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createRelayAdapter } from '../src/adapters/cli/relay.js';
+import { createSeedAdapter } from '../src/adapters/cli/seed.js';
+import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, PtyHandle } from '../src/adapters/cli/types.js';
 import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
+import { codexHistoryPath } from '../src/services/codex-paths.js';
+import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
+import * as codexTranscript from '../src/services/codex-transcript.js';
+
+// ── Speed: collapse the adapters' real-time submit waits ───────────────────
+// writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
+// history/transcript with real wall-clock budgets — ~0.5–3s per case across
+// 90+ tests, which made this the single slowest file in the whole suite.
+// BOTMUX_TIME_SCALE (read lazily by src/utils/timing.ts) shrinks every
+// delay/poll budget by this factor WITHOUT changing which branch the code
+// takes: memfs writes are synchronous, so the submit marker is already present
+// the instant the poll starts. The few tests that choreograph their OWN
+// real-time events (a transcript append fired on a timer) scale those delays by
+// TIME_SCALE as well, so the relative ordering against the (now shrunken) poll
+// budget is preserved.
+// Default to 0.1, but honor an externally-set BOTMUX_TIME_SCALE so the
+// benchmark (scripts/bench-tests.ts) can measure the un-scaled "before" timing
+// by exporting BOTMUX_TIME_SCALE=1. TIME_SCALE always reflects the *effective*
+// scale, so the choreographed delay below stays consistent with the adapter's
+// (equally scaled) confirm budget.
+process.env.BOTMUX_TIME_SCALE ??= '0.05';
+const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
+
+afterEach(() => {
+  // Bun's `runAllTimersAsync` can leave fake timers installed when a test
+  // times out before `finally`. A leftover fake clock then hangs every later
+  // `writeInput` poll in this file (measured: a cascade of 30s timeouts).
+  vi.useRealTimers();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const CODEX_HISTORY_PATH = join(homedir(), '.codex', 'history.jsonl');
 const COCO_HISTORY_PATH = platform() === 'darwin'
   ? join(homedir(), 'Library', 'Caches', 'coco', 'history.jsonl')
   : join(homedir(), '.cache', 'coco', 'history.jsonl');
+// traecli 0.201.5+ submit log (Codex-shaped {session_id, ts, text}), shared
+// with the traex adapter. coco's writeInput polls this IN ADDITION to the
+// legacy ~/.cache/coco/history.jsonl ({content, mode:"user"}) path.
+const TRAE_HISTORY_PATH = join(homedir(), '.trae', 'cli', 'history.jsonl');
 const CLAUDE_KEYBINDINGS_PATH = join(homedir(), '.claude', 'keybindings.json');
 
 function appendCodexHistory(content: string, sessionId?: string): void {
-  mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
-  appendFileSync(CODEX_HISTORY_PATH, JSON.stringify({ session_id: sessionId, text: content }) + '\n');
+  const path = codexHistoryPath();
+  mkdirSync(dirname(path), { recursive: true });
+  appendFileSync(path, JSON.stringify({ session_id: sessionId, text: content }) + '\n');
 }
 
 function resetCodexHistory(): void {
-  mkdirSync(dirname(CODEX_HISTORY_PATH), { recursive: true });
-  writeFileSync(CODEX_HISTORY_PATH, '');
+  const path = codexHistoryPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, '');
 }
 
 function appendCocoHistory(content: string): void {
@@ -79,6 +157,16 @@ function appendCocoHistory(content: string): void {
 function resetCocoHistory(): void {
   mkdirSync(dirname(COCO_HISTORY_PATH), { recursive: true });
   writeFileSync(COCO_HISTORY_PATH, '');
+}
+
+function appendTraeHistory(content: string, sessionId = 'coco-test-session'): void {
+  mkdirSync(dirname(TRAE_HISTORY_PATH), { recursive: true });
+  appendFileSync(TRAE_HISTORY_PATH, JSON.stringify({ session_id: sessionId, ts: Date.now(), text: content }) + '\n');
+}
+
+function resetTraeHistory(): void {
+  mkdirSync(dirname(TRAE_HISTORY_PATH), { recursive: true });
+  writeFileSync(TRAE_HISTORY_PATH, '');
 }
 
 function writeClaudeKeybindings(bindings: Record<string, string>): void {
@@ -127,17 +215,21 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, OpenCode, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS: its
+ *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
- *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
+ *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
+ *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
+ *  composer drains the send-keys burst together with the trailing Enter, and
+ *  Hermes' 50ms anti-paste window (#10994) then drops that Enter as a pasted
+ *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
-  ['opencode', createOpenCodeAdapter('/bin/opencode')],
+  ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
-  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
+const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
 /** Node runner adapters use a one-line base64 control protocol so multiline
  *  content cannot be split by terminal Enter semantics. */
 const APP_RUNNER_ADAPTERS: AdapterEntry[] = [
@@ -150,17 +242,24 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI and Codex. See coco.ts for the Trae 0.120.31
- *  burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
+ *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, Pi, and Hermes. See coco.ts for the
+ *  Trae 0.120.31 burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
- *  bracketed paste" note was true only for a much earlier build). */
+ *  bracketed paste" note was true only for a much earlier build).
+ *  Hermes: its prompt_toolkit composer's 50ms anti-paste guard (issue #10994)
+ *  eats the trailing Enter of the old send-keys burst on cold start, so the
+ *  opening prompt strands until a manual Enter; a single bracketed-paste
+ *  event keeps embedded newlines inert and submits reliably. */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
+  ['kimi', createKimiAdapter('/bin/kimi')],
+  ['pi', createPiAdapter('/bin/pi')],
+  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
- *  in non-tmux mode — claude-code and coco. */
+ *  in non-tmux mode. */
 const BRACKETED_PASTE_FALLBACK_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
@@ -170,6 +269,7 @@ const ALL_ADAPTERS: AdapterEntry[] = [
   ...HUMAN_TYPING_ADAPTERS,
   ...PASTE_BUFFER_ADAPTERS,
   ...PLAIN_ADAPTERS,
+  OPENCODE_ADAPTER,
   ...APP_RUNNER_ADAPTERS,
 ];
 
@@ -184,12 +284,21 @@ function decodeRunnerLine(line: string, prefix: string): any {
 // =========================================================================
 
 describe('writeInput: single-line, tmux mode', () => {
-  it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
+  it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, 'hello world');
     expect(pty.sendText).toHaveBeenCalledWith('hello world');
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['hermes', createHermesAdapter('/bin/hermes')],
+    ['pi', createPiAdapter('/bin/pi')],
+    ['mtr', createMtrAdapter('/bin/mtr')],
+  ] satisfies AdapterEntry[])('%s: returns undefined without authoritative submit evidence', async (_name, adapter) => {
+    const result = await adapter.writeInput(makeTmuxPty(), 'silent submit path');
+    expect(result).toBeUndefined();
   });
 
   it.each(PASTE_BUFFER_ADAPTERS)('%s: pasteText + delayed Enter, no sendText', async (_name, adapter) => {
@@ -211,7 +320,7 @@ describe('writeInput: single-line, tmux mode', () => {
 });
 
 describe('writeInput: single-line, non-tmux mode', () => {
-  it.each(PLAIN_ADAPTERS)('%s: write(content) + CR', async (_name, adapter) => {
+  it.each([...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: write(content) + CR', async (_name, adapter) => {
     const pty = makeRawPty();
     await adapter.writeInput(pty, 'hello world');
     const allWritten = pty.write.mock.calls.map(c => c[0]).join('');
@@ -239,11 +348,14 @@ describe('writeInput: single-line, non-tmux mode', () => {
 
 // =========================================================================
 // 2. Multiline content
-//    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
-//      string — the embedded \n stay content, only the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/OpenCode/MTR/Hermes): sendText with the
+//    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
+//      (pasteText) with the whole string — the embedded \n stay content, only
+//      the trailing Enter submits.
+//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
+//    - OpenCode: pasteText for multiline/large prompts so its TUI receives
+//      bracketed paste rather than slow literal key replay.
 // =========================================================================
 
 const MULTILINE = 'first line\n\nSession ID: abc-123';
@@ -253,6 +365,44 @@ describe('writeInput: multiline, tmux mode', () => {
     const pty = makeTmuxPty();
     await adapter.writeInput(pty, MULTILINE);
     expect(pty.sendText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: short single-line input uses sendText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, 'hello world');
+    expect(pty.sendText).toHaveBeenCalledWith('hello world');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: long single-line input uses pasteText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const input = 'x'.repeat(151);
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, input);
+    expect(pty.pasteText).toHaveBeenCalledWith(input);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: multiline input uses pasteText + Enter', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    expect(pty.sendText).not.toHaveBeenCalled();
+  });
+
+  it('opencode: slash commands keep sendText even when long or multiline', async () => {
+    const [, adapter] = OPENCODE_ADAPTER;
+    const input = `/help\n${'x'.repeat(151)}`;
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, input);
+    expect(pty.sendText).toHaveBeenCalledWith(input);
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
     expect(pty.pasteText).not.toHaveBeenCalled();
   });
@@ -305,6 +455,52 @@ describe('writeInput: multiline, tmux mode', () => {
     } finally {
       removeClaudeKeybindings();
     }
+  });
+
+  it('kiro-cli: sends multiline input with documented Ctrl+J soft newlines', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+    await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first line', 'Session ID: abc-123']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
+      ['C-j'],
+      ['C-j'],
+      ['Enter'],
+    ]);
+  });
+
+  it('kiro-cli: asks for /session-id only once per PTY', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeTmuxPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.sendText.mock.calls.map(c => c[0])).toEqual(['/session-id', 'first', 'second']);
+    expect(pty.sendSpecialKeys.mock.calls).toEqual([
+      ['Enter'],
+      ['Enter'],
+      ['Enter'],
+    ]);
+  });
+
+  it('kiro-cli: asks for /session-id once in raw PTY fallback', async () => {
+    const adapter = createKiroCliAdapter('/bin/kiro-cli');
+    const pty = makeRawPty();
+
+    await adapter.writeInput(pty, 'first');
+    await adapter.writeInput(pty, 'second');
+
+    expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+      '/session-id\r',
+      'first',
+      '\r',
+      'second',
+      '\r',
+    ]);
   });
 
   it('claude-code: fails before typing when only unsupported Cmd+Enter can submit', async () => {
@@ -451,6 +647,7 @@ describe('writeInput: multiline preserves unicode and session IDs', () => {
     expect(pty.pasteText).toHaveBeenCalledWith(followUp);
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
   });
+
 });
 
 // =========================================================================
@@ -470,8 +667,66 @@ describe('supportsTypeAhead flag', () => {
     expect(createCodexAdapter('/bin/codex').supportsTypeAhead).toBe(true);
   });
 
-  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex'))('%s: undefined (default behavior)', (_name, adapter) => {
+  it('genius: true (Claude-family queue accepts follow-up input after startup)', () => {
+    expect(createGeniusAdapter('/bin/genius').supportsTypeAhead).toBe(true);
+  });
+
+  it('pi: true (0.80.6+ Message Queue steers submit-while-busy; JSONL transcript boundary makes attribution correct)', () => {
+    expect(createPiAdapter('/bin/pi').supportsTypeAhead).toBe(true);
+  });
+
+  it('pi: exposes its busy line as the explicit busy marker', () => {
+    const adapter = createPiAdapter('/bin/pi');
+    // Pre-1.0 builds.
+    expect(adapter.busyPattern?.test('⠙ Working...')).toBe(true);
+    // Pi 1.3.0: spinner frame + bare `Working` in the editor's top border.
+    expect(adapter.busyPattern?.test(`── ⠴ Working ${'─'.repeat(40)}`)).toBe(true);
+    expect(adapter.busyPattern?.test(' ⠏ Working')).toBe(true);
+    expect(adapter.busyPattern?.test('已完成，等待下一条输入')).toBe(false);
+    expect(adapter.busyPattern?.test('Working through the implementation')).toBe(false);
+    expect(adapter.busyPattern?.test('── Working ──')).toBe(false);
+  });
+
+  it('pi: does not squash queued botmux turns (one card per Lark turn; steer merge reconciled by the bridge queue)', () => {
+    expect(createPiAdapter('/bin/pi').mergeQueuedInput).toBeUndefined();
+  });
+
+  it('non-pi type-ahead adapters do not squash queued botmux turns', () => {
+    expect(createClaudeCodeAdapter('/bin/claude').mergeQueuedInput).toBeUndefined();
+    expect(createCocoAdapter('/bin/coco').mergeQueuedInput).toBeUndefined();
+    expect(createCodexAdapter('/bin/codex').mergeQueuedInput).toBeUndefined();
+  });
+
+  it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
+  });
+
+  it('hermes: supportsTypeAhead undefined even though writeInput uses pasteText', () => {
+    // Hermes moved to PASTE_BUFFER_ADAPTERS (write mechanics) without opting
+    // into type-ahead: the adapter still relies on deferFirstPromptTimeoutUntilReady.
+    expect(createHermesAdapter('/bin/hermes').supportsTypeAhead).toBeUndefined();
+  });
+});
+
+describe('reliableTurnTerminal capability', () => {
+  it('is enabled only for the first transcript-backed meeting consumers', () => {
+    // Claude completion is derived from non-tool stop_reason / turn_duration
+    // JSONL markers, never from its prompt-looking screen-idle edge.
+    expect(createClaudeCodeAdapter('/bin/claude').reliableTurnTerminal).toBe(true);
+    expect(createCodexAdapter('/bin/codex').reliableTurnTerminal).toBe(true);
+    expect(createTraexAdapter('/bin/traex').reliableTurnTerminal).toBe(true);
+    expect(createGrokAdapter('/bin/grok').reliableTurnTerminal).toBe(true);
+    // Relay/Seed 是 Claude Code 的 fork，落盘 JSONL 与 Claude Code 同构（同样的
+    // `stop_reason:end_turn` + system 回合标记），兑现同一份 turn-terminal 契约，
+    // 故与 claude-code 一样 opt-in——让 relay/seed 系 bot 能当会议 agent。
+    expect(createRelayAdapter('/bin/relay').reliableTurnTerminal).toBe(true);
+    expect(createSeedAdapter('/bin/seed').reliableTurnTerminal).toBe(true);
+    expect(createCocoAdapter('/bin/coco').reliableTurnTerminal).toBeUndefined();
+    // Pi supports type-ahead but NOT reliableTurnTerminal: it holds no session
+    // fd (append short open/close) and a custom-terminate turn has no on-disk
+    // boundary, so it cannot make the always-on-disk end-of-turn promise
+    // durable delivery requires. Type-ahead does not need it (see pi.ts).
+    expect(createPiAdapter('/bin/pi').reliableTurnTerminal).toBeUndefined();
   });
 });
 
@@ -486,6 +741,181 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
+  // #1504 regression: exactly ONE Enter per write. A second Enter on a
+  // queued follow-up is Cursor's "steer" — it detaches a running shell tool
+  // into a background task whose completion later makes Cursor inject a
+  // synthetic "Briefly inform the user about the task result…" turn (the
+  // "auto-continue after final" symptom), and it races the follow-ups panel
+  // re-render (lost Enter → message parked at "enter steer"). Cursor submits a
+  // queued follow-up by itself at the turn boundary, so one Enter is enough.
+  it('cursor: submits with a single Enter in tmux (no follow-up steer)', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, 'queue this turn');
+      await flushFakeTimers();
+      await write;
+
+      expect(pty.sendText).toHaveBeenCalledWith('queue this turn');
+      expect(pty.sendSpecialKeys.mock.calls).toEqual([
+        ['Enter'],
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: submits with a single Enter in raw PTY mode (no follow-up steer)', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeRawPty();
+      const write = adapter.writeInput(pty, 'queue raw turn');
+      await flushFakeTimers();
+      await write;
+
+      expect(pty.write.mock.calls.map(c => c[0])).toEqual([
+        'queue raw turn',
+        '\r',
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: a multi-line type-ahead message still ends with exactly one Enter', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, '<botmux_routing>\nline two\n</botmux_routing>');
+      await flushFakeTimers();
+      await write;
+
+      // Soft newlines are C-j; the only Enter is the final submit.
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter')).toHaveLength(1);
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'C-j')).toHaveLength(2);
+      expect(pty.sendSpecialKeys.mock.calls[pty.sendSpecialKeys.mock.calls.length - 1]).toEqual(['Enter']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('kimi: settles only the first write for each backend instance', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createKimiAdapter('/bin/kimi');
+      const pty = makeTmuxPty();
+
+      const first = adapter.writeInput(pty, 'first');
+      expect(pty.pasteText).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(Math.round(250 * TIME_SCALE));
+      expect(pty.pasteText).toHaveBeenCalledOnce();
+      await flushFakeTimers();
+      await first;
+
+      const second = adapter.writeInput(pty, 'second');
+      expect(pty.pasteText).toHaveBeenCalledTimes(2);
+      await flushFakeTimers();
+      await second;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('kimi: treats a side-effecting false paste result as assume-issued', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pasted: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn((content: string) => {
+        pasted.push(content);
+        return false;
+      }),
+      sendSpecialKeys: vi.fn(),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pasted).toEqual([MULTILINE]);
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: treats a side-effecting false Enter result as assume-issued', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const submittedKeys: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendSpecialKeys: vi.fn((...keys: string[]) => {
+        submittedKeys.push(...keys);
+        return false;
+      }),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(submittedKeys).toEqual(['Enter']);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: sends large prompts through pasteText instead of argv-bound sendText', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pty = makeTmuxPty();
+    const content = 'routing-context\n' + 'x'.repeat(64 * 1024);
+
+    const result = await adapter.writeInput(pty, content);
+
+    expect(pty.pasteText).toHaveBeenCalledWith(content);
+    expect(pty.sendText).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: does not retry when paste transport throws after a side effect', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const pasted: string[] = [];
+    const pty = {
+      write: vi.fn(),
+      pasteText: vi.fn((content: string) => {
+        pasted.push(content);
+        throw new Error('confirmation timed out');
+      }),
+      sendSpecialKeys: vi.fn(),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(pasted).toEqual([MULTILINE]);
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(result).toBeUndefined();
+  });
+
+  it('kimi: raw PTY false writes remain assume-issued instead of clean non-submit', async () => {
+    const adapter = createKimiAdapter('/bin/kimi');
+    const writes: string[] = [];
+    const pty = {
+      write: vi.fn((data: string) => {
+        writes.push(data);
+        return false;
+      }),
+    } satisfies PtyHandle;
+
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(writes).toEqual([
+      `\x1b[200~${MULTILINE}\x1b[201~`,
+      '\r',
+    ]);
+    expect(pty.write).toHaveBeenCalledTimes(2);
+    expect(result).toBeUndefined();
+  });
+
   it('claude-code: image path in multiline still types via sendText', async () => {
     const pty = makeTmuxPty();
     const adapter = createClaudeCodeAdapter('/bin/claude');
@@ -494,6 +924,30 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendText).toHaveBeenCalledWith('check /tmp/a.png');
     expect(pty.sendText).toHaveBeenCalledWith('Session ID: x');
     expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+  });
+
+  it('claude-code: chunks one long Unicode line into paced UTF-8-safe sends', async () => {
+    const pty = makeTmuxPty();
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const content = `<user_message>${'中文🙂abc'.repeat(80)}</user_message>`;
+
+    await adapter.writeInput(pty, content);
+
+    const chunks = pty.sendText.mock.calls.map(call => call[0]);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.join('')).toBe(content);
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= CLAUDE_INPUT_CHUNK_BYTES)).toBe(true);
+    expect(pty.sendSpecialKeys).toHaveBeenLastCalledWith('Enter');
+    expect(pty.pasteText).not.toHaveBeenCalled();
+  });
+
+  it('chunkTextByUtf8Bytes never splits surrogate pairs and round-trips exactly', () => {
+    const content = '甲🙂e\u0301乙🚀'.repeat(20);
+    const chunks = chunkTextByUtf8Bytes(content, 11);
+    expect(chunks.join('')).toBe(content);
+    expect(chunks.every(chunk => Buffer.byteLength(chunk, 'utf8') <= 11)).toBe(true);
+    expect(chunks.every(chunk => !/[\uD800-\uDBFF]$/.test(chunk))).toBe(true);
+    expect(chunks.every(chunk => !/^[\uDC00-\uDFFF]/.test(chunk))).toBe(true);
   });
 });
 
@@ -767,42 +1221,56 @@ describe('claude-code writeInput submission confirmation', () => {
   });
 
   it('pid resolver: polls rotated JSONL from its own baseline when append follows pid update', async () => {
-    const cwd = '/tmp/pid-resolver-rotate-delayed';
-    const startSessionId = '99999999-9999-4999-8999-999999999999';
-    const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-    const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
-    const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
-    // Make the starting transcript larger than the rotated one. A stale
-    // baseByte from startPath would otherwise hide the delayed append.
-    writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
-    writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
+    // Keep the intended 800ms → 850ms ordering deterministic under full-suite
+    // CPU pressure. With scaled real timers the gap is only 2.5ms, so the
+    // shared event loop can cross the tiny observation window before running
+    // the append callback and make this synchronous memfs test flaky.
+    vi.useFakeTimers();
+    try {
+      const cwd = '/tmp/pid-resolver-rotate-delayed';
+      const startSessionId = '99999999-9999-4999-8999-999999999999';
+      const rotatedSessionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+      const startPath = makeJsonlForSession('pid-resolver-rotate-delayed', startSessionId, cwd);
+      const rotatedPath = makeJsonlForSession('pid-resolver-rotate-delayed', rotatedSessionId, cwd);
+      // Make the starting transcript larger than the rotated one. A stale
+      // baseByte from startPath would otherwise hide the delayed append.
+      writeFileSync(startPath, `${'x'.repeat(4096)}\n`);
+      writeClaudePidFile(12345, { sessionId: startSessionId, cwd });
 
-    const adapter = createClaudeCodeAdapter('/bin/claude');
-    let scheduledAppend = false;
-    const pty: PtyHandle = {
-      claudeJsonlPath: startPath,
-      cliPid: 12345,
-      cliCwd: cwd,
-      write: vi.fn(),
-      sendText: vi.fn(),
-      sendSpecialKeys: vi.fn((key: string) => {
-        if (key !== 'Enter' || scheduledAppend) return;
-        scheduledAppend = true;
-        writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
-        setTimeout(() => {
-          appendFileSync(
-            rotatedPath,
-            JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
-          );
-        }, 850);
-      }),
-    };
+      const adapter = createClaudeCodeAdapter('/bin/claude');
+      let scheduledAppend = false;
+      const pty: PtyHandle = {
+        claudeJsonlPath: startPath,
+        cliPid: 12345,
+        cliCwd: cwd,
+        write: vi.fn(),
+        sendText: vi.fn(),
+        sendSpecialKeys: vi.fn((key: string) => {
+          if (key !== 'Enter' || scheduledAppend) return;
+          scheduledAppend = true;
+          writeClaudePidFile(12345, { sessionId: rotatedSessionId, cwd });
+          // Scaled to match the adapter's (now BOTMUX_TIME_SCALE-shrunken)
+          // confirm budget. The append deliberately follows the first 800ms
+          // poll, then lands inside the rotated-path poll window.
+          setTimeout(() => {
+            appendFileSync(
+              rotatedPath,
+              JSON.stringify({ type: 'user', message: { role: 'user', content: 'delayed append after pid rotate' } }) + '\n',
+            );
+          }, 850 * TIME_SCALE);
+        }),
+      };
 
-    const result = await adapter.writeInput(pty, 'delayed append after pid rotate');
+      const resultPromise = adapter.writeInput(pty, 'delayed append after pid rotate');
+      await flushFakeTimers();
+      const result = await resultPromise;
 
-    expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
-    expect(pty.claudeJsonlPath).toBe(rotatedPath);
-    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+      expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
+      expect(pty.claudeJsonlPath).toBe(rotatedPath);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('pid resolver: missing pid file → falls back to fingerprint search', async () => {
@@ -864,18 +1332,497 @@ describe('claude-code writeInput submission confirmation', () => {
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
   });
+
+  it('extractMessageContentForFingerprint strips envelopes and metadata to isolate user payload', () => {
+    const prompt = `<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>
+
+<user_message>
+[用户引用了消息 用 botmux quoted om_123456 查看]
+[来自 协作Bot 的 @mention]
+19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。
+</user_message>`;
+
+    const payload = extractMessageContentForFingerprint(prompt);
+    expect(payload).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。');
+
+    const fp = makeSubmitFingerprint(prompt, 30);
+    expect(fp).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。'.substring(0, 30));
+    expect(fp).not.toContain('botmux_reminder');
+  });
+
+  it('extractMessageContentForFingerprint strips English metadata headers and hook mode context blocks', () => {
+    // English metadata headers
+    const enPrompt = `<user_message>
+[@mention from ReviewerBot]
+[User quoted a message — run \`botmux quoted om_123456\` to view it]
+Please review this implementation.
+</user_message>`;
+    expect(extractMessageContentForFingerprint(enPrompt)).toBe('Please review this implementation.');
+
+    // Hook mode context blocks (no <user_message> wrapper)
+    const hookPrompt = `<role context="group" chat_id="oc_123">Software Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<whiteboard id="wb_123" hint="whiteboard">
+Active whiteboard content
+</whiteboard>
+
+<chat_context_policy>Group chat context policy</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted">
+  <name>Project Group</name>
+</chat_context>
+
+<botmux_lark_tool>
+  lark-cli defaults to the current bot.
+</botmux_lark_tool>
+
+Fix the test suite failure on CI
+
+<sender type="user" id="ou_123" />
+<attachments hint="attachments">test.log</attachments>`;
+
+    const hookPayload = extractMessageContentForFingerprint(hookPrompt);
+    expect(hookPayload).toBe('Fix the test suite failure on CI');
+    expect(hookPayload).not.toContain('summary_memory');
+    expect(hookPayload).not.toContain('chat_context');
+    expect(hookPayload).not.toContain('whiteboard');
+    expect(hookPayload).not.toContain('attachments');
+    expect(hookPayload).not.toContain('botmux_lark_tool');
+
+    // ReDoS safety on unclosed <user_message>
+    const unclosed = '<user_message>'.repeat(3000) + 'safe content';
+    const t0 = Date.now();
+    const res = extractMessageContentForFingerprint(unclosed);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(100);
+    expect(res).toContain('safe content');
+  });
+
+  it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {
+    // An unclosed recognized open tag must NOT make the scanner give up: later,
+    // independent well-formed blocks are still stripped (a naive "break on
+    // missing close tag" would wrongly keep the attachments block).
+    const unclosedThenBlock =
+      '<summary_memory>unclosed head <attachments hint="x">attached</attachments>\nReal user prompt';
+    expect(extractMessageContentForFingerprint(unclosedThenBlock)).toBe(
+      '<summary_memory>unclosed head \nReal user prompt',
+    );
+
+    // Repeated recognized open tags without close tags: dead-tag short-circuit
+    // keeps the scan linear (old scanner did an indexOf-to-tail per occurrence,
+    // ~3s at 80k repeats). Payload after the soup is preserved.
+    const openTagSoup = '<summary_memory>x'.repeat(80000) + '\nReal user prompt';
+    let t0 = Date.now();
+    const soupRes = extractMessageContentForFingerprint(openTagSoup);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(soupRes).toContain('Real user prompt');
+
+    // A long run of bare '<' followed by a single delimiter: '<' terminates the
+    // tag-name scan so each '<' costs O(1) (old scanner: ~18s at 120k '<').
+    const angleRun = '<'.repeat(120000) + ' > payload';
+    t0 = Date.now();
+    extractMessageContentForFingerprint(angleRun);
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('extractMessageContentForFingerprint fingerprint begins at user payload over well-formed hook blocks', () => {
+    // Realistic opening/follow-up hook-mode PTY shape: attributed/self-closing
+    // pre-user blocks, mixed with an unclosed-tag-in-payload edge, then payload.
+    const ptyText = `<role context="group">Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<chat_context_policy>policy text</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted" fetch_status="ok">
+  <name>Review group</name>
+</chat_context>
+
+Fix the failing test now
+<sender type="user" open_id="ou_x" />`;
+    expect(extractMessageContentForFingerprint(ptyText)).toBe('Fix the failing test now');
+  });
+
+  it('makeSubmitFingerprint generates distinct fingerprints for prompts with identical botmux_reminder envelopes', () => {
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>First user instruction for session A</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Second user instruction for session B</user_message>`;
+
+    const fpA = makeSubmitFingerprint(promptA);
+    const fpB = makeSubmitFingerprint(promptB);
+
+    expect(fpA).not.toBe(fpB);
+    expect(fpA).toContain('First user instruction');
+    expect(fpB).toContain('Second user instruction');
+  });
+
+  it('makeSubmitFingerprint sanitizes invisible characters and CRLF to match normalized jsonl content', () => {
+    const raw = '<user_message>clean\u200B line one\r\nsecond\uFEFF line</user_message>';
+    const fp = makeSubmitFingerprint(raw, 30);
+    expect(fp).toBeDefined();
+    expect(fp).not.toContain('\u200B');
+    expect(fp).not.toContain('\uFEFF');
+    expect(fp).not.toContain('\r');
+    expect(fp).toContain('clean line one');
+  });
+
+  it('writeInput sanitizes CRLF and invisible characters before typing into tmux pane', async () => {
+    const cwd = '/tmp/sanitized-input';
+    const sessionId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const path = makeJsonlForSession('sanitized-input', sessionId, cwd);
+    writeClaudePidFile(44444, { sessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const sentChunks: string[] = [];
+    const pty: PtyHandle = {
+      claudeJsonlPath: path,
+      cliPid: 44444,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn((chunk: string) => {
+        sentChunks.push(chunk);
+      }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'Enter') {
+          appendFileSync(
+            path,
+            JSON.stringify({ type: 'user', message: { role: 'user', content: 'clean line 1\nclean line 2' } }) + '\n',
+          );
+        }
+      }),
+    };
+
+    // Prompt contains Windows CRLF (\r\n) and invisible zero-width space (\u200B) and BOM (\uFEFF)
+    const rawContent = 'clean\u200B line 1\r\nclean\uFEFF line 2';
+    const result = await adapter.writeInput(pty, rawContent);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: sessionId });
+    // Verify no \r was sent via sendText
+    for (const chunk of sentChunks) {
+      expect(chunk).not.toContain('\r');
+      expect(chunk).not.toContain('\u200B');
+      expect(chunk).not.toContain('\uFEFF');
+    }
+  });
+
+  it('writeInput confirms submit via fingerprint when prompt contains zero-width characters in first 30 chars', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('sanitized-fp-rotation');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+
+    // Raw prompt has zero-width space inside the first 30 chars of payload
+    const rawPrompt = '<user_message>clean\u200B prefix payload line</user_message>';
+    const sanitizedPrompt = sanitizeClaudeInput(rawPrompt);
+
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 98765, // No pid file -> falls back to fingerprint search
+      cliCwd: '/tmp/sanitized-fp-cwd',
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        // Claude writes sanitized content into newPath
+        writeFileSync(
+          newPath,
+          JSON.stringify({
+            type: 'user',
+            timestamp: new Date().toISOString(),
+            message: { role: 'user', content: sanitizedPrompt },
+          }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, rawPrompt);
+    expect(result).toBeUndefined();
+    // Successfully confirmed via fingerprint and repointed claudeJsonlPath to newPath
+    expect(pty.claudeJsonlPath).toBe(newPath);
+  });
+
+  it('writeInput fallback fingerprint search does not match sibling session for short inputs (< 10 chars)', async () => {
+    const cwd = '/tmp/sibling-short-nomatch';
+    const sidA = '11111111-aaaa-4aaa-8aaa-111111111111';
+    const sidB = '22222222-bbbb-4bbb-8bbb-222222222222';
+    const pathA = makeJsonlForSession('sibling-short-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-short-nomatch', sidB, cwd);
+
+    const shortPrompt = '<user_message>ok</user_message>';
+
+    // Sibling session B recently logged "ok"
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: 'ok' },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(), // Simulate swallowed Enter -> no write to pathA
+    };
+
+    const result = await adapter.writeInput(pty, shortPrompt);
+
+    // Because fingerprint is shorter than CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN (10),
+    // it must NOT hijack sibling session B's pathB!
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.claudeJsonlPath).toBe(pathA);
+  });
+
+  it('writeInput does not false-match sibling session JSONL sharing the same botmux_reminder envelope', async () => {
+    const cwd = '/tmp/sibling-jsonl-nomatch';
+    const sidA = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const sidB = 'bbbbbbbb-2222-4222-8222-222222222222';
+    const pathA = makeJsonlForSession('sibling-jsonl-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-jsonl-nomatch', sidB, cwd);
+
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>Session A specific prompt text</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Session B specific prompt text</user_message>`;
+
+    // Sibling session B recently logged its own turn with the same reminder envelope
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: promptB },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let enterCount = 0;
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        enterCount++;
+        // Enter 1 & 2 are soft-newlines during typing (promptA has 2 newlines).
+        // Enter 3 is the initial submit Enter (simulates review barrier / swallowed Enter -> no write to pathA).
+        // Enter 4 is retry submit Enter -> Claude logs the submit to pathA.
+        if (enterCount >= 4) {
+          appendFileSync(
+            pathA,
+            JSON.stringify({
+              type: 'user',
+              timestamp: new Date().toISOString(),
+              message: { role: 'user', content: promptA },
+            }) + '\n',
+          );
+        }
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, promptA);
+
+    // It should NOT match pathB on the first submit Enter.
+    // It must retry Enter and succeed on pathA on the second submit Enter.
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(pathA);
+    expect(enterCount).toBe(4);
+  });
+});
+
+describe('genius writeInput submission confirmation', () => {
+  function makeGeniusJsonlForSession(sessionId: string, cwd: string): string {
+    const projectHash = cwd.replace(/[^A-Za-z0-9-]/g, '-');
+    const projectDir = join(homedir(), '.genius', 'projects', projectHash);
+    mkdirSync(projectDir, { recursive: true });
+    const path = join(projectDir, `${sessionId}.jsonl`);
+    writeFileSync(path, '');
+    return path;
+  }
+
+  it('accepts queue-operation enqueue as a confirmed type-ahead submit', async () => {
+    const cwd = '/tmp/genius-queue-submit';
+    const sessionId = 'genius-queue-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'queued while busy' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toBeUndefined();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not confirm a queue-operation enqueue for different content', async () => {
+    const cwd = '/tmp/genius-queue-mismatch';
+    const sessionId = 'genius-queue-mismatch-session';
+    const transcriptPath = makeGeniusJsonlForSession(sessionId, cwd);
+    const adapter = createGeniusAdapter('/bin/genius');
+    let appended = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: transcriptPath,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || appended) return;
+        appended = true;
+        appendFileSync(
+          transcriptPath,
+          JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: 'another prompt' }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'queued while busy');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect((result as any).recheck()).toBe(false);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+  });
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('uses live footer identity for consecutive messages without adding any status command', async () => {
+    resetCodexHistory();
+    let sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const other = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const sendText = vi.fn();
+    const keys: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), sendText,
+      captureCurrentScreen: vi.fn(() => ''),
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      pasteText(text) { pasted = text; },
+      sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    sid = other;
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
+    expect(keys).toEqual(['Enter', 'Enter']);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
+  });
+
+  it('confirms daemon-backed tmux input against its live footer, rejecting another pane with identical text', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const calls: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write() { throw new Error('Unexpected raw write'); },
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      sendText(text) { calls.push(text); },
+      sendSpecialKeys(key) {
+        calls.push(key);
+        appendCodexHistory(pasted, foreign);
+        appendCodexHistory(pasted, sid);
+      },
+      pasteText(text) { pasted = text; calls.push('paste:' + text); },
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+    expect(calls).toEqual(['paste:hi', 'Enter']);
+    expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
+  });
+
+  it('submits without a footer ID and confirms the owned history', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    const owned = new Set<string>();
+    const ownership = vi.spyOn(codexTranscript, 'findCodexRolloutSetByPid').mockReturnValue(owned);
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => {
+        owned.add(sid);
+        appendCodexHistory('hi', foreign);
+        appendCodexHistory('hi', sid);
+      }),
+      captureInputState: vi.fn(() => ({
+        viewport: '\n» Ask Codex to do anything\n\n  gpt-6-astra ultra · ~/work · Main [default]',
+        cursor: { x: 2, y: 1 },
+      })),
+    };
+    try {
+      const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+      expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
+      expect(pty.captureInputState).toHaveBeenCalledTimes(1);
+      expect(pty.write).not.toHaveBeenCalled();
+      expect(pty.pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+      expect(pty.sendText).not.toHaveBeenCalled();
+      expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    } finally {
+      ownership.mockRestore();
+    }
+  });
+
+  it('writes without a terminal snapshot and confirms history without ownership proof', async () => {
+    resetCodexHistory();
+    const pasteText = vi.fn();
+    const sendText = vi.fn();
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), pasteText, sendText,
+      sendSpecialKeys: vi.fn(() => appendCodexHistory('hi', 'foreign-session')),
+      captureCurrentScreen: () => '', captureInputState: () => null,
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    // The unproven id is only a candidate, never the session.
+    expect(result).toEqual({ submitted: true, unprovenCliSessionId: 'foreign-session' });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pasteText).toHaveBeenCalledExactlyOnceWith('hi');
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+  });
+
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     })).toEqual([
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
@@ -888,11 +1835,18 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
       workingDir: '/repo/root',
     })).toEqual([
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
@@ -907,7 +1861,13 @@ describe('codex writeInput submission confirmation', () => {
     appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
@@ -915,13 +1875,51 @@ describe('codex writeInput submission confirmation', () => {
     ]);
   });
 
+  it('honors CODEX_HOME for resume fallback and submit confirmation', async () => {
+    const prevCodexHome = process.env.CODEX_HOME;
+    const customHome = join(homedir(), '.codex-botmux-test-home');
+    process.env.CODEX_HOME = customHome;
+    try {
+      resetCodexHistory();
+      appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
+      const adapter = createCodexAdapter('/bin/codex');
+      expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
+        '-c',
+        'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
+        '-c',
+        'check_for_update_on_startup=false',
+        '-c',
+        'notice.hide_rate_limit_model_nudge=true',
+        'resume',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--no-alt-screen',
+        'custom-codex-session',
+      ]);
+
+      resetCodexHistory();
+      const pty = makeTmuxPty({ codexSessionId: 'custom-submit-session' });
+      const result = await adapter.writeInput(pty, MULTILINE);
+      expect(result).toEqual({ submitted: true, cliSessionId: 'custom-submit-session' });
+    } finally {
+      if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prevCodexHome;
+      try { rmSync(customHome, { recursive: true, force: true }); } catch { /* memfs / absent */ }
+    }
+  });
+
   it('buildArgs starts fresh when resume has no known Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
     ]);
   });
 
@@ -930,12 +1928,21 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       workingDir: '/repo/root',
     })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
+      '-c',
+      'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);
@@ -947,7 +1954,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    expect(result).toBeUndefined();
+    expect(result).toEqual({ submitted: true });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
@@ -963,6 +1970,66 @@ describe('codex writeInput submission confirmation', () => {
     expect(result).toEqual({ submitted: true, cliSessionId: 'codex-thread-1' });
   });
 
+  it('ignores same-prefix history decoys and returns the exact submitted thread id', async () => {
+    resetCodexHistory();
+    const content = 'shared-prefix '.repeat(4) + 'actual submitted tail';
+    const decoy = content.slice(0, 40) + ' different tail from another codex';
+    let submittedText = '';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendCodexHistory(decoy, 'decoy-thread');
+        appendCodexHistory(submittedText, 'actual-thread');
+      }),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, content);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'actual-thread' });
+  });
+
+  it('matches JSON-decoded escaped text from history.jsonl', async () => {
+    resetCodexHistory();
+    const content = '<user_message>\n包含 <tag> & emoji ✅\n</user_message>';
+    let submittedText = '';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        const escaped = submittedText
+          .replace(/</g, '\\u003c')
+          .replace(/>/g, '\\u003e')
+          .replace(/&/g, '\\u0026');
+        appendFileSync(codexHistoryPath(), `{"session_id":"escaped-thread","text":"${escaped.replace(/\n/g, '\\n')}"}` + '\n');
+      }),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, content);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'escaped-thread' });
+  });
+
+  it('matches history text after CRLF normalization without falling back to prefix-only', async () => {
+    resetCodexHistory();
+    const content = 'first line\r\nsecond line\r\nthird line';
+    let submittedText = '';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { submittedText = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendCodexHistory(submittedText.replace(/\r\n/g, '\n'), 'normalised-thread');
+      }),
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, content);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: 'normalised-thread' });
+  });
+
   it('retries Enter and reports failure when history.jsonl never records the prompt', async () => {
     resetCodexHistory();
     const pty = makeTmuxPty({ confirmCodexSubmit: false });
@@ -975,9 +2042,29 @@ describe('codex writeInput submission confirmation', () => {
     // before any append it must report the submit still missing.
     expect(typeof (result as any)?.recheck).toBe('function');
     expect((result as any).recheck()).toBe(false);
+    appendCodexHistory(MULTILINE, 'late-codex-thread');
+    expect((result as any).recheck()).toEqual({ submitted: true, cliSessionId: 'late-codex-thread' });
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
     expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(4);
+  });
+
+  it('does not crash and reports failure when history.jsonl is absent', async () => {
+    // Codex has no fresh-install short-wait branch like CoCo. When
+    // history.jsonl does not exist at submit time, currentFileSize returns 0
+    // and waitForHistoryAppend polls until the budget expires, then retries
+    // Enter and finally surfaces { submitted: false, recheck } — it must NOT
+    // throw or silently return undefined (which would let a missing submit
+    // look like a confirmed one).
+    const { rmSync } = await import('node:fs');
+    try { rmSync(codexHistoryPath()); } catch { /* may not exist */ }
+    const pty = makeTmuxPty({ confirmCodexSubmit: false });
+    const adapter = createCodexAdapter('/bin/codex');
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
+    expect((result as any).recheck()).toBe(false);
   });
 });
 
@@ -988,8 +2075,12 @@ describe('coco writeInput submission confirmation', () => {
   // The mock records the last-pasted text and, on the first Enter (when
   // configured to confirm), writes a coco-shaped history line with that
   // content so the adapter's prefix-match path can succeed.
-  function makeCocoPasteTmuxPty(opts?: { confirmCocoSubmit?: boolean }) {
+  function makeCocoPasteTmuxPty(opts?: { confirmCocoSubmit?: boolean; historyTarget?: 'legacy' | 'trae' }) {
     const confirmCocoSubmit = opts?.confirmCocoSubmit ?? true;
+    // 'legacy' → ~/.cache/coco/history.jsonl ({content,mode:"user"}); 'trae' →
+    // ~/.trae/cli/history.jsonl ({session_id,ts,text}) — the two formats coco's
+    // dual-path confirmation must accept.
+    const historyTarget = opts?.historyTarget ?? 'legacy';
     let lastPasted = '';
     let submittedOnce = false;
     return {
@@ -999,7 +2090,8 @@ describe('coco writeInput submission confirmation', () => {
         if (key !== 'Enter') return;
         if (!confirmCocoSubmit || submittedOnce) return;
         submittedOnce = true;
-        appendCocoHistory(lastPasted);
+        if (historyTarget === 'trae') appendTraeHistory(lastPasted);
+        else appendCocoHistory(lastPasted);
       }),
       pasteText: vi.fn((text: string) => { lastPasted = text; }),
     } satisfies PtyHandle;
@@ -1012,8 +2104,9 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty();
     const result = await adapter.writeInput(pty, MULTILINE);
 
-    // Successful submit returns undefined (no warning needed)
-    expect(result).toBeUndefined();
+    // Verified history append is authoritative for the worker's bounded
+    // structured-turn start lease.
+    expect(result).toEqual({ submitted: true });
     // tmux paste-buffer path: single pasteText with the whole content, then
     // exactly one Enter (no retries — the mock confirmed via history.jsonl).
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
@@ -1075,8 +2168,8 @@ describe('coco writeInput submission confirmation', () => {
     const result = await adapter.writeInput(pty, angled);
 
     // Success path: JSON-decode + startsWith finds the Go-escaped content,
-    // so writeInput returns undefined (no warning queued).
-    expect(result).toBeUndefined();
+    // so writeInput returns an authoritative submit confirmation.
+    expect(result).toEqual({ submitted: true });
   });
 
   it('skips verification on fresh install with no history.jsonl yet', async () => {
@@ -1090,6 +2183,49 @@ describe('coco writeInput submission confirmation', () => {
     const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
     const result = await adapter.writeInput(pty, 'hello');
     expect(result).toBeUndefined();
+  });
+
+  it('fresh install: returns { submitted: true } when history.jsonl appears with our marker during the short wait', async () => {
+    // Fresh-install branch 1: history.jsonl is absent at submit time, but CoCo
+    // creates it and appends our marker within the 1.2s short-wait window.
+    // Adapter must return authoritative { submitted: true }, not undefined.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    // The mock confirms on the first Enter by writing a coco-shaped history
+    // line — but the file does not exist yet when baseByte is sampled, so we
+    // exercise the fresh-install short-wait path rather than the normal loop.
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: true });
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('fresh install: falls through to retry loop when history.jsonl appears without our marker', async () => {
+    // Fresh-install branch 3: history.jsonl is absent at submit time, appears
+    // during the short wait, but does NOT contain our marker (e.g. another
+    // session's line landed first). Adapter must NOT silently return undefined;
+    // it must fall through to the normal retry/failure loop and surface
+    // { submitted: false, recheck } so the worker can warn rather than mask a
+    // real submit failure on a new install.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    let submittedOnce = false;
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        if (submittedOnce) return;
+        submittedOnce = true;
+        // File appears, but with an unrelated line — our marker is absent.
+        appendCocoHistory('some other session\'s submit, not ours');
+      }),
+      pasteText: vi.fn(),
+    };
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
   });
 
   it('confirms submit when baseByte lands mid-line (non-atomic history append)', async () => {
@@ -1127,9 +2263,124 @@ describe('coco writeInput submission confirmation', () => {
     const adapter = createCocoAdapter('/bin/coco');
     const result = await adapter.writeInput(pty, prompt);
 
-    // Confirmed → no warning, and no spurious retry Enters.
-    expect(result).toBeUndefined();
+    // Confirmed → authoritative success, no warning or spurious retry Enters.
+    expect(result).toEqual({ submitted: true });
     const enterCalls = (pty.sendSpecialKeys as any).mock.calls.filter((c: string[]) => c[0] === 'Enter').length;
     expect(enterCalls).toBe(1);
+  });
+
+  // ── Dual-path submit confirmation (traecli 0.201.5 migration) ────────────
+  // traecli 0.201.5 moved the submit log from ~/.cache/coco/history.jsonl
+  // ({content,mode:"user"}) to $TRAE_HOME/cli/history.jsonl
+  // ({session_id,ts,text}) — the same file the traex adapter polls. Coco runs
+  // the same binary, so writeInput must poll BOTH and confirm on either.
+
+  it('confirms a submit when only the new ~/.trae/cli/history.jsonl path records it', async () => {
+    // Legacy path exists but holds no marker; the traecli 0.201.5+ path gets
+    // the {session_id,ts,text} line. Before the dual-path fix this submit
+    // false-warned submit_unconfirmed forever.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ historyTarget: 'trae' });
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toEqual({ submitted: true });
+    expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
+    const enterCalls = pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter').length;
+    expect(enterCalls).toBe(1);
+  });
+
+  it('honors TRAE_HOME for the new history path (resolved per submit, not at module load)', async () => {
+    // traeHistoryPath() must be evaluated at submit time: TRAE_HOME may be set
+    // after the adapter module loaded. Point it at a custom home and confirm
+    // the marker is found there (and not under the default ~/.trae).
+    const prevTraeHome = process.env.TRAE_HOME;
+    const customHome = join(homedir(), '.trae-coco-dual-path-test-home');
+    process.env.TRAE_HOME = customHome;
+    try {
+      resetCocoHistory();
+      appendCocoHistory('seed prior submit so legacy file exists');
+      const customHistory = join(customHome, 'cli', 'history.jsonl');
+      mkdirSync(dirname(customHistory), { recursive: true });
+      writeFileSync(customHistory, '');
+      let lastPasted = '';
+      const pty: PtyHandle = {
+        write: vi.fn(),
+        sendText: vi.fn(),
+        sendSpecialKeys: vi.fn((key: string) => {
+          if (key !== 'Enter') return;
+          appendFileSync(customHistory, JSON.stringify({ session_id: 'custom-home-session', ts: Date.now(), text: lastPasted }) + '\n');
+        }),
+        pasteText: vi.fn((text: string) => { lastPasted = text; }),
+      };
+
+      const adapter = createCocoAdapter('/bin/coco');
+      const result = await adapter.writeInput(pty, MULTILINE);
+
+      expect(result).toEqual({ submitted: true });
+    } finally {
+      if (prevTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = prevTraeHome;
+      try { rmSync(customHome, { recursive: true, force: true }); } catch { /* memfs / absent */ }
+    }
+  });
+
+  it('fresh install: confirms via the new path when only ~/.trae/cli/history.jsonl appears', async () => {
+    // Both logs absent at submit time; CoCo creates ONLY the new-path file
+    // with our marker during the fresh-install short wait.
+    const { rmSync } = await import('node:fs');
+    try { rmSync(COCO_HISTORY_PATH); } catch { /* may not exist */ }
+    try { rmSync(TRAE_HISTORY_PATH); } catch { /* may not exist */ }
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ historyTarget: 'trae' });
+    const result = await adapter.writeInput(pty, MULTILINE);
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('new path uses EXACT text match — a same-prefix decoy line does not confirm', async () => {
+    // The legacy path matches a 40-char PREFIX; the new path matches the full
+    // text exactly (traexHistoryMatchDelta, shared with traex). A line sharing
+    // only the prefix must NOT confirm on the new path.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const content = 'shared-prefix '.repeat(4) + 'actual submitted tail';
+    const decoy = content.slice(0, 40) + ' different tail from another pane';
+    const pty: PtyHandle = {
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        appendTraeHistory(decoy, 'decoy-session');
+      }),
+      pasteText: vi.fn(),
+    };
+
+    const adapter = createCocoAdapter('/bin/coco');
+    const result = await adapter.writeInput(pty, content);
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any)?.recheck).toBe('function');
+    expect((result as any).recheck()).toBe(false);
+  });
+
+  it('recheck closure scans both paths — a late append to the NEW path flips it to true', async () => {
+    // In-band budget exhausted with neither log holding the marker; the
+    // worker's deferred recheck must still spot a slow append on EITHER path.
+    resetCocoHistory();
+    appendCocoHistory('seed prior submit so legacy file exists');
+    resetTraeHistory();
+    const adapter = createCocoAdapter('/bin/coco');
+    const pty = makeCocoPasteTmuxPty({ confirmCocoSubmit: false });
+    const result = await adapter.writeInput(pty, MULTILINE);
+
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as any)?.recheck as () => boolean;
+    expect(typeof recheck).toBe('function');
+    expect(recheck()).toBe(false);
+    appendTraeHistory(MULTILINE, 'late-trae-session');
+    expect(recheck()).toBe(true);
   });
 });

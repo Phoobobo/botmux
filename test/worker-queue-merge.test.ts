@@ -1,0 +1,392 @@
+import { describe, expect, it } from 'vitest';
+import {
+  handoffQueuedDurableInputsOnBackendExit,
+  mergeQueuedCliInput,
+  pendingInputMayFlush,
+  pendingInputAllowsTypeAhead,
+  resetPreservingPendingCliInputs,
+  shouldDeferArgsBakedDurablePrompt,
+  shouldDeferInitialPromptForArgLimit,
+  shouldStopPendingBatch,
+  terminalReleasesDurableTurn,
+} from '../src/utils/pending-input-queue.js';
+
+const imOrigin = {
+  listenerAppId: 'listener', meetingId: 'meeting', memberId: 'member',
+  memberEpoch: 1, agentAppId: 'agent', ownerBootId: 'boot', ownerEpoch: 1,
+  membershipGeneration: 1, sinkOwnerGeneration: 1,
+  receiverSessionId: 'receiver', larkMessageId: 'im-1',
+};
+
+describe('mergeQueuedCliInput', () => {
+  it('returns false when there is no queued message to merge into', () => {
+    const pending: Array<{ content: string; turnId?: string }> = [];
+
+    expect(mergeQueuedCliInput(pending, { content: 'next', turnId: 't2' })).toBe(false);
+    expect(pending).toEqual([]);
+  });
+
+  it('merges incremental queued messages into the pending tail', () => {
+    const trustedCaller = {
+      requestUserOpenId: 'ou_same', requestUserUnionId: 'on_same',
+      requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    const pending = [{ content: 'first', turnId: 't1', trustedCaller }];
+
+    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2', trustedCaller })).toBe(true);
+
+    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
+  });
+
+  it('never merges queue items across trusted caller boundaries', () => {
+    const pending = [{
+      content: 'first', turnId: 't1',
+      trustedCaller: { requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const },
+    }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 't2',
+      trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(pending).toHaveLength(1);
+  });
+
+  it('never merges across a durable envelope boundary in either direction', () => {
+    const durableTail = [{ content: 'meeting envelope', turnId: 'delivery', dispatchAttempt: 1 }];
+    expect(mergeQueuedCliInput(durableTail, { content: 'human follow-up', turnId: 'im-1' })).toBe(false);
+    expect(durableTail).toEqual([{ content: 'meeting envelope', turnId: 'delivery', dispatchAttempt: 1 }]);
+
+    const ordinaryTail = [{ content: 'human turn', turnId: 'im-1' }];
+    expect(mergeQueuedCliInput(ordinaryTail, {
+      content: 'meeting envelope', turnId: 'delivery', dispatchAttempt: 1,
+    })).toBe(false);
+    expect(ordinaryTail).toEqual([{ content: 'human turn', turnId: 'im-1' }]);
+  });
+
+  it('never merges a transport command that represents different logical content', () => {
+    const deferred = [{
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 't1',
+    }];
+    expect(mergeQueuedCliInput(deferred, { content: 'next', turnId: 't2' })).toBe(false);
+    expect(mergeQueuedCliInput([{ content: 'ordinary', turnId: 't1' }], {
+      content: '/botmux-initial-prompt',
+      logicalContent: 'full original prompt',
+      turnId: 't2',
+    })).toBe(false);
+  });
+
+  it('never merges a turn that carries an automatic native title', () => {
+    const pending = [{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }];
+
+    expect(mergeQueuedCliInput(pending, { content: 'second task', turnId: 't2' })).toBe(false);
+    expect(pending).toEqual([{
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      nativeSessionTitlePrompt: 'first task',
+      turnId: 't1',
+    }]);
+
+    expect(mergeQueuedCliInput([{ content: 'ordinary', turnId: 't1' }], {
+      content: '<user_message>@Bot first task</user_message>',
+      nativeSessionTitle: '[BotMux·Lark] first task',
+      turnId: 't2',
+    })).toBe(false);
+  });
+
+  it('never merges queued explicit meeting IM turns or batches them on one live origin', () => {
+    const pending = [{ content: 'human A', turnId: 'im-1', vcMeetingImTurnOrigin: imOrigin }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'human B',
+      turnId: 'im-2',
+      vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
+    })).toBe(false);
+    expect(pending).toHaveLength(1);
+
+    expect(pendingInputAllowsTypeAhead(true, false, pending[0])).toBe(false);
+    expect(shouldStopPendingBatch(pending[0], {
+      content: 'human B',
+      turnId: 'im-2',
+      vcMeetingImTurnOrigin: { ...imOrigin, larkMessageId: 'im-2' },
+    })).toBe(true);
+  });
+});
+
+describe('handoffQueuedDurableInputsOnBackendExit', () => {
+  it('hands off every queued durable generation while preserving ordinary input order', () => {
+    const ordinaryBefore = { content: 'ordinary before', turnId: 'im-1' };
+    const durableOne = { content: 'delivery one', turnId: 'delivery-1', dispatchAttempt: 1 };
+    const ordinaryAfter = { content: 'ordinary after', turnId: 'im-2' };
+    const durableTwo = { content: 'delivery two', turnId: 'delivery-2', dispatchAttempt: 4 };
+    const pending = [ordinaryBefore, durableOne, ordinaryAfter, durableTwo];
+
+    const handedOff = handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: false },
+    );
+
+    expect(handedOff).toEqual([durableOne, durableTwo]);
+    expect(pending).toEqual([ordinaryBefore, ordinaryAfter]);
+  });
+
+  it('preserves the complete queue for an intentional in-worker restart', () => {
+    const pending = [
+      { content: 'ordinary', turnId: 'im-1' },
+      { content: 'delivery', turnId: 'delivery-1', dispatchAttempt: 2 },
+    ];
+    const snapshot = [...pending];
+
+    expect(handoffQueuedDurableInputsOnBackendExit(
+      pending,
+      { intentionalRestart: true },
+    )).toEqual([]);
+    expect(pending).toEqual(snapshot);
+  });
+});
+
+describe('initial prompt args deferral', () => {
+  it('does not defer queue-input CLIs even when the prompt exceeds the limit', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: false,
+      prompt: 'x'.repeat(10_000),
+      maxInitialPromptArgBytes: 4096,
+    })).toBe(false);
+  });
+
+  it('keeps args-baked prompts at or below the adapter byte limit on argv', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: 'abcd',
+      maxInitialPromptArgBytes: 4,
+    })).toBe(false);
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: '你', // 3 UTF-8 bytes, not 1 JS code unit.
+      maxInitialPromptArgBytes: 3,
+    })).toBe(false);
+  });
+
+  it('defers args-baked prompts whose UTF-8 byte length exceeds the adapter limit', () => {
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: '你', // 3 UTF-8 bytes.
+      maxInitialPromptArgBytes: 2,
+    })).toBe(true);
+  });
+});
+
+describe('durable turn queue boundary', () => {
+  it('routes an args-baked cold durable prompt through the owned queue by default', () => {
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: false,
+      dispatchAttempt: 1,
+    })).toBe(true);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
+    })).toBe(true);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: false,
+    })).toBe(false);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: false,
+      adoptMode: false,
+      dispatchAttempt: 1,
+    })).toBe(false);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: true,
+      dispatchAttempt: 1,
+    })).toBe(false);
+  });
+
+  it('keeps a fresh durable prompt on argv only for an adapter that guarantees it', () => {
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      dispatchAttempt: 1,
+    })).toBe(false);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
+    })).toBe(false);
+  });
+
+  it('disables type-ahead while either the active or next turn is durable', () => {
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'im' })).toBe(true);
+    expect(pendingInputAllowsTypeAhead(true, true, { content: 'im' })).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'delivery', dispatchAttempt: 1 })).toBe(false);
+  });
+
+  it('disables type-ahead while a direct RPC turn is still active', () => {
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, true)).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, false)).toBe(true);
+  });
+
+  it('forces separate idle edges for durable attempts and explicit serial batches', () => {
+    expect(shouldStopPendingBatch(
+      { content: 'delivery', dispatchAttempt: 1 },
+      { content: 'user follow-up' },
+    )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'user turn' },
+      { content: 'delivery', dispatchAttempt: 1 },
+    )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'serial turn 1' },
+      { content: 'serial turn 2' },
+      false,
+    )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'ordinary turn 1' },
+      { content: 'ordinary turn 2' },
+      true,
+    )).toBe(false);
+    expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
+  });
+
+  it('does not cross an unresolved durable boundary on a screen-idle edge', () => {
+    expect(pendingInputMayFlush(true)).toBe(false);
+    expect(pendingInputMayFlush(false)).toBe(true);
+  });
+
+  it('only lets the exact current attempt release the durable queue', () => {
+    const current = { turnId: 'delivery', dispatchAttempt: 2 };
+    expect(terminalReleasesDurableTurn(current, { turnId: 'delivery', dispatchAttempt: 1 })).toBe(false);
+    expect(terminalReleasesDurableTurn(current, { turnId: 'other', dispatchAttempt: 2 })).toBe(false);
+    expect(terminalReleasesDurableTurn(current, { turnId: 'delivery', dispatchAttempt: 2 })).toBe(true);
+  });
+
+  it('never merges structured Codex App turns because context is per-message', () => {
+    const pending = [{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }];
+    const next = {
+      content: 'legacy-2',
+      turnId: 't2',
+      codexAppInput: { text: 'clean-2' },
+    };
+    expect(mergeQueuedCliInput(pending, next)).toBe(false);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].codexAppInput.text).toBe('clean-1');
+  });
+
+  it('never merges a clean sidecar across a durable or explicit-IM boundary', () => {
+    const cleanDurable = [{
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 2,
+      codexAppInput: { text: 'external event' },
+    }];
+    expect(mergeQueuedCliInput(cleanDurable, {
+      content: 'legacy IM',
+      turnId: 'im-1',
+      codexAppInput: { text: 'human follow-up' },
+    })).toBe(false);
+    expect(cleanDurable).toEqual([{
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 2,
+      codexAppInput: { text: 'external event' },
+    }]);
+
+    const cleanIm = [{
+      content: 'legacy IM',
+      turnId: 'im-1',
+      vcMeetingImTurnOrigin: imOrigin,
+      codexAppInput: { text: 'human follow-up' },
+    }];
+    expect(mergeQueuedCliInput(cleanIm, {
+      content: 'legacy delivery',
+      turnId: 'delivery',
+      dispatchAttempt: 3,
+      codexAppInput: { text: 'external event' },
+    })).toBe(false);
+    expect(cleanIm).toEqual([{
+      content: 'legacy IM',
+      turnId: 'im-1',
+      vcMeetingImTurnOrigin: imOrigin,
+      codexAppInput: { text: 'human follow-up' },
+    }]);
+  });
+
+  it('never merges when only one side carries a clean sidecar', () => {
+    const structuredTail = [{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }];
+    expect(mergeQueuedCliInput(structuredTail, {
+      content: 'legacy-2',
+      turnId: 't2',
+    })).toBe(false);
+    expect(structuredTail).toEqual([{
+      content: 'legacy-1',
+      turnId: 't1',
+      codexAppInput: { text: 'clean-1' },
+    }]);
+
+    const ordinaryTail = [{ content: 'legacy-1', turnId: 't1' }];
+    expect(mergeQueuedCliInput(ordinaryTail, {
+      content: 'legacy-2',
+      turnId: 't2',
+      codexAppInput: { text: 'clean-2' },
+    })).toBe(false);
+    expect(ordinaryTail).toEqual([{ content: 'legacy-1', turnId: 't1' }]);
+  });
+});
+
+describe('resetPreservingPendingCliInputs', () => {
+  it('restores unwritten prompts after a reset clears the live queue', () => {
+    const pending = [
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ];
+
+    resetPreservingPendingCliInputs(pending, () => {
+      pending.length = 0;
+    });
+
+    expect(pending).toEqual([
+      { content: 'initial hello', turnId: 't1' },
+      { content: 'follow-up', turnId: 't2' },
+    ]);
+  });
+
+  it('keeps the snapshot ahead of items produced during reset and restores on throw', () => {
+    const pending = [{ content: 'queued' }];
+
+    expect(() => resetPreservingPendingCliInputs(pending, () => {
+      pending.push({ content: 'reset-added' });
+      throw new Error('reset failed');
+    })).toThrow('reset failed');
+
+    expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
+  });
+});
+
+it('keeps collaborative messages separate even from the same sender', () => {
+  const trustedCaller = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app', senderType: 'user' as const };
+  for (const flags of [[true, false], [false, true], [true, true]]) {
+    const tail = { content: 'first', turnId: 'a', trustedCaller,
+      ...(flags[0] ? { queueAfterActiveTurn: true as const } : {}) };
+    const next = { content: 'second', turnId: 'b', trustedCaller,
+      ...(flags[1] ? { queueAfterActiveTurn: true as const } : {}) };
+    expect(mergeQueuedCliInput([tail], next)).toBe(false);
+    expect(tail.content).toBe('first');
+    expect(tail.turnId).toBe('a');
+  }
+});

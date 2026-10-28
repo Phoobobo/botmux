@@ -1,4 +1,11 @@
 import { config } from '../config.js';
+import { formatUrlHost } from './dashboard-url.js';
+import { dashboardSecretPath } from './dashboard-secret.js';
+import { deriveTerminalCardViewToken } from './terminal-write-auth.js';
+import { loadDashboardSecret } from '../dashboard/auth.js';
+import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
+import { isRemoteAccessEnabled } from '../global-config.js';
+import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -7,16 +14,32 @@ import { config } from '../config.js';
  * we fall back to the worker's own port so links never go dead — the proxy is
  * an enhancement, not a hard dependency. externalHost is read live (not
  * snapshotted) so cards stay correct across network changes.
+ *
+ * When WEB_EXTERNAL_PORT is configured the proxy-mode link advertises that port
+ * (set via setTerminalExternalPort) instead of the local proxy port, so a relay
+ * host can front the terminal on a different port number. It only applies in
+ * proxy mode — the single fronting port maps cleanly to one external port; the
+ * direct fallback uses per-session worker ports that one external port can't
+ * represent, so the override is ignored there.
  */
 
 interface TerminalUrlSession {
-  session: { sessionId: string; webPort?: number | null };
+  session: { sessionId: string; webPort?: number | null; terminalCardEpoch?: string };
   workerPort: number | null;
   workerToken: string | null;
+  workerViewToken?: string | null;
+  workerCardViewToken?: string | null;
+  /** Riff AIO Sandbox web terminal link — when present, buildTerminalUrl
+   *  returns this directly instead of building a local/proxy URL. */
+  riffAccessUrl?: string;
 }
 
 let proxyPort = 0;
 let proxyReady = false;
+// Port advertised in proxy-mode links, overriding the local proxy port.
+// 0 = unset → advertise the local proxy port. Set from WEB_EXTERNAL_PORT +
+// botIndex so a relay can front the terminal on a different port number.
+let externalPort = 0;
 
 /** Marks the proxy live on `port`. Called only after a successful bind. */
 export function setTerminalProxyPort(port: number): void {
@@ -24,21 +47,133 @@ export function setTerminalProxyPort(port: number): void {
   proxyReady = true;
 }
 
+/** Override the port shown in proxy-mode links (WEB_EXTERNAL_PORT + botIndex).
+ *  0 reverts to advertising the local proxy port. */
+export function setTerminalExternalPort(port: number): void {
+  externalPort = port;
+}
+
 /** Bound proxy port, or 0 when the proxy is not available. */
 export function getTerminalProxyPort(): number {
   return proxyReady ? proxyPort : 0;
+}
+
+/** Port clients should use to reach the proxy: the configured external port
+ *  (WEB_EXTERNAL_PORT + botIndex) when set, else the bound proxy port; 0 when
+ *  the proxy isn't up. Single source of truth for the proxy-mode port that both
+ *  buildTerminalUrl (card links) and the dashboard rows advertise, so they agree
+ *  on the same external port instead of diverging. */
+export function getTerminalAdvertisedPort(): number {
+  return proxyReady ? externalPort || proxyPort : 0;
 }
 
 /** Test/edge helper: revert to the no-proxy (direct-port) state. */
 export function resetTerminalProxy(): void {
   proxyPort = 0;
   proxyReady = false;
+  externalPort = 0;
 }
 
-export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+function withCapability(base: string, name: 'token' | 'viewToken', value: string | null | undefined): string {
+  return value ? `${base}?${name}=${encodeURIComponent(value)}` : base;
+}
+
+/**
+ * Card read capability for a session no live worker has reported one for —
+ * e.g. restored after a daemon restart and re-rendered before its next fork
+ * (restart reconcile, 显示输出 / 刷新, a usage-limit card turning retryable).
+ * The worker's `ready` tokens live only in daemon memory, so without this the
+ * rebuilt card's link loses `viewToken` and a viewer without a Dashboard /
+ * platform login gets 403 (#2279).
+ *
+ * Same derivation, secret file and persisted epoch the worker uses in
+ * `refreshTerminalCardViewToken`, so the token a worker woken by this link
+ * accepts is exactly the one the pre-restart card carried. Read per call like
+ * the worker does — this path only runs while no worker token exists. Without
+ * a readable secret (standalone/test) or an epoch, the link stays bare as
+ * before.
+ */
+function restoredCardViewToken(session: TerminalUrlSession['session']): string | null {
+  if (!session.terminalCardEpoch) return null;
+  let secret: string | null;
+  try { secret = loadDashboardSecret(dashboardSecretPath()); } catch { return null; }
+  return secret ? deriveTerminalCardViewToken(secret, session.sessionId, session.terminalCardEpoch) : null;
+}
+
+/** Whether read-only terminal links route through the central platform's
+ * authenticated front door. All three must hold:
+ *  • remote access is enabled AND this machine is bound (a t- subdomain base);
+ *  • the local terminal proxy is up — buildTerminalUrl only emits the platform
+ *    URL inside `if (proxyReady)`, otherwise it falls back to a local worker URL,
+ *    so claiming the platform entry without a proxy would hand out a link that
+ *    is not actually fronted by the platform.
+ * When true, issuing a read-only `viewToken` link is enough: an owner signed in
+ * via the platform (Feishu SSO) is upgraded to write by terminal-write-auth,
+ * while teammates/guests stay read-only — no private write token needed. */
+export function platformTerminalReadEntryActive(): boolean {
+  return proxyReady && isRemoteAccessEnabled() && !!platformTerminalBaseUrl();
+}
+
+export function buildTerminalUrl(
+  ds: TerminalUrlSession,
+  opts: { write?: boolean; viewScope?: 'card' | 'worker' } = {},
+): string {
+  // Riff backend: the AIO Sandbox link is the OPERATE entry — served via
+  // 「获取操作链接」/ write links only (opts.write). The read-only
+  // 「打开 Web 终端」keeps the local worker terminal (task log view), so both
+  // stay reachable: Web终端=日志页常驻，操作链接=AIO Sandbox。
+  if (ds.riffAccessUrl && opts.write) return ds.riffAccessUrl;
+  // When 远程访问 is enabled AND this daemon is bound to the central platform AND
+  // the local terminal proxy is up, route terminal links through the terminal
+  // subdomain (`https://t-<machineId>.<platformHost>/s/<sessionId>`). The platform
+  // reverse-proxies that subdomain to this daemon's dashboard, which in turn
+  // proxies `/s/*` to the local terminal proxy — so terminals are reachable
+  // centrally with no `:port`. Platform owner login grants write access, and an
+  // explicitly requested private write link keeps its worker token as an
+  // alternative capability. Read-only links carry a distinct view capability:
+  // knowing it never grants terminal input.
+  // When 远程访问 is off the platform base is null and we fall through — first
+  // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
+  // `/s/<id>` form), then to the local proxy/worker port.
+  // The 'worker' scope must stay the live boot token: the dashboard derives the
+  // worker generation from it, so a card token there would mint a grant no
+  // worker accepts. Only card links fall back to the daemon-derived token.
+  const readToken = opts.viewScope === 'worker'
+    ? ds.workerViewToken
+    : (ds.workerCardViewToken ?? ds.workerViewToken ?? restoredCardViewToken(ds.session));
+  if (proxyReady) {
+    const platformBase = isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;
+    if (platformBase) {
+      const base = `${platformBase}/s/${ds.session.sessionId}`;
+      return opts.write
+        ? withCapability(base, 'token', ds.workerToken)
+        : withCapability(base, 'viewToken', readToken);
+    }
+    // 自建反代（BOTMUX_PUBLIC_URL）：走 dashboard 前门 `/s/<id>`，无 per-bot 端口、
+    // 对所有 bot 通。这里没有平台 SSO 兜底，故写链接必须像本地分支一样保留 token，
+    // 否则终端会裸暴露在对外域名上。
+    const publicBase = publicReverseProxyBaseUrl();
+    if (publicBase) {
+      const url = `${publicBase}/s/${ds.session.sessionId}`;
+      return opts.write
+        ? withCapability(url, 'token', ds.workerToken)
+        : withCapability(url, 'viewToken', readToken);
+    }
+    // Merlin Devbox 私有短链：同样走 dashboard 前门 `/s/<id>`，所以隧道对应的是
+    // dashboard 端口——不传 port，由 devboxDashboardBaseUrl() 按 `.dashboard-port`
+    // 解析当前实际端口并与缓存比对（端口漂移后回退本机，不指向旧隧道）。
+    const devboxBase = devboxDashboardBaseUrl();
+    if (devboxBase) {
+      const url = `${devboxBase}/s/${ds.session.sessionId}`;
+      return opts.write
+        ? withCapability(url, 'token', ds.workerToken)
+        : withCapability(url, 'viewToken', readToken);
+    }
+  }
   const base = proxyReady
-    ? `http://${config.web.externalHost}:${proxyPort}/s/${ds.session.sessionId}`
-    : `http://${config.web.externalHost}:${ds.workerPort ?? ds.session.webPort}`;
-  if (opts.write && ds.workerToken) return `${base}?token=${ds.workerToken}`;
-  return base;
+    ? `http://${formatUrlHost(config.web.externalHost)}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
+    : `http://${formatUrlHost(config.web.externalHost)}:${ds.workerPort ?? ds.session.webPort}`;
+  return opts.write
+    ? withCapability(base, 'token', ds.workerToken)
+    : withCapability(base, 'viewToken', readToken);
 }

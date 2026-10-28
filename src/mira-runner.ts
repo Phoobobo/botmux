@@ -5,6 +5,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Buffer } from 'node:buffer';
 import { extractMiraHistoryFinalText, sanitizeMiraFinalText } from './mira-output.js';
+import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
+import { errorMessage } from './utils/error-message.js';
+import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
 
 type JsonObject = Record<string, any>;
 
@@ -29,44 +32,21 @@ const DEFAULT_DATA_SOURCES = ['manus'];
 const LAST_ROUND_RETRY_DELAYS_MS = [0, 250, 750];
 const COOKIE_DB_PATH = process.env.MIRA_COOKIE_DB
   ?? join(homedir(), 'Library', 'Application Support', 'mira', 'Cookies');
-const OSC_PREFIX = '\x1b]777;botmux:';
-const OSC_END = '\x07';
+const output = new RunnerControlWriter();
+const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { sessionId: '' };
-  for (let i = 0; i < argv.length; i++) {
-    const key = argv[i];
-    const val = argv[i + 1];
-    if (key === '--session-id' && val !== undefined) { out.sessionId = val; i++; }
-    else if (key === '--mira-session-id' && val !== undefined) { out.miraSessionId = val; i++; }
-    else if (key === '--model' && val !== undefined) { out.model = val; i++; }
-    else if (key === '--bot-name' && val !== undefined) { out.botName = val; i++; }
-    else if (key === '--bot-open-id' && val !== undefined) { out.botOpenId = val; i++; }
-    else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
-  }
+  parseRunnerFlags(argv, out, {
+    '--session-id': 'sessionId',
+    '--mira-session-id': 'miraSessionId',
+    '--model': 'model',
+    '--bot-name': 'botName',
+    '--bot-open-id': 'botOpenId',
+    '--locale': 'locale',
+  });
   if (!out.sessionId) throw new Error('--session-id is required');
   return out;
-}
-
-function b64Json(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64');
-}
-
-function emitMarker(kind: string, payload: unknown): void {
-  process.stdout.write(`${OSC_PREFIX}${kind}:${b64Json(payload)}${OSC_END}`);
-}
-
-function writeLine(text = ''): void {
-  process.stdout.write(text + '\n');
-}
-
-function prompt(): void {
-  process.stdout.write('› ');
-}
-
-function errorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  return String(err);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -414,7 +394,7 @@ let args: Args;
 try {
   args = parseArgs(process.argv.slice(2));
 } catch (err) {
-  console.error(errorMessage(err));
+  output.error(`${errorMessage(err)}\n`);
   process.exit(2);
 }
 
@@ -437,7 +417,7 @@ async function runTurn(content: string): Promise<void> {
     writeLine();
     writeLine(result.finalText);
     emitMarker('final', {
-      turnId: result.turnId,
+      nativeTurnId: result.turnId,
       content: result.finalText,
       startedAtMs,
       completedAtMs,
@@ -460,7 +440,6 @@ async function drainQueue(): Promise<void> {
         const message = `Mira runner error: ${errorMessage(err)}`;
         writeLine(message);
         emitMarker('final', {
-          turnId: `mira-error-${now}`,
           content: message,
           startedAtMs: now,
           completedAtMs: now,
@@ -524,6 +503,6 @@ process.on('SIGTERM', () => {
 });
 
 main().catch(err => {
-  console.error(`Mira runner failed: ${errorMessage(err)}`);
+  output.error(`Mira runner failed: ${errorMessage(err)}\n`);
   process.exit(1);
 });

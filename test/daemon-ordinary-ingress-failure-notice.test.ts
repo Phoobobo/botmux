@@ -1,0 +1,2935 @@
+import {
+  __testOnly_durablePrimaryWorkerAdmission,
+  __testOnly_handleDocComment,
+  __testOnly_recordDurablePrimaryInputCommit,
+} from '../src/daemon.js';
+import { putDocSubscription, type DocSubscription } from '../src/services/doc-subs-store.js';
+/**
+ * 普通消息处理链终态失败的可行动提示（ingress failure notice）。
+ *
+ * transport 已 ACK（用户看到消息发出去了）之后，异常把 handleThreadReply /
+ * handleNewTopic 整条投递链掀翻时，此前只剩 event-dispatcher 的 log-only
+ * catch——用户视角就是机器人吞消息。本文件驱动真实路由入口断言：
+ *   - 投递链异常 → 话题里收到一条可行动提示，且原错误原样重抛（dispatcher
+ *     既有日志语义不变）；
+ *   - 提示本身发送失败 → 只降级为 warn，原错误仍然重抛，不被通知错误顶掉；
+ *   - 正常投递 → 不发提示（无误报）。
+ *
+ * 提示文案按接纳阶段区分（PR #846 review）：本轮 inbound 已被真正接纳后
+ *（durable tail、pendingRepo staging、live worker 收下、fork 成功——注意
+ * messageQueue append 不算接纳，queues/*.jsonl 仅供 dashboard 预览），失败
+ * 只可能出在接纳之后的状态回复支路——此时绝不能提示「请重发」（重发会让同一
+ * 任务再次入队、CLI 重复执行），改回「已接收勿重发」的澄清，且失败处理本身
+ * 不得产生第二个队列项。反向约束同样被钉住：refork 抛错、/vc-auth 纯拒绝等
+ * 未接纳失败必须保持「请重发」。
+ *
+ * Run:  pnpm vitest run test/daemon-ordinary-ingress-failure-notice.test.ts
+ */
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const mocks = vi.hoisted(() => {
+  const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-ingress-notice-${process.pid}`;
+  process.env.SESSION_DATA_DIR = dataDir;
+  process.env.BOTS_CONFIG = `${dataDir}/bots.json`;
+  delete process.env.BOTMUX_SESSION_ID;
+  delete process.env.BOTMUX_LARK_APP_ID;
+  let seq = 0;
+  const sessions = new Map<string, any>();
+  return {
+    dataDir,
+    replyMessage: vi.fn(async () => 'om_reply'),
+    sendMessage: vi.fn(async () => 'om_top'),
+    getMessageDetail: vi.fn(),
+    addReaction: vi.fn(async () => 'reaction_received'),
+    getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+    getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+    resolveTargetAppOpenId: vi.fn(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    })),
+    resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
+      openId
+        ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
+        : undefined
+    )),
+    sessions,
+    createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => {
+      const session = {
+        sessionId: `sess-fake-${++seq}`,
+        chatId,
+        rootMessageId,
+        title,
+        status: 'active' as const,
+        createdAt: new Date().toISOString(),
+        chatType,
+      };
+      sessions.set(session.sessionId, session);
+      return session;
+    }),
+    createSessionWithOwnedMutation: vi.fn((input: any, mutate: (fresh: Map<string, any>, draft: any) => unknown) => {
+      const draft = {
+        sessionId: `sess-fake-${++seq}`,
+        chatId: input.chatId,
+        rootMessageId: input.rootMessageId,
+        title: input.title,
+        status: 'active' as const,
+        createdAt: new Date().toISOString(),
+        chatType: input.chatType,
+      };
+      const rows = new Map(input.ownedSessionIds.map((id: string) => [id, structuredClone(sessions.get(id))]));
+      const result = mutate(rows, draft);
+      for (const [id, session] of rows) sessions.set(id, session);
+      sessions.set(draft.sessionId, draft);
+      return { session: draft, result, rows };
+    }),
+    updateSession: vi.fn((session: any) => { sessions.set(session.sessionId, session); }),
+    getSession: vi.fn((sessionId: string) => sessions.get(sessionId)),
+    listSessionsStrict: vi.fn(() => [...sessions.values()]),
+    mutateOwnedSessionsAtomically: vi.fn((ids: string[], mutate: (fresh: Map<string, any>) => unknown) => {
+      const fresh = new Map(ids.map(id => [id, structuredClone(sessions.get(id))]));
+      const result = mutate(fresh);
+      for (const [id, session] of fresh) sessions.set(id, session);
+      return { result, rows: fresh };
+    }),
+    closeSession: vi.fn((sessionId: string) => {
+      const session = sessions.get(sessionId);
+      if (session) session.status = 'closed';
+    }),
+    forkWorker: vi.fn((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    }),
+    scanMultipleProjects: vi.fn(() => [] as any[]),
+    getAvailableBots: vi.fn(async () => [] as any[]),
+    downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+  };
+});
+
+vi.mock('@larksuiteoapi/node-sdk', () => {
+  class FakeClient { constructor(public opts: Record<string, unknown>) {} }
+  return { Client: FakeClient };
+});
+
+vi.mock('node-pty', () => ({
+  spawn: vi.fn(() => ({
+    onData: vi.fn(),
+    onExit: vi.fn(),
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+  })),
+}));
+
+vi.mock('../src/im/lark/client.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/client.js');
+  return {
+    ...actual,
+    replyMessage: mocks.replyMessage,
+    sendMessage: mocks.sendMessage,
+    getMessageDetail: mocks.getMessageDetail,
+    addReaction: mocks.addReaction,
+    getChatMode: mocks.getChatMode,
+    getChatNameAndMode: mocks.getChatNameAndMode,
+    resolveTargetAppOpenId: mocks.resolveTargetAppOpenId,
+  };
+});
+
+vi.mock('../src/services/session-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/session-store.js');
+  return {
+    ...actual,
+    createSession: mocks.createSession,
+    createSessionWithOwnedMutation: mocks.createSessionWithOwnedMutation,
+    updateSession: mocks.updateSession,
+    getSession: mocks.getSession,
+    getOwnedSession: mocks.getSession,
+    listSessionsStrict: mocks.listSessionsStrict,
+    mutateOwnedSessionsAtomically: mocks.mutateOwnedSessionsAtomically,
+    closeSession: mocks.closeSession,
+  };
+});
+
+vi.mock('../src/core/worker-pool.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/worker-pool.js');
+  return { ...actual, forkWorker: mocks.forkWorker };
+});
+
+vi.mock('../src/core/session-manager.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-manager.js');
+  return {
+    ...actual,
+    getAvailableBots: mocks.getAvailableBots,
+    downloadResources: mocks.downloadResources,
+  };
+});
+
+vi.mock('../src/services/project-scanner.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/project-scanner.js');
+  return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
+});
+
+vi.mock('../src/im/lark/identity-cache.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
+  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
+});
+
+import { mkdirSync, readFileSync } from 'node:fs';
+
+import { getBot, registerBot } from '../src/bot-registry.js';
+import { sessionKey } from '../src/core/types.js';
+import {
+  __testOnly_activeSessions as activeSessions,
+  __testOnly_completedTurnHasCrossPrincipalFollower as completedTurnHasCrossPrincipalFollower,
+  __testOnly_handleNewTopic as handleNewTopic,
+  __testOnly_handleThreadReply as handleThreadReply,
+  __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
+  __testOnly_forkReservedInitialSession as forkReservedInitialSession,
+  __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
+  __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
+  __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
+  __testOnly_restoreSessionsAndScheduleStartupRecovery as restoreSessionsAndScheduleStartupRecovery,
+} from '../src/daemon.js';
+import { getActiveSessionsRegistry, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
+import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
+import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
+import {
+  findPendingAskByAnchor,
+  setCardDispatcher,
+  setCanTalkChecker,
+  tryResolveAsk,
+} from '../src/core/ask-broker.js';
+import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
+import { t as tr, localeForBot } from '../src/i18n/index.js';
+import type { DaemonSession } from '../src/core/types.js';
+
+const APP = 'ingress_notice_app';
+const CHAT = 'oc_ingress_notice_chat';
+const OWNER = 'ou_owner';
+const NOW = new Date().toISOString();
+
+function makeEventData(messageId: string, text: string, rootId?: string): any {
+  return {
+    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'text',
+      content: JSON.stringify({ text }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function makeBotEventData(messageId: string, text: string, rootId: string): any {
+  return {
+    sender: {
+      sender_id: { open_id: 'ou_proposer_bot', union_id: 'on_proposer_bot' },
+      sender_type: 'app',
+    },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'text',
+      content: JSON.stringify({ text }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function makeCtx(anchor: string, messageId: string): any {
+  return {
+    chatId: CHAT,
+    messageId,
+    chatType: 'group' as const,
+    scope: 'thread' as const,
+    anchor,
+    larkAppId: APP,
+  };
+}
+
+function seedThreadSession(anchor: string, title: string): DaemonSession {
+  const ds = {
+    scope: 'thread',
+    chatId: CHAT,
+    chatType: 'group',
+    larkAppId: APP,
+    worker: null,
+    workerPort: null,
+    workerToken: null,
+    spawnedAt: Date.now(),
+    cliVersion: '1.0.0',
+    lastMessageAt: Date.now(),
+    hasHistory: false,
+    ownerOpenId: OWNER,
+    session: {
+      sessionId: 'sess-seeded-' + Math.random().toString(36).slice(2),
+      chatId: CHAT,
+      rootMessageId: anchor,
+      title,
+      status: 'active',
+      createdAt: NOW,
+      larkAppId: APP,
+    },
+  } as unknown as DaemonSession;
+  activeSessions.set(sessionKey(anchor, APP), ds);
+  return ds;
+}
+
+/** All text replied through the mocked Lark client in this test, joined. */
+function repliedText(): string {
+  return [...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]
+    .map(call => String(call[2] ?? ''))
+    .join('\n');
+}
+
+function expectedNotice(): string {
+  return tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
+}
+
+describe('completed-turn XPI progression', () => {
+  it('uses the durable owner turn even after the active-turn mirror was revoked', () => {
+    const ds = seedThreadSession('om_thread_xpi_terminal_progress', 'seeded') as any;
+    ds.activeInteractiveTurn = undefined;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_terminal_progress_123456',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_b', senderType: 'user' },
+      phase: 'awaiting_owner',
+      messages: [],
+    }];
+
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'owner-turn',
+      status: 'completed',
+    })).toBe(true);
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'stale-turn',
+      status: 'completed',
+    })).toBe(false);
+    ds.session.crossPrincipalInterruptions[0].phase = 'owner_approved';
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'later-owner-turn',
+      status: 'completed',
+    })).toBe(true);
+    expect(completedTurnHasCrossPrincipalFollower(ds, {
+      turnId: 'owner-turn',
+      status: 'failed',
+    })).toBe(false);
+  });
+});
+
+describe('ordinary ingress terminal failure → actionable notice', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.getChatMode.mockResolvedValue('group');
+    mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
+    mocks.sessions.clear();
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    mocks.scanMultipleProjects.mockReturnValue([]);
+    mocks.getAvailableBots.mockResolvedValue([]);
+    mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    activeSessions.clear();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it('thread reply delivery failure replies with the notice and rethrows the original error', async () => {
+    const anchor = 'om_thread_root';
+    seedThreadSession(anchor, 'seeded');
+    mocks.downloadResources.mockRejectedValue(new Error('boom: durable store offline'));
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_1', 'hello world', anchor), makeCtx(anchor, 'om_msg_1')),
+    ).rejects.toThrow('boom: durable store offline');
+
+    expect(repliedText()).toContain(expectedNotice());
+  });
+
+  it('a failing notice never masks the original delivery error', async () => {
+    const anchor = 'om_thread_root_2';
+    seedThreadSession(anchor, 'seeded');
+    mocks.downloadResources.mockRejectedValue(new Error('boom: original failure'));
+    mocks.replyMessage.mockRejectedValue(new Error('lark transport down'));
+    mocks.sendMessage.mockRejectedValue(new Error('lark transport down'));
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_2', 'hello again', anchor), makeCtx(anchor, 'om_msg_2')),
+    ).rejects.toThrow('boom: original failure');
+  });
+
+  it('new topic delivery failure replies with the notice and rethrows', async () => {
+    mocks.downloadResources.mockRejectedValue(new Error('boom: new topic ingest'));
+
+    await expect(
+      handleNewTopic(makeEventData('om_msg_3', 'start a task'), makeCtx('om_msg_3', 'om_msg_3')),
+    ).rejects.toThrow('boom: new topic ingest');
+
+    expect(repliedText()).toContain(expectedNotice());
+  });
+
+  it('clears the previous failed label before reforking for a new thread reply', async () => {
+    const anchor = 'om_thread_refork_failure';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.failedIdleTurnId = 'om_old_failed';
+    ds.silentIdleTurnId = 'om_old_silent';
+    ds.completedIdleTurnId = 'om_old_completed';
+    await handleThreadReply(makeEventData('om_refork_new', 'new task', anchor), makeCtx(anchor, 'om_refork_new'));
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(ds.currentTurnId).toBe('om_refork_new');
+    expect(ds.failedIdleTurnId).toBeUndefined();
+    expect(ds.silentIdleTurnId).toBeUndefined();
+    expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('cold-resumes the same dormant session and native CLI lineage from its original Lark anchor', async () => {
+    const anchor = 'om_thread_dormant_cold_resume';
+    const turnId = 'om_dormant_follow_up';
+    const ds = seedThreadSession(anchor, 'dormant seeded') as any;
+    const sessionId = ds.session.sessionId;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.session.suspendedColdResume = true;
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = 'native-cli-lineage-42';
+    ds.lastCliInput = 'previous accepted turn';
+    ds.session.lastCliInput = 'previous accepted turn';
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, options: any) => {
+      expect(target).toBe(ds);
+      expect(options).toMatchObject({ resume: true, turnId });
+      expect(target.session.sessionId).toBe(sessionId);
+      expect(target.session.cliSessionId).toBe('native-cli-lineage-42');
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(turnId, 'continue from the dormant context', anchor),
+      makeCtx(anchor, turnId),
+    );
+
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(activeSessions.get(sessionKey(anchor, APP))).toBe(ds);
+    expect(ds.session.sessionId).toBe(sessionId);
+    expect(ds.session.cliSessionId).toBe('native-cli-lineage-42');
+    expect(ds.lastCliInput).toContain('continue from the dormant context');
+    expect(ds.session.lastCliInput).toContain('continue from the dormant context');
+  });
+
+  it('reforks a dead durable-primary worker and waits for provider submission proof', async () => {
+    const anchor = 'om_thread_primary_dead_worker';
+    const turnId = 'om_primary_after_worker_exit';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.workerGeneration = 4;
+    ds.session.workerGeneration = 4;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 7,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, resume: any, options: any) => {
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId,
+        dispatchAttempt: 7,
+        durablePrimaryInbox: true,
+      });
+      target.workerGeneration = 5;
+      target.session.workerGeneration = 5;
+      target.worker = { killed: false, send: vi.fn() };
+      options.onAdmission?.('accepted');
+      setImmediate(() => {
+        __testOnly_recordDurablePrimaryInputCommit(target, {
+          type: 'turn_input_committed',
+          turnId,
+          dispatchAttempt: 7,
+          durablePrimaryInbox: true,
+        }, 5);
+      });
+      return true;
+    });
+
+    await handleThreadReply(makeEventData(turnId, 'continue after worker exit', anchor), ctx);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.durablePrimaryInputCommits).toEqual([
+      expect.objectContaining({ turnId, dispatchAttempt: 7, workerGeneration: 5 }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('replays a queued activation journal after worker death before the durable follower', async () => {
+    const anchor = 'om_thread_primary_queued_recovery';
+    const openingTurnId = 'om_primary_queued_opening';
+    const followerTurnId = 'om_primary_queued_follower';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'activation-token';
+    ds.session.queuedActivationInput = { content: 'OPENING_N' };
+    ds.session.queuedActivationTurnId = openingTurnId;
+    ds.session.queuedActivationDispatchAttempt = 4;
+    ds.session.queuedActivationResume = true;
+    const ctx = makeCtx(anchor, followerTurnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 8,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    mocks.forkWorker.mockImplementationOnce((target: any, input: any, resume: any) => {
+      expect(input).toEqual({ content: 'OPENING_N' });
+      expect(resume).toMatchObject({
+        resume: true,
+        turnId: openingTurnId,
+        dispatchAttempt: 4,
+      });
+      target.worker = { killed: false, send: vi.fn() };
+      return true;
+    });
+
+    await handleThreadReply(
+      makeEventData(followerTurnId, 'FOLLOWER_N1', anchor),
+      ctx,
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        turnId: followerTurnId,
+        dispatchAttempt: 8,
+        cliInput: expect.objectContaining({ content: expect.stringContaining('FOLLOWER_N1') }),
+      }),
+    ]);
+    expect(ctx.ingressAdmission).toEqual({ admitted: true });
+  });
+
+  it('retries a dead durable-primary worker while another handler owns the start claim', async () => {
+    const anchor = 'om_thread_primary_live_start_claim';
+    const turnId = 'om_primary_during_live_start_claim';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.initialStartPending = true;
+    ds.initialStartClaimToken = 'other-handler-claim';
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 2,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('retries a dead durable-primary worker while repository selection is pending', async () => {
+    const anchor = 'om_thread_primary_pending_repo';
+    const turnId = 'om_primary_during_pending_repo';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.worker = null;
+    ds.cliReady = false;
+    ds.pendingRepo = true;
+    ds.initialStartPending = false;
+    ds.initialStartClaimToken = undefined;
+    ds.session.backendType = 'remote-runner';
+    ds.session.cliId = 'remote-runner';
+    const ctx = makeCtx(anchor, turnId);
+    ctx.durablePrimaryDispatch = {
+      attempt: 3,
+      signal: new AbortController().signal,
+    };
+    ctx.queuePostAdmissionOutput = vi.fn();
+
+    await handleThreadReply(makeEventData(turnId, 'must wait for repository', anchor), ctx);
+
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({
+      admitted: false,
+      retryReason: 'session has an unfinished turn',
+    });
+  });
+
+  it('clears the previous failed label before reforking for a document comment', async () => {
+    const anchor = 'om_doc_refork_failure';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.failedIdleTurnId = 'old-doc-failure';
+    ds.silentIdleTurnId = 'old-doc-silence';
+    ds.completedIdleTurnId = 'old-doc-completion';
+    const sub: DocSubscription = { fileToken: 'doc_refork_fixture', fileType: 'docx', sessionAnchor: anchor,
+      sessionId: ds.session.sessionId, scope: 'thread', chatId: CHAT, commentTriggerMode: 'mention-only', ownerOpenId: OWNER, createdAt: Date.now() };
+    putDocSubscription(mocks.dataDir, APP, sub);
+    mocks.forkWorker.mockImplementationOnce((target: any, _input: unknown, _options: unknown, admission: any) => {
+      target.worker = { killed: false, send: vi.fn() };
+      admission.onAdmission('accepted');
+      return target.worker;
+    });
+    expect(await __testOnly_handleDocComment({ larkAppId: APP, sub, commentId: 'comment_refork_new', text: 'new comment', authorOpenId: OWNER })).toBe(true);
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(ds.currentTurnId).toBe('comment_refork_new');
+    expect(ds.failedIdleTurnId).toBeUndefined();
+    expect(ds.silentIdleTurnId).toBeUndefined();
+    expect(ds.completedIdleTurnId).toBeUndefined();
+  });
+
+  it('successful delivery sends no failure notice', async () => {
+    const anchor = 'om_thread_root_3';
+    const ds = seedThreadSession(anchor, 'seeded');
+    (ds as any).worker = { killed: false, send: vi.fn() };
+
+    await handleThreadReply(makeEventData('om_msg_4', 'all good'), makeCtx(anchor, 'om_msg_4'));
+
+    expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('freezes a blocked primary reply for post-admission durable delivery', async () => {
+    const anchor = 'om_primary_blocked';
+    const ds = seedThreadSession(anchor, 'seeded');
+    const ctx = makeCtx(anchor, 'om_primary_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    );
+    expect(gate).toBeDefined();
+
+    gate!.options.onAdmissionBlocked?.({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_turn',
+    });
+
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: anchor, replyInThread: true },
+      content: 'Memory pressure is critical',
+      msgType: 'text',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+      hookContext: {
+        sessionId: ds.session.sessionId,
+        turnId: 'om_primary_turn',
+      },
+    });
+
+    gate!.options.marginalReclaimScheduled = true;
+    gate!.markForkReturned();
+    let settled = false;
+    const waiting = gate!.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    gate!.options.onAdmission?.('rejected');
+    await waiting;
+    expect(settled).toBe(true);
+
+    const deferredAgain = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_turn',
+    )!;
+    deferredAgain.options.marginalReclaimScheduled = true;
+    deferredAgain.markForkReturned();
+    deferredAgain.options.onAdmission?.('deferred');
+    await expect(deferredAgain.waitIfMarginal()).resolves.toBeUndefined();
+  });
+
+  it('keeps the primary gate attached to marginal admission through the initial fork', async () => {
+    const anchor = 'om_primary_marginal_initial';
+    const ds = seedThreadSession(anchor, 'seeded');
+    ds.pendingPrompt = 'start after reclaim';
+    ds.pendingTurnId = 'om_primary_marginal_turn';
+    const ctx = makeCtx(anchor, 'om_primary_marginal_turn');
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    const gate = __testOnly_durablePrimaryWorkerAdmission(
+      ctx,
+      ds,
+      'om_primary_marginal_turn',
+    )!;
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: unknown, _turn: unknown, options: any) => {
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    expect(forkReservedInitialSession(ds, [], trustedCaller, gate.options)).toBe(true);
+    gate.markForkReturned();
+    let settled = false;
+    const waiting = gate.waitIfMarginal().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: 'om_primary_marginal_turn',
+    });
+    forkOptions.onAdmission('rejected');
+    await waiting;
+
+    expect(settled).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
+  });
+
+  it('adds no generic notice when the refork was refused for a deleted working directory', async () => {
+    // forkWorker already published the recovery card (or the "still missing"
+    // line) before throwing; a second "请重发" message would contradict it.
+    const anchor = 'om_thread_missing_dir';
+    seedThreadSession(anchor, 'seeded');
+    const error = new MissingWorkingDirError('/gone/worktree');
+    mocks.forkWorker.mockImplementationOnce(() => { throw error; });
+
+    await expect(
+      handleThreadReply(makeEventData('om_missing_dir', 'resume please', anchor), makeCtx(anchor, 'om_missing_dir')),
+    ).rejects.toBe(error);
+
+    expect(mocks.forkWorker).toHaveBeenCalled();
+    expect(repliedText()).not.toContain(expectedNotice());
+  });
+
+  it('a refused refork does not strand the start gate: the next message reaches forkWorker again', async () => {
+    // After the user rebuilds the worktree (or switches directories) the next
+    // message must start the CLI; a start claim left behind by the refused
+    // attempt would buffer it forever instead.
+    const anchor = 'om_thread_missing_dir_retry';
+    const ds = seedThreadSession(anchor, 'seeded');
+    mocks.forkWorker.mockImplementationOnce(() => { throw new MissingWorkingDirError('/gone/worktree'); });
+    await expect(
+      handleThreadReply(makeEventData('om_missing_first', 'first try', anchor), makeCtx(anchor, 'om_missing_first')),
+    ).rejects.toBeInstanceOf(MissingWorkingDirError);
+    expect(ds.initialStartClaimToken).toBeUndefined();
+
+    mocks.forkWorker.mockClear();
+    await handleThreadReply(makeEventData('om_missing_second', 'after rebuild', anchor), makeCtx(anchor, 'om_missing_second'));
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a full shared-cwd queue as not accepted without marking ingress admitted', async () => {
+    const ctx = makeCtx('om_thread_queue_full', 'om_msg_queue_full');
+    ctx.ingressAdmission = { admitted: false };
+    const error = new XpiSharedCwdQueueFullError('sess-full');
+
+    await expect(notifyOrdinaryIngressFailure(ctx, error)).rejects.toBe(error);
+
+    expect(ctx.ingressAdmission.admitted).toBe(false);
+    expect(repliedText()).toContain(tr('daemon.xpi_shared_cwd_queue_full', undefined, localeForBot(APP)));
+  });
+
+  it('terminalises historical XPI records without notifying when the switch is off', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'false';
+    const ds = seedThreadSession('om_thread_xpi_disabled', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cccccccccccccccccccccccc',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'bot' as const },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'historical input',
+        userPrompt: 'historical input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.crossPrincipalInterruptionCancellations).toEqual([
+      expect.objectContaining({
+        id: 'xpi_cccccccccccccccccccccccc',
+        reason: 'feature_disabled',
+        messageTurnIds: ['proposer-turn'],
+      }),
+    ]);
+    expect(repliedText()).toBe('');
+  });
+
+  it('cancels the pending XPI wait timer when the switch is disabled', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'false';
+    vi.useFakeTimers();
+    const timerFired = vi.fn();
+    const ds = seedThreadSession('om_thread_xpi_timer_disabled', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_dddddddddddddddddddddddd',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'bot' as const },
+      phase: 'owner_waiting',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'historical input',
+        userPrompt: 'historical input',
+        createdAt: NOW,
+      }],
+    }];
+    ds.crossPrincipalWaitTimer = setTimeout(timerFired, 1_000);
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(timerFired).not.toHaveBeenCalled();
+      expect(repliedText()).toBe('');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      vi.useRealTimers();
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('terminalises an unclassified legacy bot message without publishing a control marker', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_legacy_bot', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_eeeeeeeeeeeeeeeeeeeeeeee',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer_bot', senderType: 'bot' as const },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'bot input',
+        userPrompt: 'bot input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toBe('');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+  });
+
+  it('terminalises an expired bot wait without publishing a wait marker', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_legacy_bot_wait', 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_ffffffffffffffffffffffff',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer_bot', senderType: 'bot' as const },
+      phase: 'awaiting_owner',
+      ownerWaitDeadlineAt: Date.now() - 1,
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'bot input',
+        userPrompt: 'bot input',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toBe('');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+  });
+
+  it('applies a visible upfront bot choice without publishing a classification prompt', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_upfront_choice';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    // Let this authenticated peer pass the ordinary talk/quota gate so the
+    // integration case reaches the XPI diversion boundary.
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      userPrompt: 'owner clean prompt',
+    };
+    ds.lastUserPrompt = '<quote_context>transport wrapper</quote_context>\nowner clean prompt';
+
+    try {
+      await handleThreadReply(
+        makeBotEventData(
+          'om_bot_choice',
+          '请把这项工作留给当前任务\n[botmux-as:v1:suggestion]',
+          anchor,
+        ),
+        makeCtx(anchor, 'om_bot_choice'),
+      );
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toEqual([
+      expect.objectContaining({
+        phase: 'awaiting_owner',
+        ownerUserPrompt: 'owner clean prompt',
+      }),
+    ]);
+    expect(ds.session.crossPrincipalInterruptions[0].messages[0].text)
+      .toBe('请把这项工作留给当前任务');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('请选择');
+  });
+
+  it('creates an independent bot task without addressing the proposer bot in the child root', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_bot_independent';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    ds.workingDir = `${mocks.dataDir}/xpi-independent-non-git`;
+    mkdirSync(ds.workingDir, { recursive: true });
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await handleThreadReply(
+        makeBotEventData(
+          'om_bot_independent_choice',
+          '请另开任务处理\n[botmux-as:v1:independent]',
+          anchor,
+        ),
+        makeCtx(anchor, 'om_bot_independent_choice'),
+      );
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    const childRootCall = mocks.sendMessage.mock.calls.find(call =>
+      String(call[2] ?? '').includes('已为这条独立任务创建隔离话题'));
+    expect(childRootCall).toBeDefined();
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('<at');
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('ou_proposer_bot');
+  });
+
+  it('resolves a cross-app human before creating an independent task and stores only the target-app open_id', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_xpi_human_independent', 'seeded') as any;
+    ds.workingDir = `${mocks.dataDir}/xpi-human-independent-non-git`;
+    mkdirSync(ds.workingDir, { recursive: true });
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_human_independent_1234',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'preparing_independent',
+      messages: [{
+        turnId: 'om_human_independent_choice',
+        text: '请单独检查这项任务',
+        userPrompt: '请单独检查这项任务',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    const childRootCall = mocks.sendMessage.mock.calls.find(call =>
+      String(call[2] ?? '').includes('已为这条独立任务创建隔离话题'));
+    expect(String(childRootCall?.[2] ?? '')).toContain('<at id=ou_target_proposer></at>');
+    expect(String(childRootCall?.[2] ?? '')).not.toContain('ou_foreign_source_app');
+    const child = [...mocks.sessions.values()].find((session: any) =>
+      session.sessionId !== ds.session.sessionId && session.rootMessageId === 'om_top');
+    expect(child).toMatchObject({
+      ownerOpenId: 'ou_target_proposer',
+      ownerUnionId: 'on_proposer',
+      creatorOpenId: 'ou_target_proposer',
+      lastCallerOpenId: 'ou_target_proposer',
+    });
+    expect(child.ownerOpenId).not.toBe('ou_foreign_source_app');
+    expect(child.creatorOpenId).not.toBe('ou_foreign_source_app');
+    expect(child.lastCallerOpenId).not.toBe('ou_foreign_source_app');
+  });
+
+
+  describe('independent request source across asynchronous preparation', () => {
+    let previousXpi: string | undefined;
+    let previousRegistry: ReturnType<typeof getActiveSessionsRegistry>;
+    let unavailable: Set<string>;
+    let lookupFailed: Set<string>;
+    let writes: string[];
+    const SOURCE = 'om_independent_proposal';
+    const ROOT = 'om_proposal_root';
+
+    beforeEach(() => {
+      previousXpi = process.env.BOTMUX_XPI_ENABLED;
+      previousRegistry = getActiveSessionsRegistry();
+      setActiveSessionsRegistry(activeSessions);
+      process.env.BOTMUX_XPI_ENABLED = 'true';
+      getBot(APP).config.topicUnavailablePolicy = 'stop';
+      unavailable = new Set();
+      lookupFailed = new Set();
+      writes = [];
+      mocks.getMessageDetail.mockReset().mockImplementation(async (_app, id) => {
+        if (lookupFailed.has(id)) throw new Error('source lookup temporarily unavailable');
+        return { items: [{ message_id: id, deleted: unavailable.has(id), ...(id === SOURCE ? { root_id: ROOT } : {}) }] };
+      });
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6]?.beforeWrite?.();
+        writes.push(args[2]);
+        return 'om_top';
+      });
+    });
+
+    afterEach(() => {
+      for (const ds of activeSessions.values()) clearTimeout(ds.crossPrincipalWaitTimer);
+      setActiveSessionsRegistry(previousRegistry);
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    });
+
+    function seedIndependent() {
+      const ds = seedThreadSession('om_unrelated_owner_root', 'seeded') as any;
+      ds.workingDir = `${mocks.dataDir}/xpi-source-parent`;
+      mkdirSync(ds.workingDir, { recursive: true });
+      const childDir = `${mocks.dataDir}/xpi-source-child`;
+      mkdirSync(childDir, { recursive: true });
+      ds.managedTurnOrigin = { turnId: 'unrelated-owner-turn', dispatchAttempt: 8, capability: 'owner-capability' };
+      const record = {
+        version: 1, id: 'xpi_source_guard', ownerTurnId: 'unrelated-owner-turn',
+        owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+        proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'user' },
+        phase: 'preparing_independent', independentWorkingDir: childDir,
+        messages: [{ turnId: SOURCE, replyRootId: ROOT, inThread: true,
+          text: 'check separately', userPrompt: 'check separately', createdAt: NOW }],
+      };
+      ds.session.crossPrincipalInterruptions = [record];
+      mocks.sessions.set(ds.session.sessionId, ds.session);
+      return { ds, record };
+    }
+
+    it.each(['withdrawn', 'unknown', 'lookup failed'])(
+      'settles blocked sources and parks inconclusive sources without creating a root: %s', async kind => {
+        const { ds, record } = seedIndependent();
+        if (kind === 'withdrawn') unavailable.add(SOURCE);
+        if (kind === 'unknown') mocks.getMessageDetail.mockResolvedValue({ items: [] });
+        if (kind === 'lookup failed') mocks.getMessageDetail.mockRejectedValue(new Error('lookup unavailable'));
+        await driveCrossPrincipalInterruptions(ds);
+        expect(writes).toEqual([]);
+        expect(mocks.createSession).not.toHaveBeenCalled();
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+        if (kind === 'withdrawn') {
+          expect(record.phase).toBe('terminal_notice_pending');
+          expect(ds.session.crossPrincipalInterruptions ?? []).not.toContain(record);
+        } else {
+          expect(record).toMatchObject({ phase: 'preparing_independent', sourceCheckRetry: { attempts: 1 } });
+          expect(ds.crossPrincipalWaitTimer).toBeDefined();
+        }
+      });
+
+    it('checks the provider root even while the original reply remains available', async () => {
+      const { ds } = seedIndependent();
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id).slice(0, 2)).toEqual([SOURCE, ROOT]);
+      expect(writes).toEqual([]);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('keeps the proposer source frozen while resolving a cross-app identity', async () => {
+      const { ds, record } = seedIndependent();
+      Object.assign(record.proposer, { requestLarkAppId: 'foreign-app', requestUserUnionId: 'on_proposer' });
+      mocks.resolveTargetAppOpenId.mockImplementation(async () => {
+        record.messages[0].turnId = 'om_replacement';
+        record.messages[0].replyRootId = 'om_unrelated_owner_root';
+        unavailable.add(SOURCE);
+        return { status: 'resolved', openId: 'ou_target_proposer' };
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).not.toContain('om_replacement');
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('rechecks the same source on each transport attempt', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6].beforeWrite();
+        // First provider attempt is rate-limited and produces no confirmed id.
+        unavailable.add(SOURCE);
+        await args[6].beforeWrite();
+        writes.push(args[2]);
+        return 'om_top';
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toEqual([]);
+      expect(record).not.toHaveProperty('independentRootMessageId');
+      expect(mocks.createSession).not.toHaveBeenCalled();
+    });
+
+    it('retains a confirmed root after source failure and resumes without publishing another', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6].beforeWrite();
+        writes.push(args[2]);
+        lookupFailed.add(SOURCE);
+        return 'om_top';
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(record).toHaveProperty('independentRootMessageId', 'om_top');
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      lookupFailed.clear();
+      record.sourceCheckRetry.retryAt = Date.now() - 1;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toHaveLength(1);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not stage an executable opening when source fails during bot lookup', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.getAvailableBots.mockImplementation(async () => { lookupFailed.add(SOURCE); return []; });
+      await driveCrossPrincipalInterruptions(ds);
+      const child = [...activeSessions.values()].find(item => item !== ds)!;
+      expect(child).toBeDefined();
+      expect(child.pendingPrompt).toBeUndefined();
+      expect(child.session.queuedPrompt).toBeUndefined();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+      lookupFailed.clear();
+      record.sourceCheckRetry.retryAt = Date.now() - 1;
+      mocks.getAvailableBots.mockResolvedValue([]);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not infer the proposer source from the owner turn or its current root', async () => {
+      const { ds } = seedIndependent();
+      unavailable.add('om_unrelated_owner_root');
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toHaveLength(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      // Public-context/terminal-notice reads may inspect the old thread.
+      // Only outbound source checks carry the strict lookup options.
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000).map(([, id]) => id))
+        .not.toContain('om_unrelated_owner_root');
+    });
+
+    it('uses an explicit thread root for a synthetic turn instead of querying an execution id', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages[0].turnId = 'execution-turn';
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id).filter(id => id !== 'om_unrelated_owner_root')).toEqual([ROOT]);
+      expect(writes).toEqual([]);
+    });
+
+    it('keeps explicit unthreaded synthetic input separate from a historical reply root', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages[0].turnId = 'execution-turn';
+      record.messages[0].inThread = false;
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000)).toEqual([]);
+      expect(writes).toHaveLength(1);
+    });
+
+    it('retains a restored request with missing source evidence in stop mode', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages = [{ turnId: 'execution-turn', text: 'old input', userPrompt: 'old input', createdAt: NOW }] as any;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+    });
+
+    it.each(['before-resources', 'after-root', 'before-worker'] as const)(
+      'closes a blocked request at %s without later replaying its resources', async checkpoint => {
+        const { ds, record } = seedIndependent();
+        if (checkpoint === 'before-resources') unavailable.add(SOURCE);
+        if (checkpoint === 'after-root') mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+          await args[6].beforeWrite(); writes.push(args[2]); unavailable.add(SOURCE); return 'om_top';
+        });
+        if (checkpoint === 'before-worker') mocks.getAvailableBots.mockImplementation(async () => { unavailable.add(SOURCE); return []; });
+        await driveCrossPrincipalInterruptions(ds);
+        expect(record.phase).toBe('terminal_notice_pending');
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+        const rootCount = writes.length;
+        const childCount = mocks.createSession.mock.calls.length;
+        unavailable.clear();
+        await driveCrossPrincipalInterruptions(ds);
+        expect(writes).toHaveLength(rootCount);
+        expect(mocks.createSession).toHaveBeenCalledTimes(childCount);
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+      },
+    );
+    it('bounds source-check retries across restored records and respects their wake time', async () => {
+      const { ds, record } = seedIndependent();
+      lookupFailed.add(SOURCE);
+      await driveCrossPrincipalInterruptions(ds);
+      const checks = mocks.getMessageDetail.mock.calls.length;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail).toHaveBeenCalledTimes(checks);
+      for (let attempt = 2; attempt <= 3; attempt++) {
+        ds.session.crossPrincipalInterruptions = JSON.parse(JSON.stringify(ds.session.crossPrincipalInterruptions));
+        ds.session.crossPrincipalInterruptions[0].sourceCheckRetry.retryAt = Date.now() - 1;
+        await driveCrossPrincipalInterruptions(ds);
+      }
+      expect(ds.session.crossPrincipalInterruptions ?? []).toEqual([]);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(JSON.stringify(mocks.replyMessage.mock.calls)).toContain('无法核验');
+      expect(record.sourceCheckRetry.attempts).toBe(1);
+    });
+    it.each(['closed', 'replaced'] as const)('does not revive a %s source after an awaited check', async change => {
+      const { ds, record } = seedIndependent();
+      mocks.getMessageDetail.mockImplementationOnce(async () => {
+        if (change === 'closed') ds.session.status = 'closed';
+        else ds.session.crossPrincipalInterruptions = [];
+        throw new Error('lookup lost its session');
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(record.sourceCheckRetry).toBeUndefined();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+    });
+
+    it('preserves legacy behavior without source lookups', async () => {
+      const { ds } = seedIndependent();
+      getBot(APP).config.topicUnavailablePolicy = 'legacy';
+      unavailable.add(SOURCE);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000)).toEqual([]);
+      expect(writes).toHaveLength(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('fails a live legacy bot send closed without addressing protocol traffic back to bots', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_xpi_live_legacy_bot';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+
+    try {
+      await handleThreadReply(
+        makeBotEventData('om_legacy_bot_send', '旧版本未声明处理方式', anchor),
+        makeCtx(anchor, 'om_legacy_bot_send'),
+      );
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toBe('');
+    expect(repliedText()).not.toContain('[botmux-xpi-control:');
+    expect(repliedText()).not.toContain('ou_proposer_bot');
+    expect(ds.worker.send).not.toHaveBeenCalled();
+  });
+
+  it('consumes a legacy control marker before it can auto-create a third-party session', async () => {
+    const marker = '[botmux-xpi-control:v1:terminal:xpi_0123456789abcdef01234567]\n未执行';
+    // Make the foreign bot otherwise eligible for ordinary ingress. Without
+    // this, the permission gate would reject the mutated control message too,
+    // and the test could pass without exercising the early consume branch.
+    getBot(APP).resolvedAllowedUsers.push('ou_proposer_bot');
+
+    await handleThreadReply(
+      makeBotEventData('om_legacy_control', marker, 'om_unowned_control_root'),
+      makeCtx('om_unowned_control_root', 'om_legacy_control'),
+    );
+
+    expect(activeSessions.size).toBe(0);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(repliedText()).toBe('');
+  });
+
+  it('keeps an approved cross-principal record until the queue-full notice is delivered', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_queue_full', 'seeded') as any;
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-queue-full';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `queued-${index}`,
+      turnId: `queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_aaaaaaaaaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
+      phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const beforeQueue = structuredClone(ds.session.xpiSharedCwdQueuedTurns);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(repliedText()).toContain('本次未接收也不会执行');
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual(beforeQueue);
+  });
+
+  it('retains an approved cross-principal record when its queue-full notice fails', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_notice_retry', 'seeded') as any;
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:owner-notice-retry';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `retry-queued-${index}`,
+      turnId: `retry-queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
+      phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
+    mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({
+          id: 'xpi_bbbbbbbbbbbbbbbbbbbbbbbb',
+          phase: 'terminal_notice_pending',
+          terminalNoticeAttempts: 1,
+        }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      mocks.replyMessage.mockResolvedValue('om_terminal_recovered');
+      mocks.sendMessage.mockResolvedValue('om_terminal_recovered');
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+      expect(ds.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('retries a persisted terminal notice after daemon restart without replaying the business action', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_thread_terminal_notice_restart';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    const caller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:terminal-notice-restart';
+    ds.session.xpiSharedCwdAdmissionCoordinatorSessionId = 'missing-coordinator';
+    ds.session.xpiSharedCwdQueuedTurns = Array.from({ length: 32 }, (_, index) => ({
+      version: 1,
+      id: `restart-queued-${index}`,
+      turnId: `restart-queued-turn-${index}`,
+      caller,
+      userPrompt: `queued ${index}`,
+      cliInput: { content: `queued ${index}` },
+      resume: true,
+      createdAt: new Date(index).toISOString(),
+      dispatchState: 'queued',
+    }));
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_terminal_restart_123456',
+      ownerTurnId: 'owner-turn',
+      owner: caller,
+      proposer: {
+        ...caller,
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        requestLarkAppId: 'foreign-app-observer',
+      },
+      phase: 'owner_approved',
+      ownerUserPrompt: 'original owner task',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockRejectedValue(new Error('notice transport unavailable'));
+    mocks.sendMessage.mockRejectedValue(new Error('notice transport unavailable'));
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        id: 'xpi_terminal_restart_123456',
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+      expect(ds.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
+      const persisted = structuredClone(ds.session);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      activeSessions.clear();
+      vi.clearAllMocks();
+      mocks.replyMessage.mockResolvedValue('om_terminal_recovered_after_restart');
+      mocks.sendMessage.mockResolvedValue('om_terminal_recovered_after_restart');
+      const workerSend = vi.fn();
+      const restartedDs = {
+        ...ds,
+        worker: { killed: false, send: workerSend },
+        session: persisted,
+        crossPrincipalInterruptionDriving: false,
+        crossPrincipalWaitTimer: undefined,
+      } as any;
+
+      await restoreSessionsAndScheduleStartupRecovery({
+        larkAppId: APP,
+        restoreSessions: async () => {
+          activeSessions.set(sessionKey(anchor, APP), restartedDs);
+          return [];
+        },
+        markSessionsRestored: () => {},
+        driveRestoredXpiGroup: () => {},
+      });
+
+      await vi.waitFor(() => {
+        expect(restartedDs.session.crossPrincipalInterruptions).toBeUndefined();
+      });
+      expect(restartedDs.session.xpiSharedCwdQueuedTurns).toHaveLength(32);
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(repliedText()).toContain('建议已确认，但共享目录等待队列已满');
+    } finally {
+      activeSessions.clear();
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('replays the original owner task with the approved suggestion under the owner identity', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_replayaaaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: '生成发布说明并校验链接',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: '补充回滚步骤',
+        userPrompt: '补充回滚步骤',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    const sent = workerSend.mock.calls[0]?.[0];
+    expect(sent).toMatchObject({
+      type: 'message',
+      turnId: 'xpi_replayaaaaaaaaaaaaaaaaaa:approved',
+      atMostOnce: true,
+      trustedCaller: owner,
+    });
+    expect(sent.content).toContain('生成发布说明并校验链接');
+    expect(sent.content).toContain('补充回滚步骤');
+    expect(sent.content).toContain('请重新执行原任务');
+    expect(sent.content).not.toContain('ou_foreign_proposer');
+    expect(ds.lastUserPrompt).toContain('生成发布说明并校验链接');
+    expect(ds.lastUserPrompt).toContain('补充回滚步骤');
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      turnId: 'xpi_replayaaaaaaaaaaaaaaaaaa:approved',
+      caller: owner,
+    });
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('正在以你的身份重新执行原任务');
+    expect(repliedText()).toContain('你的建议已获确认');
+  });
+
+  it('wakes an approved T1 suggestion when later owner turn T2 completes', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_after_t2', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn-t2',
+      caller: owner,
+      userPrompt: 'T2 task',
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_replay_after_t2aaaaaaaaa',
+      ownerTurnId: 'owner-turn-t1',
+      owner,
+      ownerUserPrompt: 'T1 task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(workerSend).not.toHaveBeenCalled();
+      expect(ds.session.crossPrincipalInterruptions).toHaveLength(1);
+      expect(completedTurnHasCrossPrincipalFollower(ds, {
+        turnId: 'owner-turn-t2',
+        status: 'completed',
+      })).toBe(true);
+
+      ds.activeInteractiveTurn = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0]?.[0]).toMatchObject({
+      type: 'message',
+      turnId: 'xpi_replay_after_t2aaaaaaaaa:approved',
+      trustedCaller: owner,
+    });
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+  });
+
+  it('fails closed when an approved legacy record lacks the original owner prompt', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_missing', 'seeded') as any;
+    const workerSend = vi.fn();
+    ds.worker = { killed: false, send: workerSend };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_missingaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner: {
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+        requestUserUnionId: 'on_owner',
+        senderType: 'user' as const,
+      },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toContain('无法恢复原任务内容');
+  });
+
+  it('retains and schedules an approved replay when worker delivery is temporarily unavailable', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_retry', 'seeded') as any;
+    ds.worker = { killed: false, send: vi.fn(() => { throw new Error('ipc unavailable'); }) };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_retryaaaaaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner: {
+        requestLarkAppId: APP,
+        requestUserOpenId: OWNER,
+        requestUserUnionId: 'on_owner',
+        senderType: 'user' as const,
+      },
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({ id: 'xpi_retryaaaaaaaaaaaaaaaaaa', phase: 'owner_approved' }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+      expect(repliedText()).toContain('暂未成功启动');
+      expect(ds.activeInteractiveTurn).toBeUndefined();
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('enqueues an approved grouped replay once when its cold fork is marginally deferred', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_marginal', 'seeded') as any;
+    // Active, lease-free coordinator row so the cold-fork busy precheck passes
+    // and dispatch reaches the fork boundary.
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-marginal',
+      chatId: 'oc_coord_marginal',
+      rootMessageId: 'om_coord_marginal',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-marginal',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_marginalaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    // Marginal admission: the fork is accepted synchronously, but the group
+    // slot closure never fires (it only runs on the asynchronous re-entry).
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _turn: any, forkOpts: any) => {
+      forkOpts.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    // Asserted immediately after the synchronous dispatch leg: the turn must be
+    // durably queued and the record removed without waiting for any owner-wait
+    // timer (asserting only after a timer advance would also pass on the old
+    // retry-and-redrive behaviour).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual([
+      expect.objectContaining({
+        turnId: 'xpi_marginalaaaaaaaaaaaaaa:approved',
+        dispatchState: 'queued',
+      }),
+    ]);
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+    else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+  });
+
+  it('keeps the owner-wait retry when a grouped cold fork is hard-blocked rather than marginal', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    vi.useFakeTimers();
+    const ds = seedThreadSession('om_thread_owner_replay_hard', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-hard',
+      chatId: 'oc_coord_hard',
+      rootMessageId: 'om_coord_hard',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-hard',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_hardblockaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    // Synchronous refusal with the same boolean shape as marginal (hard memory
+    // block / retirement fence): accepted=true, closure unfired, but NO
+    // marginalReclaimScheduled out-flag. No re-entry is coming.
+    mocks.forkWorker
+      .mockImplementationOnce(() => true)
+      .mockImplementation(() => true);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+
+      // The record is retained and nothing is parked in the lease journal; the
+      // owner-wait timer owns the retry.
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(ds.session.crossPrincipalInterruptions?.map((r: any) => r.id))
+        .toEqual(['xpi_hardblockaaaaaaaaaaa']);
+      expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+      expect(ds.crossPrincipalWaitTimer).toBeTruthy();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // The retained record re-drove and forked a second time, still without
+      // journaling the turn (a third owner-wait is now pending).
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+      expect(ds.session.crossPrincipalInterruptions?.map((r: any) => r.id))
+        .toEqual(['xpi_hardblockaaaaaaaaaaa']);
+      expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      vi.useRealTimers();
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('persists a grouped opening into the leased queue when its cold fork is marginally deferred', async () => {
+    const ds = seedThreadSession('om_thread_group_opening_marginal', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-opening',
+      chatId: 'oc_coord_opening',
+      rootMessageId: 'om_coord_opening',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-opening',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.pendingPrompt = 'grouped opening task';
+    ds.pendingTurnId = 'om_group_opening';
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    // Marginal admission: synchronous fork accepted without firing the group
+    // slot closure.
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _turn: any, forkOpts: any) => {
+      forkOpts.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    const started = forkReservedInitialSession(ds, [], trustedCaller);
+
+    expect(started).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual([
+      expect.objectContaining({ turnId: 'om_group_opening', dispatchState: 'queued' }),
+    ]);
+    expect(ds.pendingTurnId).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+  });
+
+  it('retains a grouped opening buffers when its cold fork is synchronously refused outside marginal', () => {
+    const ds = seedThreadSession('om_thread_group_opening_hard', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-opening-hard',
+      chatId: 'oc_coord_opening_hard',
+      rootMessageId: 'om_coord_opening_hard',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-opening-hard',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.pendingPrompt = 'grouped opening task';
+    ds.pendingTurnId = 'om_group_opening_hard';
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    // Hard refusal with the marginal boolean shape but no marginal out-flag.
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    const started = forkReservedInitialSession(ds, [], trustedCaller);
+
+    expect(started).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // Nothing is parked in the journal; the opening buffers stay for the
+    // existing inbound/release retry paths.
+    expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+    expect(ds.pendingTurnId).toBe('om_group_opening_hard');
+    expect(ds.pendingPrompt).toBe('grouped opening task');
+  });
+});
+
+describe('XPI cross-app human classification identity', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.sessions.clear();
+    activeSessions.clear();
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
+    setCardDispatcher(createLarkAskCardDispatcher({
+      replyMessage: mocks.replyMessage,
+      sendMessage: mocks.sendMessage,
+    getMessageDetail: mocks.getMessageDetail,
+      updateMessage: vi.fn(async () => undefined),
+    }));
+    setCanTalkChecker(() => true);
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER, 'ou_target_proposer'];
+  });
+
+  it('resolves union_id in the receiving app and never reuses the source-app open_id', async () => {
+    const ds = seedThreadSession('om_xpi_cross_app_identity', 'seeded');
+    const result = await resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: 'ou_foreign_source_app',
+      requestUserUnionId: 'on_proposer',
+      requestLarkAppId: 'foreign-app-observer',
+      senderType: 'user',
+    }, 'proposer');
+
+    expect(result).toEqual({
+      status: 'resolved',
+      openId: 'ou_target_proposer',
+      source: 'resolved_from_union',
+    });
+    expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledWith(APP, 'on_proposer');
+  });
+
+  it('fails closed when a proposer has only a source-app open_id', async () => {
+    const ds = seedThreadSession('om_xpi_reject_foreign_open_id', 'seeded');
+    await expect(resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: 'ou_foreign_source_app',
+      requestLarkAppId: 'foreign-app-observer',
+      senderType: 'user',
+    }, 'proposer')).resolves.toEqual({ status: 'rejected_source_app_open_id' });
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('accepts an open_id captured by this exact app without a contact lookup', async () => {
+    // Same-app events (with or without a union_id stamp, and even when the
+    // contact API would refuse the user) already carry a target-app open_id;
+    // no conversion or owner-only fallback is needed.
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'definitive' });
+    const ds = seedThreadSession('om_xpi_owner_target_fallback', 'seeded');
+    await expect(resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner_hidden_from_contact',
+      requestLarkAppId: APP,
+      senderType: 'user',
+    }, 'owner')).resolves.toEqual({
+      status: 'resolved',
+      openId: OWNER,
+      source: 'target_app_same_app',
+    });
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the owner open_id only for a cross-app-captured active owner', async () => {
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'definitive' });
+    const ds = seedThreadSession('om_xpi_owner_cross_app_fallback', 'seeded');
+    await expect(resolveXpiHumanOpenId(ds, {
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner_hidden_from_contact',
+      requestLarkAppId: 'other-app',
+      senderType: 'user',
+    }, 'owner')).resolves.toEqual({
+      status: 'resolved',
+      openId: OWNER,
+      source: 'target_app_owner',
+    });
+  });
+
+  it('keeps a staged human message across bounded transient identity lookup retries', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'transient' });
+    const ds = seedThreadSession('om_xpi_transient_identity_retry', 'seeded') as any;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_transient_identity_1234',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_transient_identity_message',
+        text: '作为建议',
+        userPrompt: '作为建议',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({
+          id: 'xpi_transient_identity_1234',
+          identityResolutionRetry: { role: 'proposer', attempts: 1 },
+        }),
+      ]);
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.identityResolutionRetry)
+        .toEqual({ role: 'proposer', attempts: 2 });
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.terminalNoticeAttempts).toBe(2);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledTimes(6);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('binds the classification card to the target-app open_id and accepts that user click', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_xpi_cross_app_card';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cross_app_card_12345678',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_cross_app_message',
+        text: '作为建议',
+        userPrompt: '作为建议',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      const driving = driveCrossPrincipalInterruptions(ds);
+      await vi.waitFor(() => {
+        expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })).toBeDefined();
+      });
+      const ask = findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })!;
+      expect(ask.answererOpenId).toBe('ou_target_proposer');
+      expect(JSON.stringify(mocks.replyMessage.mock.calls)).not.toContain('ou_foreign_source_app');
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'suggestion',
+        by: 'ou_target_proposer',
+      })).toBe('accepted');
+      await driving;
+      expect(ds.session.crossPrincipalInterruptions).toEqual([
+        expect.objectContaining({ phase: 'awaiting_owner' }),
+      ]);
+      // The proposer notice is sent in the background after the queue is saved;
+      // awaiting the driver only guarantees the state transition has completed.
+      await vi.waitFor(() => {
+        expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      });
+      expect(repliedText()).not.toContain('消息已暂存，不会打断当前任务。');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('offers only an independent task when the active owner is a bot', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const anchor = 'om_xpi_bot_owner_human_card';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-bot-turn',
+      caller: { requestLarkAppId: 'owner-bot-app', requestUserOpenId: 'ou_owner_bot', senderType: 'bot' as const },
+    };
+    ds.worker = { killed: false, send: vi.fn() };
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_bot_owner_card_123456789',
+      ownerTurnId: 'owner-bot-turn',
+      owner: { requestLarkAppId: 'owner-bot-app', requestUserOpenId: 'ou_owner_bot', senderType: 'bot' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_bot_owner_human_message',
+        text: '请帮忙处理',
+        userPrompt: '请帮忙处理',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      const driving = driveCrossPrincipalInterruptions(ds);
+      await vi.waitFor(() => {
+        expect(findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })).toBeDefined();
+      });
+      const ask = findPendingAskByAnchor({ larkAppId: APP, chatId: CHAT, anchor })!;
+      expect(ask.questions[0]?.prompt).toContain('当前任务由机器人发起');
+      expect(ask.questions[0]?.options).toEqual([
+        { key: 'independent', label: '另开任务' },
+      ]);
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'suggestion',
+        by: 'ou_target_proposer',
+      })).toBe('stale');
+      expect(tryResolveAsk({
+        askId: ask.askId,
+        nonce: ask.nonce,
+        selected: 'independent',
+        by: 'ou_target_proposer',
+      })).toBe('accepted');
+      await driving;
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.phase)
+        .toMatch(/preparing_independent|independent_queued/);
+      expect(repliedText()).not.toContain('--as');
+      expect(repliedText()).not.toContain('requestLarkAppId');
+      expect(repliedText()).not.toContain('turnId');
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('fails closed with human guidance when the target app cannot resolve the proposer', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    mocks.resolveTargetAppOpenId.mockResolvedValue({ status: 'definitive' });
+    const ds = seedThreadSession('om_xpi_cross_app_unresolvable', 'seeded') as any;
+    ds.activeInteractiveTurn = {
+      turnId: 'owner-turn',
+      caller: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_cross_app_missing_123456',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' as const },
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_unresolvable',
+        senderType: 'user' as const,
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'om_cross_app_unresolvable',
+        text: 'human message',
+        userPrompt: 'human message',
+        createdAt: NOW,
+      }],
+    }];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({
+        phase: 'terminal_notice_pending',
+        terminalNoticeAttempts: 1,
+      });
+      expect(ds.crossPrincipalWaitTimer).toBeDefined();
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(ds.session.crossPrincipalInterruptions?.[0]?.terminalNoticeAttempts).toBe(2);
+
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      await driveCrossPrincipalInterruptions(ds);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(repliedText()).toBe('');
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.at(-1)).toMatchObject({
+      event: 'delivery_exhausted',
+      reason: 'terminal notice outer retry exhausted; closing on audit plane',
+    });
+    expect(repliedText()).not.toContain('ou_foreign_source_app');
+    expect(repliedText()).not.toContain('--as');
+  });
+});
+
+describe('XPI human terminal alert delivery', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.sessions.clear();
+    activeSessions.clear();
+    mocks.resolveTargetAppOpenId.mockImplementation(async (_appId: string, unionId: string) => ({
+      status: 'resolved' as const,
+      openId: `ou_target_${unionId.slice(3)}`,
+    }));
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  function seedAlertRecord(ds: DaemonSession): any {
+    return {
+      version: 1,
+      id: 'xpi_alert_test_123456789012',
+      ownerTurnId: 'owner-turn',
+      owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+      proposer: {
+        requestLarkAppId: 'proposer-app',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_human_proposer',
+        senderType: 'user',
+      },
+      phase: 'awaiting_classification',
+      messages: [{
+        turnId: 'turn-with-secret',
+        text: 'secret-original-body-should-not-leak',
+        userPrompt: 'secret-original-body-should-not-leak',
+        createdAt: NOW,
+      }],
+    };
+  }
+
+  it('does not send XPI outcomes for an already closed session', async () => {
+    const ds = seedThreadSession('om_alert_closed', 'seeded');
+    ds.session.status = 'closed';
+
+    await expect(notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式')).resolves.toBe(false);
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('stops an XPI outcome when the session closes during identity resolution', async () => {
+    const ds = seedThreadSession('om_alert_close_lookup', 'seeded');
+    let resolveIdentity!: (result: { status: 'resolved'; openId: string }) => void;
+    mocks.resolveTargetAppOpenId.mockImplementationOnce(() => new Promise(resolve => { resolveIdentity = resolve; }));
+    const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+    expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledOnce();
+
+    ds.session.status = 'closed';
+    resolveIdentity({ status: 'resolved', openId: 'ou_target_proposer' });
+
+    await expect(sending).resolves.toBe(false);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('stops XPI transport retries when the session closes during retry backoff', async () => {
+    vi.useFakeTimers();
+    const ds = seedThreadSession('om_alert_close_retry', 'seeded');
+    mocks.replyMessage.mockRejectedValueOnce(new Error('temporary failure'));
+    try {
+      const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      ds.session.status = 'closed';
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(sending).resolves.toBe(false);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not reschedule or persist an XPI terminal cycle after close during delivery', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_alert_close_cycle', 'seeded');
+    const record = seedAlertRecord(ds);
+    record.phase = 'terminal_notice_pending';
+    record.terminalNoticeText = '未选择处理方式';
+    ds.session.crossPrincipalInterruptions = [record];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      ds.session.status = 'closed';
+      ds.session.crossPrincipalInterruptions = undefined;
+      mocks.updateSession.mockClear();
+      throw new Error('delivery interrupted by close');
+    });
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.updateSession).not.toHaveBeenCalled();
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      expect(ds.crossPrincipalInterruptionDriving).toBe(false);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('records delivery_failed for three failures and then delivery_exhausted', async () => {
+    const ds = seedThreadSession('om_alert_retry', 'seeded');
+    const record = seedAlertRecord(ds);
+    mocks.replyMessage.mockRejectedValue(new Error('alert transport down'));
+    mocks.sendMessage.mockRejectedValue(new Error('alert transport down'));
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, '未选择处理方式')).resolves.toBe(false);
+
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
+      .toEqual(['delivery_failed', 'delivery_failed', 'delivery_failed', 'delivery_exhausted']);
+    expect(repliedText()).not.toContain('secret-original-body-should-not-leak');
+  });
+
+  it('records recovery on the second attempt and does not exhaust', async () => {
+    const ds = seedThreadSession('om_alert_recover', 'seeded');
+    const record = seedAlertRecord(ds);
+    mocks.replyMessage
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce('om_recovered');
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, '未选择处理方式')).resolves.toBe(true);
+
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.event))
+      .toEqual(['delivery_failed', 'delivery_recovered']);
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.some((item: any) => item.event === 'delivery_exhausted')).toBe(false);
+    expect(repliedText()).toContain('你未选择处理方式，该消息未执行。请重新发送。');
+    expect(repliedText()).not.toContain('接收应用');
+    expect(repliedText()).not.toContain('发送者类型');
+    expect(repliedText()).not.toContain('--as');
+    expect(repliedText()).not.toContain('generic terminal reason');
+  });
+
+  it('uses target-app identity and human guidance without bot --as instructions', async () => {
+    const ds = seedThreadSession('om_alert_cross_app_human', 'seeded');
+    const record = {
+      ...seedAlertRecord(ds),
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_source_app',
+        requestUserUnionId: 'on_human_proposer',
+        senderType: 'user',
+      },
+      messages: [{
+        turnId: 'om_x100b65fde2fa2cb0c224fa8cbfcb084',
+        text: 'secret-original-body-should-not-leak',
+        userPrompt: 'secret-original-body-should-not-leak',
+        createdAt: NOW,
+      }],
+    };
+
+    await expect(notifyCrossPrincipalTerminal(ds, record as any, '未选择处理方式')).resolves.toBe(true);
+
+    expect(repliedText()).toContain('<at id=ou_target_human_proposer></at>');
+    expect(repliedText()).toContain('你未选择处理方式，该消息未执行。请重新发送。');
+    expect(repliedText()).not.toContain('ou_foreign_source_app');
+    expect(repliedText()).not.toContain('--as');
+    expect(repliedText()).not.toContain('发送者类型');
+    expect(repliedText()).not.toContain('接收应用');
+    expect(repliedText()).not.toContain('turnId');
+    expect(repliedText()).not.toContain('4fa8cbfcb084');
+    expect(repliedText()).not.toContain('secret-original-body-should-not-leak');
+  });
+
+  it('fails closed outside a group/topic and records the route reason without sending', async () => {
+    const ds = seedThreadSession('om_alert_private', 'seeded');
+    ds.chatType = 'p2p';
+    const record = seedAlertRecord(ds);
+
+    await expect(notifyCrossPrincipalTerminal(ds, record, 'generic terminal reason')).resolves.toBe(false);
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(ds.session.crossPrincipalInterruptionDeliveryAudits?.map((item: any) => item.reason))
+      .toEqual(['alert route is not a group/topic', 'alert route is not a group/topic']);
+  });
+});
+
+/** 让匹配 predicate 的回复失败，其余照常成功（模拟 Lark 瞬时发送故障只打中某一条）。 */
+function failRepliesMatching(predicate: (content: string) => boolean, message: string): void {
+  mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+    if (predicate(String(args[2] ?? ''))) throw new Error(message);
+    return 'om_reply';
+  });
+  mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+    if (predicate(String(args[2] ?? ''))) throw new Error(message);
+    return 'om_top';
+  });
+}
+
+describe('durable admission then failing status reply → no resend advice (PR #846 review)', () => {
+  const resendNotice = () => tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
+  const admittedNotice = () => tr('daemon.ordinary_ingress_admitted_reply_failed', undefined, localeForBot(APP));
+  // 这些用例里的 pendingRepo 会话从没发过选仓卡（repoCardMessageId 缺席），daemon 的待选仓
+  // 回复走不指卡片的那条文案；有卡时才是 daemon.choose_repo_first。
+  const chooseRepoNotice = () => tr('daemon.choose_repo_no_card', undefined, localeForBot(APP));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mkdirSync(mocks.dataDir, { recursive: true });
+    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.sendMessage.mockResolvedValue('om_top');
+    mocks.getChatMode.mockResolvedValue('group');
+    mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.sessions.clear();
+    mocks.forkWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+    });
+    mocks.scanMultipleProjects.mockReturnValue([]);
+    mocks.getAvailableBots.mockResolvedValue([]);
+    mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+    activeSessions.clear();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+  });
+
+  it('pending-repo follower admitted to the durable tail: failing status reply keeps exactly one tail entry and never advises a resend', async () => {
+    const anchor = 'om_thread_pending_repo_1';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'durable opening';
+    ds.pendingTurnId = 'om_opening_turn';
+    failRepliesMatching(c => c.includes(chooseRepoNotice()), 'lark transient send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr1', 'follow-up work', anchor), makeCtx(anchor, 'om_msg_pr1')),
+    ).rejects.toThrow('lark transient send failure');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).toContain(admittedNotice());
+    expect(ds.session.queuedActivationTail?.length ?? 0).toBe(1);
+  });
+
+  it('pending-repo opening staged durably: failing status reply never advises a resend', async () => {
+    const anchor = 'om_thread_pending_repo_2';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = '';
+    failRepliesMatching(c => c.includes(chooseRepoNotice()), 'lark transient send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr2', 'becomes the opening', anchor), makeCtx(anchor, 'om_msg_pr2')),
+    ).rejects.toThrow('lark transient send failure');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).toContain(admittedNotice());
+    expect(ds.session.pendingRepoSetup?.turnId).toBe('om_msg_pr2');
+  });
+
+  // A failing repo card used to escape this handler and land here as an
+  // "admitted, do not resend" notice. That was the least-bad reading of a wedge:
+  // the turn was durably staged behind a picker that did not exist, so every
+  // follow-up hit 「请先在上方卡片中选择仓库」 and a restart re-published the same
+  // card. The publish sites now degrade instead — no picker means fork with the
+  // default cwd — so the turn actually runs. The invariant this case was written
+  // for still holds and is what it now pins: a failed card never advises a
+  // resend and never duplicates the queue item.
+  it('new topic staged + queued durably: a failing repo card degrades to a working session instead of wedging', async () => {
+    const anchor = 'om_msg_nt_admitted';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    failRepliesMatching(() => false, 'unused');
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    await handleNewTopic(makeEventData(anchor, 'start a durable task'), makeCtx(anchor, anchor));
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
+    expect(readFileSync(`${mocks.dataDir}/queues/${anchor}.jsonl`, 'utf-8').split('\n').filter(Boolean)).toHaveLength(1);
+  });
+
+  it('keeps the real new-topic handler pending until marginal admission reaches a terminal decision', async () => {
+    const anchor = 'om_primary_marginal_handler';
+    const ctx = makeCtx(anchor, anchor);
+    const queuePostAdmissionOutput = vi.fn();
+    ctx.queuePostAdmissionOutput = queuePostAdmissionOutput;
+    let forkOptions: any;
+    mocks.forkWorker.mockImplementationOnce((ds: any, _input: unknown, _turn: unknown, options: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      forkOptions = options;
+      options.marginalReclaimScheduled = true;
+      options.onAdmission?.('deferred');
+      return true;
+    });
+
+    let resolved = false;
+    const handling = handleNewTopic(
+      makeEventData(anchor, 'start after marginal reclaim'),
+      ctx,
+    ).then(() => { resolved = true; });
+    await vi.waitFor(() => expect(forkOptions).toBeDefined());
+    await Promise.resolve();
+    expect(resolved).toBe(false);
+    expect(queuePostAdmissionOutput).not.toHaveBeenCalled();
+
+    forkOptions.onAdmissionBlocked({
+      content: 'Memory pressure is critical',
+      turnId: anchor,
+    });
+    forkOptions.onAdmission('rejected');
+    await handling;
+
+    expect(resolved).toBe(true);
+    expect(queuePostAdmissionOutput).toHaveBeenCalledWith(expect.objectContaining({
+      content: 'Memory pressure is critical',
+      providerUuid: expect.stringMatching(/^admission_blocked_[a-f0-9]{24}$/),
+    }));
+  });
+
+  // 同一降级的另外两个发卡点。三处的 fallback 各自不同（raw passthrough 走
+  // forkReservedInitialRawSession，auto-create 走 noteTurnReceived +
+  // forkReservedInitialSession），所以分别钉住，避免只在一处补了兜底。
+  it('initial raw passthrough: a failing repo card runs the command on the default cwd', async () => {
+    const anchor = 'om_msg_raw_passthrough';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // /goal is claude-code's adapter default passthrough → initial raw passthrough route.
+    await handleNewTopic(makeEventData(anchor, '/goal ship the fix'), makeCtx(anchor, anchor));
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    // The raw command survives the degradation — it is what gets executed.
+    expect(ds?.pendingRawInput).toBe('/goal ship the fix');
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+  });
+
+  it('thread auto-create: a failing repo card forks the new session on the default cwd', async () => {
+    const anchor = 'om_autocreate_root';
+    mocks.scanMultipleProjects.mockReturnValue([
+      { name: 'demo', path: '/tmp/botmux-demo', type: 'repo', branch: 'main' },
+    ] as any);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_top';
+    });
+
+    // A reply under a root with no session → auto-create takes the picker route.
+    await handleThreadReply(
+      makeEventData('om_autocreate_msg', 'auto create me', anchor),
+      makeCtx(anchor, 'om_autocreate_msg'),
+    );
+
+    const ds: any = activeSessions.get(sessionKey(anchor, APP));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(repliedText()).not.toContain(chooseRepoNotice());
+  });
+
+  it('a failing admitted-notice never masks the original status-reply error', async () => {
+    const anchor = 'om_thread_pending_repo_3';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.pendingRepo = true;
+    ds.pendingPrompt = 'durable opening';
+    failRepliesMatching(
+      c => c.includes(chooseRepoNotice()) || c.includes(admittedNotice()),
+      'status reply transport down',
+    );
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pr3', 'follow-up work', anchor), makeCtx(anchor, 'om_msg_pr3')),
+    ).rejects.toThrow('status reply transport down');
+
+    expect(repliedText()).not.toContain(resendNotice());
+    expect(ds.session.queuedActivationTail?.length ?? 0).toBe(1);
+  });
+
+  it('pre-admission failure still advises a resend (unchanged behavior)', async () => {
+    const anchor = 'om_thread_pre_admission';
+    seedThreadSession(anchor, 'seeded');
+    mocks.downloadResources.mockRejectedValue(new Error('boom: before any admission'));
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_pre', 'never admitted', anchor), makeCtx(anchor, 'om_msg_pre')),
+    ).rejects.toThrow('boom: before any admission');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('worker-dead refork failure still advises a resend: the turn was never accepted anywhere durable', async () => {
+    const anchor = 'om_thread_refork_fail';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.hasHistory = true;
+    mocks.forkWorker.mockImplementation(() => {
+      throw new Error('fork failed: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_refork', 'run the task', anchor), makeCtx(anchor, 'om_msg_refork')),
+    ).rejects.toThrow('fork failed: EAGAIN');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('a rejected /vc-auth (pure-reply branch, no side effect) still advises a resend', async () => {
+    const anchor = 'om_thread_vc_auth_help';
+    seedThreadSession(anchor, 'seeded');
+    failRepliesMatching(() => true, 'vc-auth usage send failure');
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_vcauth', '/vc-auth help', anchor), makeCtx(anchor, 'om_msg_vcauth')),
+    ).rejects.toThrow('vc-auth usage send failure');
+
+    expect(repliedText()).toContain(resendNotice());
+    expect(repliedText()).not.toContain(admittedNotice());
+  });
+
+  it('queued-activation-pending refork clears suppressRecoveryCard (user inbound ends restart silence)', async () => {
+    const anchor = 'om_thread_queued_pending';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    // Restart restore: recovery silence set, a queued activation still pending
+    // from before the daemon died.
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-pending-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qp', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qp'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // This branch returns without rememberLastCliInput, so it must clear the
+    // recovery flag itself once the fork is ACCEPTED — otherwise every later
+    // async worker death stays muted and the session is permanently silent.
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('retained-queued-activation refork clears suppressRecoveryCard too', async () => {
+    const anchor = 'om_thread_queued_retained';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queued = true;
+    ds.session.queuedActivationInput = { content: 'retained opening task' };
+    ds.session.queuedActivationTurnId = 'turn-queued-retained-1';
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qr', '继续任务', anchor),
+      makeCtx(anchor, 'om_msg_qr'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBeUndefined();
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker returns false (rejection leg, same predicate as main refork)', async () => {
+    const anchor = 'om_thread_queued_rejected';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    ds.session.queuedActivationTurnId = 'turn-queued-rejected-1';
+    // false = quarantine / session no longer active non-throwing rejection;
+    // the fork was not accepted, so recovery silence must survive exactly as
+    // on the sync-throw path.
+    mocks.forkWorker.mockImplementationOnce(() => false);
+
+    await handleThreadReply(
+      makeEventData('om_msg_qj', '继续', anchor),
+      makeCtx(anchor, 'om_msg_qj'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.suppressRecoveryCard).toBe(true);
+  });
+
+  it('queued refork keeps suppressRecoveryCard when forkWorker throws synchronously (clear happens only after acceptance)', async () => {
+    const anchor = 'om_thread_queued_throw';
+    const ds = seedThreadSession(anchor, 'seeded') as any;
+    ds.suppressRecoveryCard = true;
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = '';
+    mocks.forkWorker.mockImplementationOnce(() => {
+      throw new Error('fork threw: EAGAIN');
+    });
+
+    await expect(
+      handleThreadReply(makeEventData('om_msg_qt', '继续', anchor), makeCtx(anchor, 'om_msg_qt')),
+    ).rejects.toThrow('fork threw: EAGAIN');
+
+    // Timing contract: the flag is cleared only AFTER forkWorker returns. A
+    // sync throw keeps the silence and routes to the ingress-notice catch.
+    expect(ds.suppressRecoveryCard).toBe(true);
+  });
+});

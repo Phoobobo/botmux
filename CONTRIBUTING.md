@@ -5,18 +5,62 @@
 ```bash
 git clone https://github.com/deepcoldy/botmux.git
 cd botmux
-pnpm install
-pnpm build
+bun install --frozen-lockfile
+bun run build
 
-# Run directly (no PM2)
-pnpm daemon
+# Run directly (foreground)
+bun run daemon
 
-# Or with PM2
-pnpm daemon:start
-pnpm daemon:logs
+# Or under the built-in supervisor
+bun run daemon:start
+bun run daemon:logs
 ```
 
-> Every code change requires `pnpm build` then `pnpm daemon:restart`.
+> Every code change requires `bun run build` then `bun run daemon:restart`.
+
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.3`,
+> lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
+> `node-pty`: bun does not run dependency lifecycle scripts by default, and
+> `node-pty` needs its install hook to build `build/Release/pty.node` — without
+> it the PTY layer is dead and the compiled single-file binary cannot be built.
+> The list is deliberately just `["electron","node-pty"]` (identical to the
+> `onlyBuiltDependencies` it replaced) — don't "complete" it by adding esbuild:
+> its binary comes from the `@esbuild/<platform>` package, not its postinstall.
+>
+> This is about *building botmux from source*. How **end users install botmux**
+> is a separate matter — `pnpm i -g botmux` is still a supported install path
+> (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
+> those to bun.
+
+## Midscene Test · Feishu browser E2E
+
+The existing Feishu browser scenarios in `test/e2e-browser/` run through
+`@midscene/test`. Their Playwright and Midscene Web assertions are registered as
+native YAML cases, preserving the original scenario behavior while adding
+Midscene Test selection, retries, summaries, and unified reports.
+
+Create `storageState.json` and provide the Feishu and `MIDSCENE_MODEL_*`
+variables shown in `.env.example`, then run:
+
+```bash
+bun run test:midscene:typecheck
+bun run test:e2e-browser
+```
+
+Each invocation writes its replayable report below the gitignored
+`midscene_run/runs/<run-id>/` directory.
+
+## 调试飞书卡片回调
+
+设置 `BOTMUX_CARD_ACTION_DIAGNOSTICS=1` 启动或重启待验证的 daemon，点击卡片后查找
+`[card-action-diagnostics]` 日志。`dispatcher` 记录归一化之前的字段结构，`handler`
+记录进入业务处理时的结构；两者均包含外层是否有 `event`、action 字段名、value 类型，
+以及解析后的 `action`、`result`、`expected_feedback_id`。完整事件载荷、token、用户与
+消息标识、表单正文不会输出。该开关默认关闭，排查结束后取消设置并重启。
+
+归一化必须先于动作分类和去重。回归测试应通过真实反馈存储验证 revision 和同卡更新，
+同时验证下拉/表单字段、身份校验及重复点击行为。卡片定义里的 `behaviors[].value`
+不能代替实际回调载荷；未拿到线上原始结构时，PR 应明确标注尚未完成线上实测。
 
 ## Architecture
 
@@ -25,6 +69,7 @@ Lark WebSocket Events
     |
 Daemon (daemon.ts → core/ modules)
     |-- im/lark/event-dispatcher: event routing
+    |-- im/lark/transport/connection: WebSocket connection and failed-state recovery
     |-- im/lark/card-handler: card interactions
     |-- core/worker-pool: worker process pool
     |-- core/command-handler: slash commands
@@ -80,6 +125,7 @@ src/
     lark/
       client.ts             # Lark API wrapper
       event-dispatcher.ts   # Lark WebSocket event routing
+      transport/connection.ts # WebSocket connection, proxy and failed-state recovery
       card-handler.ts       # Lark card interaction handling
       card-builder.ts       # Lark interactive card builders
       message-parser.ts     # Lark event message parsing
@@ -123,7 +169,7 @@ teach the agent when/how to use them.
 
 | Subcommand | Description |
 |------------|-------------|
-| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--mention` flags) |
+| `botmux send [content]` | Send message to current thread (stdin / heredoc / `--content-file`; `--images` / `--files` / `--videos` / `--mention` flags) |
 | `botmux bots list` | List bots in current chat with their `open_id`s |
 | `botmux thread messages [--limit N]` | Fetch thread message history (JSON) |
 | `botmux schedule add <schedule> <prompt>` | Create scheduled task bound to current thread |
@@ -140,6 +186,9 @@ spawn child processes — no extra protocol support required from the CLI.
 2. Add the new ID to the `CliId` type in `src/adapters/cli/types.ts`
 3. Add a case to the switch in `src/adapters/cli/registry.ts`
 4. Set `"cliId": "<new-id>"` in `bots.json` to use it
+
+> Full checklist — display names, setup choices, README updates:
+> see [`src/adapters/cli/CLAUDE.md`](src/adapters/cli/CLAUDE.md).
 
 The `CliAdapter` interface requires:
 
@@ -158,8 +207,66 @@ The `CliAdapter` interface requires:
 
 ## Tests
 
+Tests are split into two Vitest projects with different execution profiles
+(see `vitest.config.ts`):
+
+- **`unit`** (`*.test.ts`) — pure, filesystem-mocked or temp-dir-isolated.
+  Runs with **file parallelism on** (one process per file). This is what
+  `bun run test` runs; it needs no real CLI binary or browser. The full project
+  takes minutes, not seconds (CI splits it into four shards balanced by recorded
+  per-file duration, see `scripts/duration-shards.mjs`), so while iterating run
+  only the files you touched: `bun run test -- test/<name>.test.ts`.
+- **`e2e`** (`*.e2e.ts`, excluding `test/e2e-browser/`) — spawns real CLIs and
+  runs sequentially. Opt-in only.
+- **Feishu browser E2E** (`test/e2e-browser/cases/*.yaml`) — runs through
+  `@midscene/test` against a shared daemon and logged-in browser session.
+
 ```bash
-pnpm test                # Run all tests (unit + E2E)
-pnpm test:codex          # Codex input E2E
-pnpm test:gemini         # Gemini CLI input E2E
+bun run test                # Unit tests only — parallel (default)
+bun run test:all            # Unit + E2E (needs real CLIs / browser session)
+bun run test:e2e            # All *.e2e.ts (sequential)
+bun run test:e2e-browser    # Feishu browser cases through Midscene Test
+bun run test:codex          # Codex input E2E
+bun run test:gemini         # Gemini CLI input E2E
+bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
+bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
+
+> **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
+> submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by
+> `src/utils/timing.ts`, default `1` = unchanged in production) multiplies every
+> such delay. Filesystem-mocked unit tests set it small to collapse those waits.
+> See [`docs/test-benchmark.md`](docs/test-benchmark.md).
+
+### What Makes a Test Worth Keeping
+
+Tests must prove **behavior**, not photograph the implementation. Before writing
+one, ask: will it fail on a real behavioral regression, and will it stay green
+through a harmless refactor, copy edit or tuning change? The full rules live in
+the "测试原则" section of [`CLAUDE.md`](CLAUDE.md); in short:
+
+- Do not read `src/` files as text and assert on their contents. Extract the
+  logic into an exported function and test that instead. The few genuine
+  structural guards (import boundaries, compiled-binary constraints, security
+  guards without a behavioral seam, high-severity regression tripwires,
+  machine-checkable consistency) must carry a `// 源码结构护栏(Kx)：…` comment
+  (or `// 非文本断言：…` when a src asset is only used as a fixture);
+  `test/test-hygiene.test.ts` rejects unmarked ones.
+- Do not pin documentation wording, UI copy or internal tuning constants.
+  External protocol values and relationships between constants are fine.
+- Do not keep production exports alive just for their tests: wire them in or
+  delete both.
+
+### Timing-Sensitive Test Contract
+
+- Treat a test fixture's `ready` handshake as a happens-before barrier, not a
+  progress log: publish it only after every handler, listener, resource, and
+  durable state needed by the parent's next action is installed.
+- Establish preconditions and postconditions through the exact observable event
+  or state under assertion. Do not infer sibling or downstream telemetry from a
+  lifecycle event unless its contract explicitly orders them. Fixed sleeps may
+  model intentional timing or bound a hang, but must not stand in for readiness.
+- Make scheduler-sensitive ordering deterministic in the fixture. Widen a
+  timeout only for proven slow-but-progressing work, and never use retries to
+  mask a missing barrier or known race.
+- Keep every wait bounded and make timeout errors identify the unmet condition.

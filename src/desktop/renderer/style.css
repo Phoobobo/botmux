@@ -1,0 +1,787 @@
+:root {
+  color-scheme: dark;
+  /* Desktop shell tokens mirror the bundled dashboard's dark design system. */
+  --bg: #07090f;
+  --bg-soft: #0b0f17;
+  --surface: #0e141d;
+  --surface-raised: #151d29;
+  --surface-muted: #0b1018;
+  --text: #eef2f8;
+  --muted: #99a3b3;
+  --faint: #5d6675;
+  --border: #25303f;
+  --border-soft: #1a2330;
+  --accent: #5be3ff;
+  --accent-strong: #8feeff;
+  --accent-soft: rgba(91, 227, 255, 0.13);
+  --info: #4f8bff;
+  --info-soft: rgba(79, 139, 255, 0.14);
+  --danger: #ff6b81;
+  --danger-soft: rgba(255, 107, 129, 0.13);
+  --warning: #ffc24d;
+  --success: #4ee69a;
+  --success-soft: rgba(78, 230, 154, 0.13);
+  --on-accent: #051018;
+  --radius: 14px;
+  --radius-sm: 9px;
+  --sidebar-width: 250px;
+  --topbar-height: 56px;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  width: 100%;
+  /* Match desktopWindowMinWidth: 980px dashboard content + 250px native rail. */
+  min-width: 1230px;
+  min-height: 680px;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  color: var(--text);
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.72), rgba(7, 9, 15, 0.98)),
+    var(--bg);
+  /* Native app chrome: labels, pills, and buttons are controls, not copyable
+     text. Diagnostic text re-enables selection below. */
+  user-select: none;
+}
+
+.runtime-meta,
+.version-line,
+.log-output,
+.empty-dashboard {
+  user-select: text;
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+button {
+  min-width: 0;
+  height: 36px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 0 12px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button:disabled,
+select:disabled,
+input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  height: 100vh;
+  padding: 18px 14px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+  border-right: 1px solid var(--border);
+  backdrop-filter: blur(20px);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  padding: 6px 8px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  flex: 0 0 34px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  color: #06101a;
+  background: radial-gradient(circle at 32% 28%, #aef4ff, var(--accent) 38%, var(--info) 68%, #0a1530 105%);
+  box-shadow: 0 0 16px rgba(91, 227, 255, 0.42), inset 0 0 8px rgba(255, 255, 255, 0.3);
+  font-weight: 700;
+}
+
+.brand-text {
+  min-width: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.brand-text strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-text strong {
+  font-size: 15px;
+  line-height: 1.2;
+  letter-spacing: 0;
+}
+
+.sidebar-nav {
+  display: grid;
+  flex: 1 1 auto;
+  gap: 2px;
+  margin-top: 18px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  align-content: start;
+  /* Master keeps adding dashboard sections; scroll only the menu so runtime
+     controls stay reachable at the bottom of the native shell. */
+  scrollbar-width: thin;
+}
+
+.sidebar-nav a {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.sidebar-nav a:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.sidebar-nav a.active {
+  color: var(--accent-strong);
+  background: linear-gradient(120deg, rgba(91, 227, 255, 0.16), rgba(79, 139, 255, 0.10));
+  border-color: rgba(91, 227, 255, 0.30);
+  box-shadow: inset 0 0 0 1px rgba(91, 227, 255, 0.10);
+}
+
+.sidebar-nav svg {
+  flex: 0 0 17px;
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sidebar-nav::-webkit-scrollbar {
+  width: 6px;
+}
+
+.sidebar-nav::-webkit-scrollbar-thumb {
+  background: rgba(153, 163, 179, 0.28);
+  border-radius: 999px;
+}
+
+.sidebar-foot {
+  /* Three rows — status line, action group, version — spaced evenly. */
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 9px;
+  flex: 0 0 auto;
+  margin-top: 10px;
+  padding: 10px 6px 0;
+  border-top: 1px solid var(--border);
+}
+
+.runtime-line {
+  /* Status reads left, the launch-at-login switch right-aligns on the same line. */
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.runtime-line > .login-row {
+  /* Multi-line runtime meta grows the row; keep the switch level with the
+     first (status) line instead of drifting to the vertical middle. */
+  align-self: start;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #87909b;
+  box-shadow: 0 0 0 3px rgba(135, 144, 155, 0.18);
+}
+
+.status-dot[data-status="running"] {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(78, 230, 154, 0.16);
+}
+
+.status-dot[data-status="starting"] {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(91, 227, 255, 0.16);
+}
+
+.status-dot[data-status="degraded"] {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px rgba(189, 123, 25, 0.2);
+}
+
+.status-dot[data-status="not_configured"],
+.status-dot[data-status="stopped"] {
+  background: #9aa3ad;
+}
+
+.runtime-copy {
+  min-width: 0;
+}
+
+.runtime-status {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+  /* Exactly the switch height, so the status line and the launch-at-login
+     row that shares this line have identical vertical centers. */
+  line-height: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-meta {
+  min-height: 0;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.runtime-actions {
+  /* Only state-relevant actions are visible (start vs stop/restart), so the
+     row flexes to share space among whichever buttons are shown. */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: rgba(6, 10, 16, 0.42);
+}
+
+.runtime-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 28px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border-color: transparent;
+  color: var(--muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+}
+
+.runtime-action[hidden] {
+  display: none;
+}
+
+.runtime-action svg {
+  flex: 0 0 13px;
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.runtime-action-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-action:hover:not(:disabled) {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.065);
+}
+
+.runtime-action-primary {
+  color: var(--on-accent);
+  background: linear-gradient(135deg, var(--accent), var(--info));
+  box-shadow: 0 4px 12px rgba(79, 139, 255, 0.2);
+}
+
+.runtime-action-primary svg {
+  fill: currentColor;
+  stroke: none;
+}
+
+.runtime-action-primary:hover:not(:disabled) {
+  color: var(--on-accent);
+  border-color: rgba(174, 244, 255, 0.68);
+  background: linear-gradient(135deg, var(--accent-strong), #6aa2ff);
+  box-shadow: 0 5px 14px rgba(91, 227, 255, 0.24);
+}
+
+.runtime-action-danger {
+  color: #ff91a1;
+}
+
+.runtime-action-danger:hover:not(:disabled) {
+  color: #ffd8de;
+  border-color: rgba(255, 107, 129, 0.34);
+  background: var(--danger-soft);
+}
+
+.runtime-action-quiet {
+  color: var(--muted);
+}
+
+.runtime-action-takeover {
+  flex: 1 1 100%;
+  min-height: 30px;
+  justify-content: center;
+  padding: 0 10px;
+  border-color: rgba(255, 194, 77, 0.28);
+  background:
+    linear-gradient(90deg, rgba(255, 194, 77, 0.18), rgba(255, 194, 77, 0.07)),
+    rgba(255, 194, 77, 0.06);
+  color: var(--warning);
+}
+
+.runtime-action-takeover:hover:not(:disabled) {
+  color: #ffe1a3;
+  border-color: rgba(255, 194, 77, 0.52);
+  background:
+    linear-gradient(90deg, rgba(255, 194, 77, 0.25), rgba(255, 194, 77, 0.1)),
+    rgba(255, 194, 77, 0.08);
+}
+
+.footer-meta-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  align-items: center;
+  min-width: 0;
+}
+
+.login-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+  margin-top: 0;
+  padding: 0;
+  color: var(--muted);
+  /* Sits beside the 13px/650 runtime status; match its tone one notch smaller,
+     on the same exact 16px line box so both text centers coincide. */
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.login-row:has(input:disabled) {
+  cursor: not-allowed;
+}
+
+/* The real checkbox stays in the tree for the label/a11y wiring; the switch
+   track next to it is the visible control (macOS-style sliding toggle). */
+.login-row input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.login-switch {
+  flex: 0 0 26px;
+  position: relative;
+  width: 26px;
+  height: 16px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+.login-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  transition: transform 160ms ease;
+}
+
+.login-row input:checked ~ .login-switch {
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  box-shadow: none;
+}
+
+.login-row input:checked ~ .login-switch::after {
+  transform: translateX(10px);
+}
+
+.login-row input:disabled ~ .login-switch {
+  opacity: 0.55;
+}
+
+.login-row input:focus-visible ~ .login-switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.login-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.login-row[data-enabled="true"] .login-label {
+  color: var(--text);
+}
+
+.version-line {
+  min-height: 0;
+  min-width: 0;
+  padding: 0;
+  color: var(--faint);
+  font-size: 10.5px;
+  line-height: 1.2;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace {
+  display: grid;
+  grid-template-rows: var(--topbar-height) minmax(0, 1fr);
+  min-width: 0;
+  min-height: 100vh;
+}
+
+.topbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+  padding: 8px 20px;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(18px);
+}
+
+.topbar-title {
+  display: none;
+}
+
+.topbar-title strong,
+.topbar-title span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-title strong {
+  font-size: 16px;
+  line-height: 1.2;
+}
+
+.topbar-title span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.topbar-status,
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.topbar-status {
+  /* Read-only summary lives on the left; interactive actions right-align. */
+  justify-content: flex-start;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  height: 26px;
+  padding: 0 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.status-pill strong {
+  color: var(--accent-strong);
+  font-size: 13px;
+}
+
+.topbar-actions {
+  justify-content: flex-end;
+}
+
+.locale-toggle {
+  display: inline-flex;
+  gap: 2px;
+  height: 32px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.locale-toggle button {
+  height: 24px;
+  min-width: 32px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.locale-toggle button.active {
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  color: var(--on-accent);
+}
+
+.topbar-actions > button,
+.topbar-actions > a,
+.logs-actions button {
+  height: 32px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.045);
+  color: var(--text);
+  /* Buttons inherit the 16px document size otherwise; the rest of the shell
+     chrome (sidebar nav, pills, locale toggle) sits at 12-13px. */
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.topbar-actions > button:hover:not(:disabled),
+.topbar-actions > a:hover,
+.logs-actions button:hover:not(:disabled) {
+  border-color: rgba(91, 227, 255, 0.34);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.topbar-actions > a {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+#create-session-btn,
+#add-bot-btn {
+  border-color: transparent;
+  background: linear-gradient(120deg, var(--accent), var(--info));
+  color: var(--on-accent);
+  box-shadow: 0 4px 16px rgba(91, 227, 255, 0.24);
+}
+
+#create-session-btn:hover:not(:disabled),
+#add-bot-btn:hover:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+}
+
+#stop-btn {
+  color: var(--danger);
+}
+
+.dashboard-host {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+#dashboard-frame {
+  /* Electron webview guests only resize reliably when the host is flex-laid. */
+  display: flex;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--bg);
+}
+
+#dashboard-frame[data-visible="false"] {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.empty-dashboard {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  padding: 32px;
+  color: var(--muted);
+  font-size: 15px;
+  text-align: center;
+  background: var(--bg);
+}
+
+.empty-dashboard[hidden] {
+  display: none;
+}
+
+.logs {
+  /* The drawer overlays only the dashboard area; the control rail stays usable. */
+  position: fixed;
+  left: var(--sidebar-width);
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  height: min(42vh, 340px);
+  min-height: 260px;
+  display: grid;
+  grid-template-rows: 54px minmax(0, 1fr);
+  background: rgba(14, 20, 29, 0.96);
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -18px 42px rgba(0, 0, 0, 0.34);
+  backdrop-filter: blur(18px);
+  transform: translateY(100%);
+  transition: transform 160ms ease;
+}
+
+.logs.open {
+  transform: translateY(0);
+}
+
+.logs-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.logs-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.logs-heading h2 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.2;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+#log-target {
+  width: 180px;
+  max-width: 28vw;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 28px 0 10px;
+  color: var(--text);
+  background: var(--surface-raised);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.logs-actions {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.logs-actions button {
+  height: 32px;
+  padding: 0 10px;
+}
+
+.log-output {
+  margin: 0;
+  padding: 12px;
+  min-width: 0;
+  overflow: auto;
+  color: #dbe3eb;
+  background: var(--surface-muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

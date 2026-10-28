@@ -1,11 +1,26 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
 
-export type ConnectorVerifyType = 'hmac-sha256';
+export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
+export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
+export type ConnectorLifecycleGroupNameMode = 'default' | 'fixed' | 'template';
+
+export interface ConnectorTopicMessageExtractor {
+  path: string;
+  kind: 'text' | 'mention';
+  /** Relative path within each extracted mention object. Omit when the
+   *  extracted value itself is the identity string. */
+  identityPath?: string;
+  /** Optional relative path for the display name used inside/fallback from a
+   *  native Lark mention. */
+  namePath?: string;
+}
 
 export interface ConnectorDefinition {
   id: string;
@@ -35,16 +50,59 @@ export interface ConnectorDefinition {
     headerAllowlist: string[];
     includeRawText: boolean;
     maxBodyBytes: number;
+    // Trusted task ("what should the bot do with this event"); injected above the
+    // untrusted event data when a turn fires. Empty/absent = no extra instruction.
+    instruction?: string;
   };
+  /** Feishu topic seed shown when this webhook has to open a new topic.
+   *  Missing on older stores means `default` for backwards compatibility. */
+  topicMessage?: {
+    mode: ConnectorTopicMessageMode;
+    /** Custom text may contain `{source}`, resolved from promptEnvelope.sourceName. */
+    text?: string;
+    /** Connector-owner allowlist used only by `template` mode. Aliases become
+     *  `{{alias}}` or `{{mention alias}}` tokens in `text`. */
+    extractors?: Record<string, ConnectorTopicMessageExtractor>;
+  };
+  /** When true, the daemon drops the trailing final_output reply for turns this
+   *  webhook fires (the live streaming card / start notice still show). Lets a
+   *  webhook that only needs the bot's in-topic `botmux send` output avoid the
+   *  extra "完成/总结" message. Missing = false. Ignored for wait/async response
+   *  modes, whose whole contract is to return the final output. */
+  suppressFinalOutput?: boolean;
   loggingPolicy: {
     storePayload: boolean;
     storeHeaders: boolean;
     retentionDays: number;
   };
+  // new-group dedup: null = no dedup (every event → a fresh group); { dedupKey }
+  // = events whose payload yields the same value at `dedupKey` share one group.
   lifecycleExtractors: null | {
     dedupKey: string;
-    status: string;
-    statusMap?: Record<string, string>;
+  };
+  /** Feishu chat name for `target.mode === 'new-group'`. Missing means the
+   *  historical default: `<connector name>: <dedup key or request id>`. */
+  lifecycleGroupName?: {
+    mode: ConnectorLifecycleGroupNameMode;
+    /** Fixed name, or a template using `{{source}}`, `{{dedupKey}}`,
+     *  `{{requestId}}`, or JSON body paths such as `{{alert.title}}`. */
+    text?: string;
+  };
+  /** Inbound duplicate-delivery suppression for an at-least-once upstream.
+   *
+   *  Header/query carriage needs NO config — a key presented by the sender is
+   *  always honoured (sending it IS the declaration that the delivery is
+   *  uniquely identified), which is what makes this fix land on existing
+   *  connectors without an edit. These two knobs only cover what can't be
+   *  inferred:
+   *  - `keyPath`: dotted body path for senders that can't set a header (they can
+   *    only paste a URL), so the unique id lives inside the event JSON.
+   *  - `disabled`: escape hatch for an upstream that reuses one id across
+   *    genuinely distinct events, where suppression would lose real events.
+   *  Absent (older stores) = header/query honoured, no body path. */
+  idempotency?: {
+    keyPath?: string;
+    disabled?: boolean;
   };
   rateLimit?: {
     windowSeconds: number;
@@ -79,21 +137,18 @@ function normalizeStore(raw: unknown): ConnectorStoreFile {
 }
 
 export function readConnectorStore(dataDir: string = config.session.dataDir): ConnectorStoreFile {
-  const fp = storePath(dataDir);
-  if (!existsSync(fp)) return emptyStore();
-  try {
-    return normalizeStore(JSON.parse(readFileSync(fp, 'utf-8')));
-  } catch {
-    return emptyStore();
-  }
+  // 损坏的文件被隔离为 .corrupt-*（而不是被下一次 writeConnectorStore 覆盖），见 utils/json-file.ts。
+  return normalizeStore(readJsonFileSoft<Record<string, any>>(storePath(dataDir), {
+    fallback: () => ({}),
+    validate: isJsonObject,
+    label: 'connector-store',
+  }));
 }
 
 function writeConnectorStore(dataDir: string, store: ConnectorStoreFile): void {
   const fp = storePath(dataDir);
   mkdirSync(dirname(fp), { recursive: true });
-  const tmp = `${fp}.${process.pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
-  renameSync(tmp, fp);
+  atomicWriteFileSync(fp, JSON.stringify(normalizeStore(store), null, 2) + '\n', { mode: 0o600, followTargetSymlink: false });
 }
 
 export function listConnectors(dataDir: string = config.session.dataDir): ConnectorDefinition[] {

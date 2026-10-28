@@ -1,0 +1,133 @@
+/**
+ * Guards the per-turn model/reasoningEffort consumption chain at the adapter
+ * boundary (launch args / thread config).
+ */
+import { describe, it, expect, vi } from 'vitest';
+
+// codex-app buildArgs resolves the codex binary via resolveCommand; return the
+// path as-is so we can assert the emitted flags without shelling out.
+vi.mock('../src/adapters/cli/registry.js', async (orig) => {
+  const actual = await orig<typeof import('../src/adapters/cli/registry.js')>();
+  return { ...actual, resolveCommand: (bin: string) => bin };
+});
+
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+
+const BASE = { sessionId: 's1', resume: false, workingDir: '/tmp' } as const;
+
+describe('codex adapter buildArgs — reasoningEffort injection', () => {
+  it('injects -c model_reasoning_effort verbatim (xhigh NOT downgraded)', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: 'xhigh' });
+    const i = args.indexOf('model_reasoning_effort="xhigh"');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+    // must not appear as high — that would be the removed downgrade
+    expect(args.join(' ')).not.toContain('model_reasoning_effort="high"');
+  });
+
+  it('passes each effort level through unchanged', () => {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
+      expect(args.join(' ')).toContain(`model_reasoning_effort="${e}"`);
+    }
+  });
+
+  it('omits the -c effort flag when no effort is given', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE });
+    expect(args.join(' ')).not.toContain('model_reasoning_effort');
+  });
+
+  it('injects --model when provided', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, model: 'gpt-5.6-terra' });
+    const i = args.indexOf('gpt-5.6-terra');
+    expect(args[i - 1]).toBe('--model');
+  });
+});
+
+describe('codex adapter buildArgs — serviceTier injection', () => {
+  const override = 'service_tier="priority"';
+
+  it('fresh launch injects the -c service_tier override', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, serviceTier: 'priority' });
+    const i = args.indexOf(override);
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+  });
+
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps the -c override before the $command subcommand', ({ command, forkSession }) => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+      ...BASE, resume: true, resumeSessionId: 'codex-existing', forkSession, serviceTier: 'priority',
+    });
+    const i = args.indexOf(override);
+    expect(i).toBeGreaterThan(0);
+    expect(args[i - 1]).toBe('-c');
+    expect(i).toBeLessThan(args.indexOf(command));
+  });
+
+  it('pure --remote viewer carries no service_tier override', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+      ...BASE, resume: true, remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+      serviceTier: 'priority',
+    });
+    expect(args.some(a => a.startsWith('service_tier='))).toBe(false);
+  });
+});
+
+describe('codex-app adapter buildArgs — runner flags', () => {
+  it('emits --model and --reasoning-effort (xhigh verbatim) for the runner', () => {
+    const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, model: 'gpt-5.6-terra', reasoningEffort: 'xhigh' });
+    const mi = args.indexOf('--model');
+    expect(args[mi + 1]).toBe('gpt-5.6-terra');
+    const ei = args.indexOf('--reasoning-effort');
+    expect(args[ei + 1]).toBe('xhigh');
+  });
+
+  it('passes each effort level to the runner unchanged', () => {
+    for (const e of ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const) {
+      const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, reasoningEffort: e });
+      const i = args.indexOf('--reasoning-effort');
+      expect(args[i + 1]).toBe(e);
+    }
+  });
+
+  it('omits both flags when neither is given', () => {
+    const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE });
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('--reasoning-effort');
+    expect(args).not.toContain('--service-tier');
+  });
+
+  it('emits --service-tier for the runner', () => {
+    const args = createCodexAppAdapter('/usr/bin/codex').buildArgs({ ...BASE, serviceTier: 'priority' });
+    const i = args.indexOf('--service-tier');
+    expect(i).toBeGreaterThan(0);
+    expect(args[i + 1]).toBe('priority');
+  });
+});
+
+describe('Codex profile argv', () => {
+  it.each([
+    {}, { resume: true, resumeSessionId: 'native' },
+    { resume: true, resumeSessionId: 'native', forkSession: true },
+  ])('passes the profile before every subcommand: %j', extra => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, ...extra, codexProfile: 'withhooks', model: 'explicit', reasoningEffort: 'high' });
+    expect(args.slice(0, 2)).toEqual(['--profile', 'withhooks']);
+    expect(args.filter(x => x === '--profile')).toHaveLength(1);
+    expect(args).toContain('model_reasoning_effort="high"');
+  });
+  it('keeps a leading-hyphen profile a single value on resume', () => {
+    const args = createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, resume: true, resumeSessionId: 'native', codexProfile: '-selected' });
+    expect(args[0]).toBe('--profile=-selected');
+    expect(args).not.toContain('-selected');
+  });
+  it('rejects RPC viewer instead of silently dropping the profile', () => {
+    expect(() => createCodexAdapter('/usr/bin/codex').buildArgs({ ...BASE, codexProfile: 'selected', remoteWsUrl: 'ws://localhost:9', remoteThreadId: 'thread' })).toThrow('RPC');
+  });
+  it('does not add an explicit profile for the default selection', () => {
+    expect(createCodexAdapter('/usr/bin/codex').buildArgs(BASE)).not.toContain('--profile');
+  });
+});

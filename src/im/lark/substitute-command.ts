@@ -1,0 +1,73 @@
+import { canOperate, canTalk, extractMessageTextForRouting, isBotMentioned } from './event-dispatcher.js';
+import { stripLeadingMentions } from './message-parser.js';
+import { getChatMode, replyMessage } from './client.js';
+import { isSubstituteEnabledForChat, setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
+import { localeForBot, t } from '../../i18n/index.js';
+import { logger } from '../../utils/logger.js';
+import { getBot } from '../../bot-registry.js';
+
+export async function tryHandleSubstituteCommand(
+  larkAppId: string,
+  message: any,
+  senderOpenId: string | undefined,
+): Promise<boolean> {
+  const rawText = extractMessageTextForRouting(message);
+  if (!rawText) return false;
+  const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
+  const match = /^\/substitute(?:\s+(\S+))?\s*$/i.exec(text);
+  if (!match) return false;
+
+  const isP2p = message.chat_type === 'p2p';
+  if (!isP2p && !isBotMentioned(larkAppId, message, senderOpenId)) return true;
+
+  const chatId: string | undefined = message.chat_id;
+  const messageId: string | undefined = message.message_id;
+  const loc = localeForBot(larkAppId);
+  const reply = (content: string) => messageId
+    ? replyMessage(larkAppId, messageId, content, 'text', false)
+        .catch(err => logger.warn(`[substitute] reply failed: ${err?.message ?? err}`))
+    : Promise.resolve();
+
+  // 普通群与话题群都支持 per-chat 开关；只有 p2p / 未知 chat_mode 拒绝。
+  const chatMode = !chatId || isP2p ? undefined : await getChatMode(larkAppId, chatId);
+  if (!chatId || isP2p || (chatMode !== 'group' && chatMode !== 'topic')) {
+    await reply(t('cmd.substitute.unsupported', undefined, loc));
+    return true;
+  }
+  if (chatMode === 'topic' && getBot(larkAppId).config.substituteMode?.topicGroups === false) {
+    // topicGroups 是 bot 级总开关；per-chat toggle 不能越过它。若仍回 status_on /
+    // updated_on，用户会看到“已开启”但 dispatcher 永远不触发，形成假成功。
+    await reply(t('cmd.substitute.topic_disabled', undefined, loc));
+    return true;
+  }
+  if (getBot(larkAppId).config.substituteMode?.excludedChats?.includes(chatId)) {
+    // 配置黑名单是硬关闭：dispatcher 里 isSubstituteAllowedChat 命中即短路，
+    // per-chat /substitute on 翻不回来。若仍回 status_on / updated_on 就是假成功
+    // （用户看到“已开启”却静默不代答），所以对 status/on/off 统一回报被屏蔽，
+    // 且不写运行态开关。先于 owner 权限检查：屏蔽状态非敏感，人人可见。
+    await reply(t('cmd.substitute.blocked', undefined, loc));
+    return true;
+  }
+
+  const arg = match[1]?.trim().toLowerCase() ?? 'status';
+  if (!arg || arg === 'status') {
+    if (!canTalk(larkAppId, chatId, senderOpenId) && !isBotMentioned(larkAppId, message, senderOpenId)) return true;
+    const enabled = isSubstituteEnabledForChat(larkAppId, chatId);
+    await reply(t(enabled ? 'cmd.substitute.status_on' : 'cmd.substitute.status_off', undefined, loc));
+    return true;
+  }
+
+  const enable = arg === 'on' || arg === 'enable' || arg === '开启' || arg === '开';
+  const disable = arg === 'off' || arg === 'disable' || arg === '关闭' || arg === '关';
+  if (!enable && !disable) {
+    await reply(t('cmd.substitute.usage', undefined, loc));
+    return true;
+  }
+  if (!canOperate(larkAppId, chatId, senderOpenId)) {
+    await reply(t('cmd.substitute.owner_only', undefined, loc));
+    return true;
+  }
+  setSubstituteEnabledForChat(larkAppId, chatId, enable);
+  await reply(t(enable ? 'cmd.substitute.updated_on' : 'cmd.substitute.updated_off', undefined, loc));
+  return true;
+}
