@@ -15,11 +15,12 @@ export type DashboardEvent =
   /** 普通群回复模式策略变化（群级覆盖或 Bot 默认）；dashboard 据此让群矩阵快照失效。 */
   | { type: 'groups.reply-policy.changed'; body: { chatId?: string } }
   | { type: 'heartbeat';         body: { ts: number } }
-  /** A worker `turn_terminal`. `completed` is `success`; failed, cancelled, and ambiguous are `error`. */
+  /** A durably accepted worker `turn_terminal`. `completed` is `success`; failed, cancelled, and ambiguous are `error`. `terminalStatus` keeps the worker enum. */
   | { type: 'turn.finished'; body: {
       sessionId: string;
       turnId: string;
       status: 'success' | 'error';
+      terminalStatus: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       larkAppId: string;
       chatId: string;
       dispatchAttempt?: number;

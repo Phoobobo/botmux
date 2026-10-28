@@ -1,17 +1,26 @@
 /**
- * One structured notice when a turn reaches `turn_terminal`.
+ * One structured notice when a worker `turn_terminal` has been accepted by the
+ * durable callback. `success` means that callback returned, not that a later
+ * feedback webhook (`turn.completed`) has been correlated.
  *
- * Integrators can subscribe to the `turn.finished` hook or to `GET /api/events`
- * instead of polling. The sender is the turn's own reply-target sender. A turn
- * with no sender omits `senderOpenId`; the session owner is not a substitute.
+ * Integrators can subscribe to the `turn.finished` hook or to the daemon
+ * loopback `GET /api/events`. The public dashboard `/events` relay drops this
+ * frame for anonymous and workbench viewers. A dedicated VC receiver still
+ * publishes on the loopback bus, but does not run the user hook.
+ *
+ * The sender is the turn's own reply-target sender, unless the caller passes
+ * the Codex App ledger sender frozen at acceptance. A turn with no sender
+ * omits `senderOpenId`; the session owner is not a substitute.
+ *
+ * Dedupe is in-process only (4096 FIFO). A daemon restart can emit again.
  */
 import { dashboardEventBus } from './dashboard-events.js';
 import { pickTurnReplyTarget } from './reply-target.js';
 import { emitHookEventLocal } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
-import type { Session } from '../types.js';
+import type { Session, WorkerToDaemon } from '../types.js';
 
-export type TurnFinishedTerminalStatus = 'completed' | 'failed' | 'cancelled' | 'ambiguous';
+export type TurnFinishedTerminalStatus = Extract<WorkerToDaemon, { type: 'turn_terminal' }>['status'];
 export type TurnFinishedStatus = 'success' | 'error';
 
 const seen = new Set<string>();
@@ -35,9 +44,15 @@ export function publishTurnFinished(
   ds: {
     larkAppId: string;
     chatId: string;
-    session: Pick<Session, 'sessionId' | 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId'>;
+    session: Pick<Session, 'sessionId' | 'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'vcMeetingReceiver'>;
   },
-  terminal: { turnId: string; dispatchAttempt?: number; status: TurnFinishedTerminalStatus },
+  terminal: {
+    turnId: string;
+    dispatchAttempt?: number;
+    status: TurnFinishedTerminalStatus;
+    /** Ledger sender frozen at Codex App acceptance. Wins over the live reply target. */
+    senderOpenId?: string;
+  },
 ): boolean {
   const key = `${ds.session.sessionId}\0${terminal.turnId}\0${terminal.dispatchAttempt ?? ''}`;
   if (seen.has(key)) return false;
@@ -47,11 +62,12 @@ export function publishTurnFinished(
     const stale = seenOrder.shift();
     if (stale) seen.delete(stale);
   }
-  const senderOpenId = turnFinishedSenderOpenId(ds.session, terminal.turnId);
+  const senderOpenId = terminal.senderOpenId || turnFinishedSenderOpenId(ds.session, terminal.turnId);
   const body = {
     sessionId: ds.session.sessionId,
     turnId: terminal.turnId,
     status: turnFinishedStatus(terminal.status),
+    terminalStatus: terminal.status,
     larkAppId: ds.larkAppId,
     chatId: ds.chatId,
     ...(terminal.dispatchAttempt !== undefined ? { dispatchAttempt: terminal.dispatchAttempt } : {}),
@@ -59,7 +75,10 @@ export function publishTurnFinished(
   };
   try {
     dashboardEventBus.publish({ type: 'turn.finished', body });
-    emitHookEventLocal('turn.finished', body);
+    // User hooks are an external side-effect channel. Dedicated VC receivers
+    // fail closed on every other lifecycle hook; this one does too. The
+    // loopback bus above stays, matching session.spawned/update for these rows.
+    if (!ds.session.vcMeetingReceiver) emitHookEventLocal('turn.finished', body);
     return true;
   } catch (err) {
     seen.delete(key);

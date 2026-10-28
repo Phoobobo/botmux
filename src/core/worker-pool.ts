@@ -18653,7 +18653,6 @@ function setupWorkerHandlers(
           );
           break;
         }
-        publishTurnFinished(ds, msg);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -18743,13 +18742,20 @@ function setupWorkerHandlers(
         const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
+        // `turn.finished` means this durable callback accepted the worker
+        // terminal, not merely that the IPC arrived. A thrown persist is not
+        // success and does not consume the in-process dedupe key, so a later
+        // replay can still emit. Same rule as the Codex App settlement below.
+        let terminalPersisted = true;
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
         } catch (err: any) {
+          terminalPersisted = false;
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        if (terminalPersisted) publishTurnFinished(ds, msg);
         try {
           if (!ordinaryHttpTerminal) handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
           recoveryHandled = recoveryOwnsTerminal;
@@ -19786,12 +19792,9 @@ function setupWorkerHandlers(
                   // Durable receivers must not depend on the worker surviving
                   // the daemon ACK long enough to emit a later terminal IPC.
                   // Persist the exact completed attempt first; the worker's
-                  // ordered duplicate terminal remains idempotent.
-                  publishTurnFinished(ds, {
-                    turnId: msg.turnId,
-                    dispatchAttempt: msg.dispatchAttempt,
-                    status: 'completed',
-                  });
+                  // ordered duplicate terminal remains idempotent. The
+                  // turn.finished notice waits until this write and the ledger
+                  // write below both succeed.
                   await cb.onTurnTerminal?.(ds, {
                     type: 'turn_terminal',
                     sessionId: ds.session.sessionId,
@@ -19823,6 +19826,18 @@ function setupWorkerHandlers(
                 // pop and cumulative runner ACK boundary. Only after this write
                 // may the worker acknowledge final-end to the runner.
                 sessionStore.updateSession(ds.session);
+                if (msg.dispatchAttempt !== undefined) {
+                  // Both durable writes succeeded. The frozen ledger sender is
+                  // the attribution captured at acceptance; the live reply
+                  // target may already belong to a later steer.
+                  const frozenSender = preview.settledEntry.replyTargetSenderOpenId;
+                  publishTurnFinished(ds, {
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    status: 'completed',
+                    ...(frozenSender ? { senderOpenId: frozenSender } : {}),
+                  });
+                }
                 return true;
               } catch (err) {
                 ds.session.codexAppDispatchLedger = priorLedger;
