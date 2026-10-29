@@ -44,7 +44,7 @@ import {
 import * as sessionStore from '../services/session-store.js';
 import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
-import { parseHookCommand } from '../services/hook-runner.js';
+import { emitHookEventLocal, parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
@@ -88,7 +88,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
-import { parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -642,12 +642,24 @@ function requireBoundBot(handler: Handler, notBound: object = NOT_BOUND_BODY.leg
 const BAD_JSON: unique symbol = Symbol('bad_json');
 
 /**
- * 读取并解析请求 JSON（无大小上限，同 `readJsonBody(req)`）。失败时已回写
- * 400 `{ ok: false, error: 'bad_json' }`，调用方写 `if (body === BAD_JSON) return;` 即可。
+ * 读取并解析请求 JSON。`maxBytes` 缺省时无大小上限（同 `readJsonBody(req)`）。
+ * 失败时已回写 400 `{ ok: false, error: 'bad_json' }`，超限回 413
+ * `{ ok: false, error: 'body_too_large' }`。调用方写 `if (body === BAD_JSON) return;` 即可。
  */
-async function readJsonBodyOrBadJson<T = unknown>(req: IncomingMessage, res: ServerResponse): Promise<T | typeof BAD_JSON> {
-  try { return await readJsonBody<T>(req); }
-  catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return BAD_JSON; }
+async function readJsonBodyOrBadJson<T = unknown>(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBytes?: number,
+): Promise<T | typeof BAD_JSON> {
+  try { return await readJsonBody<T>(req, maxBytes); }
+  catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+      return BAD_JSON;
+    }
+    jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return BAD_JSON;
+  }
 }
 
 /** `botConfigPutRoute` 的 normalize 结果：待写入的值，或 400 的 error。 */
@@ -6992,9 +7004,13 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
  * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
  * The same requestId never produces a second visible message; an attempt whose
  * outcome cannot be reconciled any more is `409 outcome_unknown`.
+ *
+ * `sendMessage` always suppresses its own outbound hook. The hook fires from
+ * `onCommitted` after the sent record is durable, at most once per message id.
+ * `larkAppId` and `chatId` are on that payload because hook filters gate on them.
  */
 ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
-  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, GROUP_SEND_BODY_MAX_BYTES);
   if (body === BAD_JSON) return;
   const input = parseGroupSendBody(body);
   if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
@@ -7002,13 +7018,16 @@ ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res
   try {
     const result = await sendRequestBoundGroupMessage({
       larkAppId, storePath: groupSendStorePath(larkAppId),
-      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid),
+      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
+      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
     }, { chatId: p.chatId, ...input });
     const { status, ...rest } = result;
     return jsonRes(res, status, rest);
   } catch (e) {
-    // Store unreadable/unwritable: fail closed, nothing was sent.
-    return jsonRes(res, 503, { ok: false, error: 'store_unavailable', detail: String(e) });
+    // Fail closed. The provider may already have accepted (the post-send save
+    // failed). Retry this same requestId; a new one can post a second message.
+    logger.warn(`[group-send] store unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    return jsonRes(res, 503, { ok: false, error: 'store_unavailable', retryable: true });
   }
 }, NOT_BOUND_BODY.okFalse));
 
