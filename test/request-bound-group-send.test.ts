@@ -243,6 +243,9 @@ describe('sendRequestBoundGroupMessage', () => {
     expect(Object.keys(JSON.parse(readFileSync(storePath, 'utf8')).records)).toHaveLength(GROUP_SEND_RECORD_LIMIT);
   });
 
+  // 源码结构护栏(K1)：request-bound-group-send 必须保持不 import hook-runner。
+  // 评审要求 hook 经 onCommitted 注入，服务模块被单测加载时不能拉起全局 hook 配置和子进程。
+  // 只加一行未调用的 import 时，假回调的行为测试仍然全绿，所以只能读源码钉住这条边界。
   it('does not import the hook runner', () => {
     const src = readFileSync(new URL('../src/services/request-bound-group-send.ts', import.meta.url), 'utf8');
     expect(src).not.toContain('hook-runner');
